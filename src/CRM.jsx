@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   LayoutDashboard, Users, Building2, Briefcase, Activity, MessageSquare, Mail,
-  Phone, Settings, Plus, Upload, Search, X, Check, ChevronDown, Trash2, Send,
-  Zap, FileText, Clock, Eye
+  Phone, Settings, Plus, Upload, Search, X, Check, ChevronDown, Trash2, Copy,
+  FileText, Clock, Eye, Download
 } from "lucide-react";
 
 /* ────────────────────────────────────────────────────────────
@@ -100,8 +100,6 @@ const OBJ = {
    ──────────────────────────────────────────────────────────── */
 const uid = () => Math.random().toString(36).slice(2, 10);
 const nowISO = () => new Date().toISOString();
-const hoursAgo = (h) => new Date(Date.now() - h * 3600e3).toISOString();
-const daysAgo = (d) => new Date(Date.now() - d * 86400e3).toISOString();
 
 const isToday = (iso) => {
   if (!iso) return false;
@@ -156,65 +154,146 @@ const titleOf = (kind, rec) => {
 };
 
 /* ────────────────────────────────────────────────────────────
-   Semilla
+   Almacenamiento
    ──────────────────────────────────────────────────────────── */
-function seed() {
-  const mk = (kind, props, extra = {}) => ({ id: uid(), props: { createdAt: nowISO(), ...props }, ...extra });
-  const companies = [
-    mk("company", { name: "Colegio San Andrés", lastName: "Rojas", phone: "+57 310 555 1120", email: "admisiones@sanandres.edu.co", leadStatus: "Calificado", leadSource: "Meta Lead Ads", url: "https://sanandres.edu.co", type: "Prospecto", createdAt: hoursAgo(3), lastActivityAt: hoursAgo(2) }),
-    mk("company", { name: "Instituto Panamericano", lastName: "Vega", phone: "+57 320 444 8890", email: "contacto@panamericano.edu.co", leadStatus: "Abierto", leadSource: "Sitio web", url: "https://panamericano.edu.co", type: "Cliente", createdAt: daysAgo(6), lastActivityAt: daysAgo(1) }),
-    mk("company", { name: "Fundación Aprender", lastName: "Salas", phone: "+57 315 221 7744", email: "info@aprender.org", leadStatus: "Nuevo", leadSource: "Carga masiva", url: "https://aprender.org", type: "Prospecto", createdAt: daysAgo(12), lastActivityAt: daysAgo(4) }),
-  ];
-  const contacts = [
-    mk("contact", { firstName: "Laura", lastName: "Rojas", phone: "+57 310 555 1120", email: "laura.rojas@sanandres.edu.co", leadStatus: "Calificado", leadSource: "Meta Lead Ads", institution: "Colegio San Andrés", type: "Prospecto", createdAt: hoursAgo(3), lastActivityAt: hoursAgo(1) }, { companyId: companies[0].id }),
-    mk("contact", { firstName: "Andrés", lastName: "Vega", phone: "+57 320 444 8890", email: "andres.vega@panamericano.edu.co", leadStatus: "Conectado", leadSource: "Sitio web", institution: "Instituto Panamericano", type: "Cliente", createdAt: daysAgo(6), lastActivityAt: hoursAgo(5) }, { companyId: companies[1].id }),
-    mk("contact", { firstName: "Marcela", lastName: "Salas", phone: "+57 315 221 7744", email: "marcela.salas@aprender.org", leadStatus: "Abierto", leadSource: "Carga masiva", institution: "Fundación Aprender", type: "Acudiente", createdAt: daysAgo(12), lastActivityAt: daysAgo(2) }, { companyId: companies[2].id }),
-    mk("contact", { firstName: "Julián", lastName: "Ortiz", phone: "+57 300 909 3311", email: "julian.ortiz@gmail.com", leadStatus: "Nuevo", leadSource: "Meta Lead Ads", institution: "Colegio Bilingüe del Norte", type: "Prospecto", createdAt: hoursAgo(6), lastActivityAt: hoursAgo(6) }),
-    mk("contact", { firstName: "Diana", lastName: "Cárdenas", phone: "+57 311 778 2214", email: "diana.cardenas@outlook.com", leadStatus: "Intento de contacto", leadSource: "Instagram", institution: "Liceo Moderno", type: "Prospecto", createdAt: daysAgo(2), lastActivityAt: hoursAgo(9) }),
-  ];
-  const deals = [
-    mk("deal", { name: "Licencias 2026 · Colegio San Andrés", stage: "Propuesta", source: "Meta Lead Ads", amount: 18500000, createdAt: hoursAgo(2), lastActivityAt: hoursAgo(1) }, { companyId: companies[0].id, contactIds: [contacts[0].id] }),
-    mk("deal", { name: "Renovación · Instituto Panamericano", stage: "Negociación", source: "Sitio web", amount: 32000000, createdAt: daysAgo(5), lastActivityAt: hoursAgo(5) }, { companyId: companies[1].id, contactIds: [contacts[1].id] }),
-    mk("deal", { name: "Piloto · Fundación Aprender", stage: "Ganado", source: "Referido", wonReason: "Producto", amount: 9800000, createdAt: daysAgo(20), lastActivityAt: daysAgo(2) }, { companyId: companies[2].id, contactIds: [contacts[2].id] }),
-    mk("deal", { name: "Plan anual · Liceo Moderno", stage: "Perdido", source: "Instagram", lostReason: "Precio", amount: 7400000, createdAt: daysAgo(30), lastActivityAt: daysAgo(9) }, { contactIds: [contacts[4].id] }),
-  ];
-  const A = (type, at, subject, contactIds = [], companyIds = []) => ({ id: uid(), type, at, subject, body: "", contactIds, companyIds });
-  const activities = [
-    A("whatsapp", hoursAgo(1), "Plantilla: Primer contacto", [contacts[0].id]),
-    A("whatsapp", hoursAgo(1), "Plantilla: Primer contacto", [contacts[3].id]),
-    A("email", hoursAgo(5), "Campaña: Catálogo 2026", [contacts[1].id]),
-    A("call", hoursAgo(4), "Llamada de seguimiento", [contacts[1].id]),
-    A("call", hoursAgo(9), "Llamada sin respuesta", [contacts[4].id]),
-    A("email", hoursAgo(2), "Campaña: Catálogo 2026", [], [companies[0].id]),
-    A("note", hoursAgo(7), "Pidió cotización para 340 estudiantes", [contacts[0].id]),
-    A("whatsapp", daysAgo(1), "Plantilla: Recordatorio de reunión", [contacts[2].id]),
-  ];
+const STORE_KEY = "crm:data";
+const CORRUPT_KEY = "crm:data:ilegible";
+const BACKUP_KEY = "crm:data:respaldo-antes-de-limpieza";
+const DATA_VERSION = 1;
+
+/* Espacio de trabajo vacío: sólo el esquema de propiedades. Sin registros ni
+   plantillas de muestra; todo lo que aparezca en la app lo cargaste tú. */
+const emptyDb = () => ({
+  v: DATA_VERSION,
+  schema: BASE_SCHEMA,
+  contacts: [],
+  companies: [],
+  deals: [],
+  activities: [],
+  templates: { whatsapp: [], email: [] },
+});
+
+/* Completa las claves que falten sin descartar nada de lo guardado: si el
+   archivo llega incompleto se rellena, en vez de arrancar de cero encima. */
+function normalizeDb(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const base = emptyDb();
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  const sch = (k) => (arr(d.schema && d.schema[k]).length ? d.schema[k] : base.schema[k]);
   return {
-    schema: BASE_SCHEMA,
-    contacts, companies, deals, activities,
+    ...d,
+    v: DATA_VERSION,
+    schema: { contact: sch("contact"), company: sch("company"), deal: sch("deal") },
+    contacts: arr(d.contacts),
+    companies: arr(d.companies),
+    deals: arr(d.deals),
+    activities: arr(d.activities),
     templates: {
-      whatsapp: [
-        { id: uid(), name: "Primer contacto", body: "Hola {{nombre}}, soy del equipo comercial. Vi tu interés en nuestro programa para {{institucion}}. ¿Te queda bien una llamada de 15 minutos esta semana?" },
-        { id: uid(), name: "Recordatorio de reunión", body: "Hola {{nombre}}, te recuerdo nuestra reunión de mañana. Te comparto el enlace apenas confirmes." },
-        { id: uid(), name: "Reactivación", body: "Hola {{nombre}}, seguimos con cupos para {{institucion}} este semestre. ¿Retomamos la conversación?" },
-      ],
-      email: [
-        { id: uid(), name: "Catálogo 2026", subject: "Catálogo de programas 2026 para {{institucion}}", body: "Hola {{nombre}},\n\nTe comparto el catálogo con los programas disponibles para 2026 y los planes por número de estudiantes.\n\nQuedo atento a tus comentarios." },
-        { id: uid(), name: "Propuesta enviada", subject: "Propuesta comercial · {{institucion}}", body: "Hola {{nombre}},\n\nAdjunto la propuesta que revisamos. Incluye la vigencia y las condiciones de implementación.\n\nUn saludo." },
-      ],
+      whatsapp: arr(d.templates && d.templates.whatsapp),
+      email: arr(d.templates && d.templates.email),
     },
-    meta: { connected: false, pageId: "", formId: "", token: "", lastSync: null },
   };
 }
 
-const META_POOL = [
-  { firstName: "Camila", lastName: "Herrera", institution: "Colegio Los Nogales", email: "camila.herrera@nogales.edu.co", phone: "+57 313 442 9087" },
-  { firstName: "Santiago", lastName: "Mejía", institution: "Gimnasio del Sur", email: "santiago.mejia@gimsur.edu.co", phone: "+57 301 776 5540" },
-  { firstName: "Valeria", lastName: "Pineda", institution: "Colegio Nueva Granada", email: "valeria.pineda@cng.edu.co", phone: "+57 318 220 1176" },
-  { firstName: "Tomás", lastName: "Restrepo", institution: "Instituto Alberto Merani", email: "tomas.restrepo@merani.edu.co", phone: "+57 316 903 4412" },
-  { firstName: "Isabella", lastName: "Quintero", institution: "Liceo Campestre", email: "isabella.q@liceocampestre.edu.co", phone: "+57 304 118 6623" },
-  { firstName: "Mateo", lastName: "Guzmán", institution: "Colegio San Bartolomé", email: "mateo.guzman@sanbarto.edu.co", phone: "+57 322 551 7788" },
+/* ────────────────────────────────────────────────────────────
+   Limpieza de los datos de demostración
+   Las versiones anteriores sembraban registros, plantillas y leads simulados.
+   Aquí quedan sus huellas exactas para borrarlos del almacenamiento una sola
+   vez. La comparación es por correo + nombre exactos, así que un registro real
+   —o uno de muestra que hayas editado— no se toca.
+   ──────────────────────────────────────────────────────────── */
+const DEMO_CONTACTS = [
+  ["laura.rojas@sanandres.edu.co", "Laura Rojas"],
+  ["andres.vega@panamericano.edu.co", "Andrés Vega"],
+  ["marcela.salas@aprender.org", "Marcela Salas"],
+  ["julian.ortiz@gmail.com", "Julián Ortiz"],
+  ["diana.cardenas@outlook.com", "Diana Cárdenas"],
+  ["camila.herrera@nogales.edu.co", "Camila Herrera"],
+  ["santiago.mejia@gimsur.edu.co", "Santiago Mejía"],
+  ["valeria.pineda@cng.edu.co", "Valeria Pineda"],
+  ["tomas.restrepo@merani.edu.co", "Tomás Restrepo"],
+  ["isabella.q@liceocampestre.edu.co", "Isabella Quintero"],
+  ["mateo.guzman@sanbarto.edu.co", "Mateo Guzmán"],
 ];
+const DEMO_COMPANIES = [
+  ["admisiones@sanandres.edu.co", "Colegio San Andrés"],
+  ["contacto@panamericano.edu.co", "Instituto Panamericano"],
+  ["info@aprender.org", "Fundación Aprender"],
+];
+const DEMO_DEALS = [
+  "Licencias 2026 · Colegio San Andrés",
+  "Renovación · Instituto Panamericano",
+  "Piloto · Fundación Aprender",
+  "Plan anual · Liceo Moderno",
+];
+/* Plantillas de muestra: se comparan por el cuerpo exacto, de modo que si
+   alguna la reescribiste queda como tuya y sobrevive. */
+const DEMO_TEMPLATES = [
+  "Hola {{nombre}}, soy del equipo comercial. Vi tu interés en nuestro programa para {{institucion}}. ¿Te queda bien una llamada de 15 minutos esta semana?",
+  "Hola {{nombre}}, te recuerdo nuestra reunión de mañana. Te comparto el enlace apenas confirmes.",
+  "Hola {{nombre}}, seguimos con cupos para {{institucion}} este semestre. ¿Retomamos la conversación?",
+  "Hola {{nombre}},\n\nTe comparto el catálogo con los programas disponibles para 2026 y los planes por número de estudiantes.\n\nQuedo atento a tus comentarios.",
+  "Hola {{nombre}},\n\nAdjunto la propuesta que revisamos. Incluye la vigencia y las condiciones de implementación.\n\nUn saludo.",
+];
+
+function purgeDemoData(db) {
+  const fp = (a, b) => `${norm(a)}|${norm(b)}`;
+  const cSet = new Set(DEMO_CONTACTS.map(([e, n]) => fp(e, n)));
+  const oSet = new Set(DEMO_COMPANIES.map(([e, n]) => fp(e, n)));
+  const dSet = new Set(DEMO_DEALS.map((n) => norm(n)));
+  const tSet = new Set(DEMO_TEMPLATES.map((b) => norm(b)));
+
+  const goneC = new Set(db.contacts
+    .filter((r) => cSet.has(fp((r.props || {}).email, [(r.props || {}).firstName, (r.props || {}).lastName].filter(Boolean).join(" "))))
+    .map((r) => r.id));
+  const goneO = new Set(db.companies
+    .filter((r) => oSet.has(fp((r.props || {}).email, (r.props || {}).name)))
+    .map((r) => r.id));
+  const goneD = new Set(db.deals
+    .filter((r) => dSet.has(norm((r.props || {}).name)))
+    .map((r) => r.id));
+
+  const contacts = db.contacts
+    .filter((r) => !goneC.has(r.id))
+    .map((r) => (goneO.has(r.companyId) ? { ...r, companyId: undefined } : r));
+  const companies = db.companies.filter((r) => !goneO.has(r.id));
+  const deals = db.deals.filter((r) => !goneD.has(r.id)).map((r) => ({
+    ...r,
+    companyId: goneO.has(r.companyId) ? undefined : r.companyId,
+    contactIds: (r.contactIds || []).filter((id) => !goneC.has(id)),
+  }));
+
+  /* Una actividad se borra sólo si todo lo que tocaba era de demostración; si
+     también apuntaba a un registro tuyo, se conserva sin esa referencia. */
+  const activities = db.activities
+    .filter((a) => {
+      const ids = [...(a.contactIds || []), ...(a.companyIds || [])];
+      const touched = ids.some((id) => goneC.has(id) || goneO.has(id)) || Boolean(a.dealId && goneD.has(a.dealId));
+      if (!touched) return true;
+      return ids.some((id) => !goneC.has(id) && !goneO.has(id)) || Boolean(a.dealId && !goneD.has(a.dealId));
+    })
+    .map((a) => ({
+      ...a,
+      contactIds: (a.contactIds || []).filter((id) => !goneC.has(id)),
+      companyIds: (a.companyIds || []).filter((id) => !goneO.has(id)),
+    }));
+
+  const clean = (list) => (list || []).filter((t) => !tSet.has(norm(t.body)));
+  const templates = { whatsapp: clean(db.templates.whatsapp), email: clean(db.templates.email) };
+
+  const { meta, ...rest } = db; // la conexión simulada con Meta ya no existe
+  const removed = {
+    contactos: goneC.size,
+    empresas: goneO.size,
+    negocios: goneD.size,
+    actividades: db.activities.length - activities.length,
+    plantillas:
+      db.templates.whatsapp.length + db.templates.email.length -
+      (templates.whatsapp.length + templates.email.length),
+  };
+  const total = Object.values(removed).reduce((a, b) => a + b, 0);
+  return { db: { ...rest, contacts, companies, deals, activities, templates }, removed, total };
+}
 
 /* ────────────────────────────────────────────────────────────
    Átomos de UI
@@ -290,26 +369,107 @@ export default function CRM() {
   const [db, setDb] = useState(null);
   const [view, setView] = useState("dashboard");
   const [toast, setToast] = useState(null);
-  const [modal, setModal] = useState(null); // {kind:'record'|'import'|'meta'|'prop'|'send'|'deal'|'template', ...}
+  const [modal, setModal] = useState(null); // {kind:'record'|'import'|'prop'|'send'|'deal', ...}
   const [detail, setDetail] = useState(null); // {kind, id}
+  const [save, setSave] = useState({ state: "idle", at: null, error: null });
+  const [fatal, setFatal] = useState(null);
+
+  const dbRef = useRef(null);
+  const pending = useRef(false);
+  const external = useRef(false);
+
+  const say = (m) => { setToast(m); setTimeout(() => setToast(null), 2600); };
+
+  /* Escritura real en el almacenamiento. Se dispara al vencer el rebote y
+     también al cerrar o esconder la pestaña, para que nada quede a medias. */
+  const persist = React.useCallback(() => {
+    if (!pending.current || !dbRef.current) return;
+    const payload = JSON.stringify(dbRef.current);
+    const failed = (e) => setSave({ state: "error", at: null, error: (e && e.message) || String(e) });
+    try {
+      Promise.resolve(window.storage.set(STORE_KEY, payload))
+        .then(() => { pending.current = false; setSave({ state: "saved", at: new Date(), error: null }); })
+        .catch(failed);
+    } catch (e) { failed(e); }
+  }, []);
 
   useEffect(() => {
     let live = true;
     (async () => {
-      let loaded = null;
-      try { const r = await window.storage.get("crm:data"); loaded = r ? JSON.parse(r.value) : null; } catch (e) { loaded = null; }
-      if (live) setDb(loaded && loaded.schema ? loaded : seed());
+      let raw = null;
+      try { const r = await window.storage.get(STORE_KEY); raw = r ? r.value : null; }
+      catch (e) {
+        if (live) setFatal(`No pude abrir el almacenamiento de este navegador (${(e && e.message) || e}). Suele pasar en ventanas de incógnito o con las cookies bloqueadas para este sitio; no se cargó nada para no arriesgar lo que ya esté guardado.`);
+        return;
+      }
+
+      let parsed = null;
+      if (raw) {
+        try { parsed = JSON.parse(raw); }
+        catch (e) {
+          /* No arrancamos vacíos: eso borraría lo guardado en el primer cambio.
+             Se preserva el original tal cual y se avisa. */
+          try { await window.storage.set(CORRUPT_KEY, raw); } catch (_) {}
+          if (live) setFatal(`Los datos guardados no se pudieron leer (${(e && e.message) || e}). No se sobrescribió nada: quedan intactos en la clave “${CORRUPT_KEY}” del navegador para recuperarlos.`);
+          return;
+        }
+      }
+
+      let next = normalizeDb(parsed);
+      let cleaned = 0;
+      if (!next.demoPurgedAt) {
+        const res = purgeDemoData(next);
+        cleaned = res.total;
+        if (cleaned > 0 && raw) { try { await window.storage.set(BACKUP_KEY, raw); } catch (_) {} }
+        next = { ...res.db, demoPurgedAt: nowISO() };
+      }
+      if (!live) return;
+      dbRef.current = next;
+      setDb(next);
+      if (cleaned > 0) say(`Se eliminaron ${cleaned} elementos de demostración`);
     })();
     return () => { live = false; };
   }, []);
 
   useEffect(() => {
     if (!db) return;
-    const t = setTimeout(() => { try { window.storage.set("crm:data", JSON.stringify(db)); } catch (e) {} }, 300);
+    dbRef.current = db;
+    if (external.current) { external.current = false; return; } // llegó ya guardado de otra pestaña
+    pending.current = true;
+    setSave((s) => ({ ...s, state: "saving" }));
+    const t = setTimeout(persist, 300);
     return () => clearTimeout(t);
-  }, [db]);
+  }, [db, persist]);
 
-  const say = (m) => { setToast(m); setTimeout(() => setToast(null), 2600); };
+  /* Con el CRM abierto en dos pestañas, la que no tiene cambios pendientes
+     adopta lo que escribió la otra en vez de pisarlo al guardar. */
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key !== STORE_KEY || !e.newValue || pending.current) return;
+      try {
+        const next = normalizeDb(JSON.parse(e.newValue));
+        external.current = true;
+        dbRef.current = next;
+        setDb(next);
+      } catch (_) {}
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  /* Cerrar la pestaña, recargar o pasar a otra app vacía lo que esté pendiente. */
+  useEffect(() => {
+    const onHide = () => { if (document.visibilityState === "hidden") persist(); };
+    window.addEventListener("beforeunload", persist);
+    window.addEventListener("pagehide", persist);
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      window.removeEventListener("beforeunload", persist);
+      window.removeEventListener("pagehide", persist);
+      document.removeEventListener("visibilitychange", onHide);
+      persist();
+    };
+  }, [persist]);
 
   /* ── mutaciones ── */
   const collKey = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : "deals");
@@ -331,6 +491,17 @@ export default function CRM() {
       deals: act.dealId ? d.deals.map((x) => x.id === act.dealId ? { ...x, props: { ...x.props, lastActivityAt: at } } : x) : d.deals,
     };
   });
+
+  if (fatal) {
+    return (
+      <div style={{ minHeight: "100vh", background: C.canvas, display: "grid", placeItems: "center", padding: 24 }}>
+        <div style={{ maxWidth: 520, background: C.panel, border: `1px solid ${C.claySoft}`, borderRadius: 10, padding: 22 }}>
+          <div style={{ fontFamily: "system-ui", fontSize: 16, fontWeight: 600, color: C.clay, marginBottom: 8 }}>No se pudo abrir tu CRM</div>
+          <div style={{ fontFamily: "system-ui", fontSize: 13.5, color: C.ink, lineHeight: 1.6 }}>{fatal}</div>
+        </div>
+      </div>
+    );
+  }
 
   if (!db) {
     return <div style={{ minHeight: "100vh", background: C.canvas, display: "grid", placeItems: "center", fontFamily: "system-ui", color: C.mute, fontSize: 13 }}>Cargando tu CRM…</div>;
@@ -381,6 +552,10 @@ export default function CRM() {
           <div style={{ marginTop: "auto", padding: "12px 10px", borderTop: `1px solid ${C.line}` }}>
             <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, lineHeight: 1.6 }}>
               {db.contacts.length} contactos<br />{db.companies.length} empresas<br />{db.deals.length} negocios
+            </div>
+            <div title={save.error || ""} style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 9, fontFamily: "var(--ui)", fontSize: 11, color: save.state === "error" ? C.clay : C.mute }}>
+              <span style={{ width: 7, height: 7, borderRadius: 99, flexShrink: 0, background: save.state === "error" ? C.clay : save.state === "saving" ? C.amber : C.jade }} />
+              {save.state === "error" ? "Sin guardar" : save.state === "saving" ? "Guardando…" : save.at ? `Guardado ${save.at.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}` : "Todo guardado"}
             </div>
           </div>
         </aside>
@@ -438,16 +613,6 @@ export default function CRM() {
             say(`${records.length} registros importados${newFields.length ? ` · ${newFields.length} propiedades creadas` : ""}`);
           }} />
       )}
-      {modal?.kind === "meta" && (
-        <MetaModal db={db} setDb={setDb} onClose={() => setModal(null)}
-          onSync={(n) => {
-            const picks = [...META_POOL].sort(() => Math.random() - 0.5).slice(0, n);
-            const recs = picks.map((p) => ({ id: uid(), props: { ...p, leadStatus: "Nuevo", leadSource: "Meta Lead Ads", type: "Prospecto", createdAt: nowISO(), lastActivityAt: nowISO() } }));
-            addRecords("contact", recs);
-            setDb((d) => ({ ...d, meta: { ...d.meta, connected: true, lastSync: nowISO() } }));
-            setModal(null); say(`${n} leads traídos desde Meta`);
-          }} />
-      )}
       {modal?.kind === "prop" && (
         <PropertyModal objKind={modal.objKind} onClose={() => setModal(null)}
           onCreate={(def) => {
@@ -461,7 +626,7 @@ export default function CRM() {
           onSend={(payload) => {
             modal.ids.forEach((id) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) }));
             setModal(null);
-            say(`Enviado a ${modal.ids.length} destinatario(s)`);
+            say(`Envío registrado en ${modal.ids.length} registro(s)`);
           }} />
       )}
       {modal?.kind === "deal" && (
@@ -470,6 +635,12 @@ export default function CRM() {
             addRecords("deal", [{ id: uid(), props: { createdAt: nowISO(), lastActivityAt: nowISO(), ...props }, contactIds: modal.contactIds || [], companyId: modal.companyId }]);
             setModal(null); say("Negocio creado");
           }} />
+      )}
+
+      {save.state === "error" && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, background: C.clay, color: "#fff", padding: "9px 16px", fontFamily: "var(--ui)", fontSize: 12.5, zIndex: 100, textAlign: "center" }}>
+          Los últimos cambios no se pudieron guardar{save.error ? ` (${save.error})` : ""}. Descarga un respaldo desde Configuración → Datos antes de cerrar esta pestaña.
+        </div>
       )}
 
       {toast && (
@@ -523,7 +694,7 @@ function Dashboard({ db, go }) {
       <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 22 }}>
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
           <KPI label="Contactos creados hoy" value={k.contacts} sub={`${db.contacts.length} en total`} />
-          <KPI label="Mensajes enviados hoy" value={k.messages} sub="WhatsApp + correo" accent={C.jade} />
+          <KPI label="Mensajes registrados hoy" value={k.messages} sub="WhatsApp + correo" accent={C.jade} />
           <KPI label="Empresas creadas hoy" value={k.companies} sub={`${db.companies.length} en total`} />
           <KPI label="Actividades de hoy" value={k.activities} sub="llamadas · WhatsApp · correos" />
         </div>
@@ -650,7 +821,6 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
     <div>
       <Header eyebrow={`${rows.length} registros`} title={OBJ[kind].plural}
         right={<>
-          <Btn variant="outline" Icon={Zap} onClick={() => setModal({ kind: "meta" })}>Traer de Meta</Btn>
           <Btn variant="outline" Icon={Upload} onClick={() => setModal({ kind: "import", objKind: kind })}>Cargar archivo</Btn>
           <Btn variant="solid" Icon={Plus} onClick={() => setModal({ kind: "record", objKind: kind })}>Crear {OBJ[kind].singular.toLowerCase()}</Btn>
         </>} />
@@ -935,22 +1105,39 @@ function TemplatesView({ db, setDb, say }) {
    Configuración
    ──────────────────────────────────────────────────────────── */
 function SettingsView({ db, setDb, setModal, say }) {
+  const exportBackup = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(db, null, 2)], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `crm-respaldo-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    say("Respaldo descargado");
+  };
+
+  const restoreBackup = async (file) => {
+    if (!file) return;
+    try {
+      const next = normalizeDb(JSON.parse(await file.text()));
+      const n = next.contacts.length + next.companies.length + next.deals.length;
+      if (!window.confirm(`Se reemplazarán los datos actuales por los del respaldo (${n} registros). Esta acción no se puede deshacer. ¿Continuar?`)) return;
+      setDb({ ...purgeDemoData(next).db, demoPurgedAt: nowISO() });
+      say(`Respaldo restaurado · ${n} registros`);
+    } catch (e) {
+      say(`No pude leer el respaldo: ${(e && e.message) || e}`);
+    }
+  };
+
   const removeProp = (objKind, key) => {
     setDb((d) => ({ ...d, schema: { ...d.schema, [objKind]: d.schema[objKind].filter((f) => f.key !== key) } }));
     say("Propiedad eliminada");
   };
   return (
     <div>
-      <Header eyebrow="Ajustes" title="Propiedades y conexiones"
-        right={<Btn variant="outline" Icon={Zap} onClick={() => setModal({ kind: "meta" })}>Conexión con Meta</Btn>} />
+      <Header eyebrow="Ajustes" title="Propiedades y datos" />
       <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 20 }}>
-        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
-          <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>Meta Lead Ads</div>
-          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginTop: 4 }}>
-            {db.meta.connected ? `Conectado · última sincronización ${fmt(db.meta.lastSync)}` : "Sin conectar. Configura la página y el formulario para traer leads automáticamente."}
-          </div>
-        </div>
-
         {Object.keys(OBJ).map((k) => (
           <div key={k} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
@@ -972,9 +1159,18 @@ function SettingsView({ db, setDb, setModal, say }) {
         ))}
 
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
-          <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Datos</div>
-          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginBottom: 12 }}>Todo se guarda en este espacio de trabajo. Reiniciar borra registros, plantillas y propiedades personalizadas.</div>
-          <Btn variant="danger" Icon={Trash2} onClick={() => { setDb(seed()); say("CRM reiniciado con datos de ejemplo"); }}>Reiniciar con datos de ejemplo</Btn>
+          <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Datos y respaldo</div>
+          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginBottom: 12, lineHeight: 1.6 }}>
+            {db.contacts.length} contactos · {db.companies.length} empresas · {db.deals.length} negocios · {db.activities.length} actividades.
+            <br />Todo queda guardado en este navegador apenas lo escribes. El respaldo es un archivo con la copia completa: sirve para conservarla fuera del equipo o para pasarla a otro navegador.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <Btn variant="outline" Icon={Download} onClick={exportBackup}>Descargar respaldo</Btn>
+            <label className="crm-btn" style={{ display: "inline-flex", alignItems: "center", gap: 6, borderRadius: 6, border: `1px solid ${C.line}`, background: C.panel, color: C.ink, fontFamily: "var(--ui)", fontSize: 13, fontWeight: 500, padding: "7px 12px", cursor: "pointer" }}>
+              <Upload size={14} strokeWidth={2} /> Restaurar respaldo
+              <input type="file" accept=".json,application/json" style={{ display: "none" }} onChange={(e) => { restoreBackup(e.target.files && e.target.files[0]); e.target.value = ""; }} />
+            </label>
+          </div>
         </div>
       </div>
     </div>
@@ -1197,29 +1393,6 @@ function ImportModal({ db, objKind, onClose, onImport }) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   Meta
-   ──────────────────────────────────────────────────────────── */
-function MetaModal({ db, setDb, onClose, onSync }) {
-  const [m, setM] = useState({ ...db.meta });
-  const [n, setN] = useState(3);
-  return (
-    <Modal title="Traer leads desde Meta" subtitle="Conecta la página y el formulario de Lead Ads de Facebook o Instagram." onClose={onClose}
-      footer={<><Btn variant="outline" onClick={() => { setDb((d) => ({ ...d, meta: { ...m } })); onClose(); }}>Guardar conexión</Btn>
-        <Btn variant="solid" Icon={Zap} onClick={() => { setDb((d) => ({ ...d, meta: { ...m } })); onSync(Number(n)); }}>Sincronizar ahora</Btn></>}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field def={{ label: "ID de la página", type: "text" }} value={m.pageId} onChange={(v) => setM({ ...m, pageId: v })} />
-        <Field def={{ label: "ID del formulario de Lead Ads", type: "text" }} value={m.formId} onChange={(v) => setM({ ...m, formId: v })} />
-        <Field def={{ label: "Token de acceso", type: "text" }} value={m.token} onChange={(v) => setM({ ...m, token: v })} />
-        <Field def={{ label: "Leads a traer en esta sincronización", type: "select", options: ["1", "2", "3", "4", "5", "6"] }} value={String(n)} onChange={(v) => setN(v || 1)} />
-      </div>
-      <div style={{ marginTop: 14, background: C.amberSoft, border: `1px solid #E8D5AC`, borderRadius: 7, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12, color: "#6E4C0B", lineHeight: 1.5 }}>
-        Esta demo simula la respuesta de Meta. Para producción, reemplaza la sincronización por el webhook <span style={{ fontFamily: "var(--mono)" }}>leadgen</span> y la llamada a <span style={{ fontFamily: "var(--mono)" }}>/&#123;form-id&#125;/leads</span> de la Graph API; el mapeo de campos ya queda listo.
-      </div>
-    </Modal>
-  );
-}
-
-/* ────────────────────────────────────────────────────────────
    Nueva propiedad
    ──────────────────────────────────────────────────────────── */
 function PropertyModal({ objKind, onClose, onCreate }) {
@@ -1259,13 +1432,30 @@ function SendModal({ db, channel, kind, ids, onClose, onSend }) {
 
   const missingChannel = recipients.filter((r) => channel === "email" ? !r.props.email : !r.props.phone).length;
 
+  const [copied, setCopied] = useState("");
+  const copyAll = async () => {
+    const texto = recipients.map((r) => {
+      const dest = channel === "email" ? r.props.email || "sin correo" : r.props.phone || "sin teléfono";
+      const asunto = channel === "email" ? `\nAsunto: ${applyTemplate(subject, r, kind)}` : "";
+      return `${titleOf(kind, r)} · ${dest}${asunto}\n${applyTemplate(body, r, kind)}`;
+    }).join("\n\n———\n\n");
+    try {
+      await navigator.clipboard.writeText(texto);
+      setCopied(`Copiado · ${recipients.length}`);
+    } catch (e) {
+      setCopied("No se pudo copiar");
+    }
+    setTimeout(() => setCopied(""), 2000);
+  };
+
   return (
-    <Modal wide title={channel === "whatsapp" ? "Enviar plantilla de WhatsApp" : "Enviar correo de marketing"}
-      subtitle={`${recipients.length} destinatario(s) seleccionados`} onClose={onClose}
+    <Modal wide title={channel === "whatsapp" ? "Preparar mensaje de WhatsApp" : "Preparar correo de marketing"}
+      subtitle={`${recipients.length} destinatario(s) · el CRM personaliza el texto y deja la actividad registrada; el envío lo haces desde WhatsApp o tu correo.`} onClose={onClose}
       footer={<><Btn variant="outline" onClick={onClose}>Cancelar</Btn>
-        <Btn variant="solid" Icon={Send} disabled={!body.trim() || recipients.length === 0}
+        <Btn variant="outline" Icon={Copy} disabled={!body.trim() || recipients.length === 0} onClick={copyAll}>{copied || "Copiar textos"}</Btn>
+        <Btn variant="solid" Icon={Check} disabled={!body.trim() || recipients.length === 0}
           onClick={() => onSend({ subject: t ? `Plantilla: ${t.name}` : channel === "email" ? subject || "Correo de marketing" : "Mensaje de WhatsApp", body })}>
-          Enviar a {recipients.length}</Btn></>}>
+          Registrar en {recipients.length}</Btn></>}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <Field def={{ label: "Plantilla", type: "select", options: templates.map((x) => x.name) }}
@@ -1275,7 +1465,7 @@ function SendModal({ db, channel, kind, ids, onClose, onSend }) {
           <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Variables: {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"}, {"{{empresa}}"}</div>
           {missingChannel > 0 && (
             <div style={{ background: C.claySoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>
-              {missingChannel} destinatario(s) no tienen {channel === "email" ? "correo" : "teléfono"}. Complétalos antes de enviar para no perder el envío.
+              {missingChannel} destinatario(s) no tienen {channel === "email" ? "correo" : "teléfono"}. Complétalos para poder contactarlos.
             </div>
           )}
         </div>
