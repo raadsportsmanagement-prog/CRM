@@ -13,10 +13,14 @@ if (!window.storage) {
       const value = localStorage.getItem(key);
       return value === null ? null : { value };
     },
-    async set(key, value) {
+    /* set y delete no son `async` a propósito: localStorage escribe en el acto,
+       y así un fallo —quedarse sin espacio, sobre todo— se conoce en el mismo
+       instante del intento. Envueltos en async el error llegaría un turno
+       después, cuando la pestaña que se está cerrando ya no puede avisar. */
+    set(key, value) {
       localStorage.setItem(key, value);
     },
-    async delete(key) {
+    delete(key) {
       localStorage.removeItem(key);
     },
   };

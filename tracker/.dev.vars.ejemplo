@@ -1,0 +1,33 @@
+# Copia este archivo a ".dev.vars" para probar en local con `npx wrangler dev`.
+# ".dev.vars" no entra al repositorio.
+#
+# En producción nada de esto se escribe en un archivo: cada línea se guarda
+# cifrada en Cloudflare con `npx wrangler secret put NOMBRE`.
+
+# ── El medidor de correos ──
+CLAVE=una-clave-larga-e-inventada
+
+# ── Meta: leads de Facebook e Instagram, y métricas de campaña ──
+# Token de usuario de sistema, con permisos leads_retrieval, pages_show_list,
+# pages_read_engagement y ads_read. Se saca en business.facebook.com →
+# Configuración del negocio → Usuarios de sistema → Generar token.
+META_TOKEN=
+
+# Sólo si el token de arriba no alcanza para leer los formularios de la página
+# (Meta a veces exige un token de página aparte). Si lo dejas vacío se usa
+# META_TOKEN, que es lo normal.
+META_PAGE_TOKEN=
+
+# ── WhatsApp Cloud API ──
+# Token permanente de la app de WhatsApp. Suele ser el mismo usuario de sistema
+# de arriba, pero con el permiso whatsapp_business_messaging añadido.
+WA_TOKEN=
+
+# ── Google Ads ──
+# El secreto del ID de cliente de OAuth. El ID va en wrangler.toml; esto no.
+GADS_CLIENT_SECRET=
+
+# El developer token de tu cuenta administradora de Google Ads. Se pide en
+# ads.google.com → Herramientas → Centro de API, y Google tarda días en
+# aprobarlo. Sin él la API no contesta.
+GADS_DEV_TOKEN=

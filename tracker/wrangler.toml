@@ -1,0 +1,56 @@
+name = "crm-medidor"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Donde se anotan los eventos. Crea el espacio con:
+#   npx wrangler kv namespace create EVENTOS
+# y pega abajo el id que imprime.
+#
+# El mismo espacio guarda ahora el permiso de Google Ads, que el puente pide
+# una vez y renueva solo. Por eso hace falta aunque no midas correos.
+[[kv_namespaces]]
+binding = "EVENTOS"
+id = "PEGA_AQUI_EL_ID"
+
+# La clave NO va en este archivo: este archivo entra al repositorio.
+# Se guarda cifrada en Cloudflare con:
+#   npx wrangler secret put CLAVE
+
+# ─────────────────────────────────────────────────────────────
+# El puente: Meta, WhatsApp y Google Ads
+#
+# Aquí abajo van sólo identificadores —el número de una página, el de una
+# cuenta publicitaria—. No son secretos: no sirven para entrar a ninguna
+# parte, y quien vea este archivo ya tiene el repositorio.
+#
+# Los tokens son otra cosa y NO van aquí. Cada uno se guarda cifrado con
+# `npx wrangler secret put NOMBRE`, y la lista está en el README.
+#
+# Deja en blanco lo que no uses: el puente apaga solo la parte que le falte
+# configuración, en vez de fallar a medias.
+# ─────────────────────────────────────────────────────────────
+[vars]
+# Meta — la página de Facebook cuyos formularios de Lead Ads se leen.
+# Está en la página → Configuración → Información, como "Identificador".
+META_PAGE_ID = ""
+
+# Meta — la cuenta publicitaria, para las métricas de campaña.
+# Está en el Administrador de anuncios, arriba, como "act_123456789".
+META_AD_ACCOUNT = ""
+
+# WhatsApp — el identificador del número remitente. NO es el número de
+# teléfono: está en developers.facebook.com → tu app → WhatsApp → Configuración
+# de la API, como "Identificador del número de teléfono".
+WA_PHONE_ID = ""
+
+# Google Ads — el ID de cliente de OAuth (termina en .apps.googleusercontent.com).
+# Identifica la aplicación, no a ti; el secreto sí va aparte.
+GADS_CLIENT_ID = ""
+
+# Google Ads — el número de la cuenta que se va a leer, con o sin guiones.
+GADS_CUSTOMER_ID = ""
+
+# Google Ads — sólo si esa cuenta cuelga de una cuenta administradora (MCC):
+# el número del MCC. Si la cuenta es suelta, déjalo en blanco; ponerlo igual
+# hace que Google conteste que la cuenta no existe.
+GADS_LOGIN_CUSTOMER_ID = ""
