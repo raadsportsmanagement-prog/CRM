@@ -2,8 +2,14 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   LayoutDashboard, Users, Building2, Briefcase, Activity, MessageSquare, Mail,
   Phone, Settings, Plus, Upload, Search, X, Check, ChevronDown, Trash2, Copy,
-  FileText, Clock, Eye, Download
+  FileText, Clock, Eye, Download, Plug, Send, ExternalLink, ShieldCheck, LogOut,
+  Code2, Paperclip
 } from "lucide-react";
+import {
+  EMAIL_MODES, normalizeIntegrations, toE164, waLink,
+  gmailComposeLink, mailtoLink, gmailStatus, onGmailChange, connectGmail,
+  disconnectGmail, sendGmail, withSignature, withSignatureHtml, htmlToText, escapeHtml,
+} from "./integrations.js";
 
 /* ────────────────────────────────────────────────────────────
    Paleta y tipografía
@@ -134,7 +140,10 @@ function parseCSV(text) {
   return rows.filter((r) => r.some((c) => String(c).trim() !== "")).map((r) => r.map((c) => c.trim()));
 }
 
-const applyTemplate = (text, rec, kind) => {
+/* enHtml: dentro de una plantilla HTML las variables se escapan antes de
+   entrar. Una institución llamada "Ríos & Cía." no debe poder abrir una
+   etiqueta ni romper un atributo del diseño. */
+const applyTemplate = (text, rec, kind, enHtml) => {
   const p = rec.props || {};
   const map = {
     nombre: p.firstName || p.name || "",
@@ -144,7 +153,11 @@ const applyTemplate = (text, rec, kind) => {
     correo: p.email || "",
     telefono: p.phone || "",
   };
-  return String(text || "").replace(/\{\{\s*([a-zA-ZñÑáéíóú_]+)\s*\}\}/g, (m, k) => map[norm(k)] ?? m);
+  return String(text || "").replace(/\{\{\s*([a-zA-ZñÑáéíóú_]+)\s*\}\}/g, (m, k) => {
+    const v = map[norm(k)];
+    if (v == null) return m;
+    return enHtml ? escapeHtml(v) : v;
+  });
 };
 
 const titleOf = (kind, rec) => {
@@ -171,6 +184,7 @@ const emptyDb = () => ({
   deals: [],
   activities: [],
   templates: { whatsapp: [], email: [] },
+  integrations: normalizeIntegrations(null),
 });
 
 /* Completa las claves que falten sin descartar nada de lo guardado: si el
@@ -188,10 +202,13 @@ function normalizeDb(raw) {
     companies: arr(d.companies),
     deals: arr(d.deals),
     activities: arr(d.activities),
+    /* Las plantillas guardadas antes del diseño HTML no traen ese campo: se
+       completa vacío para que la pantalla no tenga que adivinarlo. */
     templates: {
-      whatsapp: arr(d.templates && d.templates.whatsapp),
-      email: arr(d.templates && d.templates.email),
+      whatsapp: arr(d.templates && d.templates.whatsapp).map((t) => ({ ...t, html: "" })),
+      email: arr(d.templates && d.templates.email).map((t) => ({ ...t, html: String((t && t.html) || "") })),
     },
+    integrations: normalizeIntegrations(d.integrations),
   };
 }
 
@@ -354,6 +371,14 @@ const Field = ({ def, value, onChange }) => (
   </label>
 );
 
+/* El permiso de Gmail vive en un módulo, no en React: este hook deja que
+   cualquier pantalla se entere cuando se conecta o se cae. */
+function useGmail() {
+  const [st, setSt] = useState(gmailStatus);
+  useEffect(() => onGmailChange(setSt), []);
+  return st;
+}
+
 const Empty = ({ title, hint, action }) => (
   <div style={{ padding: "56px 24px", textAlign: "center" }}>
     <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, color: C.ink }}>{title}</div>
@@ -471,6 +496,18 @@ export default function CRM() {
     };
   }, [persist]);
 
+  /* Google recuerda el consentimiento, así que al recargar se puede recuperar
+     el permiso sin abrir ninguna ventana ni preguntar nada. Si falla se queda
+     desconectado en silencio: el usuario lo verá en Conexiones. */
+  const triedGmail = useRef(false);
+  const emailCfg = db && db.integrations.email;
+  useEffect(() => {
+    if (triedGmail.current) return;
+    if (!emailCfg || emailCfg.mode !== "gmailApi" || !emailCfg.clientId) return;
+    triedGmail.current = true;
+    connectGmail(emailCfg.clientId, { silent: true }).catch(() => {});
+  }, [emailCfg && emailCfg.mode, emailCfg && emailCfg.clientId]);
+
   /* ── mutaciones ── */
   const collKey = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : "deals");
 
@@ -514,6 +551,7 @@ export default function CRM() {
     { key: "deal", label: "Negocios", Icon: Briefcase },
     { key: "activities", label: "Actividades", Icon: Activity },
     { key: "templates", label: "Plantillas", Icon: MessageSquare },
+    { key: "connections", label: "Conexiones", Icon: Plug },
     { key: "settings", label: "Configuración", Icon: Settings },
   ];
 
@@ -537,8 +575,8 @@ export default function CRM() {
         {/* Rail */}
         <aside style={{ width: 208, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: "#E9EDE5", padding: "18px 12px", display: "flex", flexDirection: "column", gap: 4, position: "sticky", top: 0, height: "100vh" }}>
           <div style={{ padding: "0 8px 18px" }}>
-            <div style={{ fontFamily: "var(--display)", fontSize: 18, fontWeight: 700, letterSpacing: "-.02em" }}>Cuaderno</div>
-            <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".08em", textTransform: "uppercase", marginTop: 2 }}>CRM comercial</div>
+            <img src="/raadsports-logo.png" alt="Raad Sports Management" style={{ display: "block", width: "100%", maxWidth: 168, height: "auto" }} />
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".08em", textTransform: "uppercase", marginTop: 6 }}>CRM comercial</div>
           </div>
           {NAV.map(({ key, label, Icon }) => {
             const on = view === key;
@@ -569,6 +607,7 @@ export default function CRM() {
           {view === "deal" && <DealsView db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord("deal", id, { stage, lastActivityAt: nowISO() }); say(`Negocio movido a ${stage}`); }} />}
           {view === "activities" && <ActivitiesView db={db} setModal={setModal} />}
           {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say} />}
+          {view === "connections" && <ConnectionsView db={db} setDb={setDb} say={say} />}
           {view === "settings" && <SettingsView db={db} setDb={setDb} setModal={setModal} say={say} />}
         </main>
       </div>
@@ -623,10 +662,13 @@ export default function CRM() {
       {modal?.kind === "send" && (
         <SendModal db={db} channel={modal.channel} kind={modal.objKind} ids={modal.ids}
           onClose={() => setModal(null)}
+          onLogOne={(id, payload) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) })}
           onSend={(payload) => {
-            modal.ids.forEach((id) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) }));
+            /* Se registra sólo en los que quedaron marcados en el modal. */
+            const dest = payload.ids || modal.ids;
+            dest.forEach((id) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) }));
             setModal(null);
-            say(`Envío registrado en ${modal.ids.length} registro(s)`);
+            say(`Envío registrado en ${dest.length} registro(s)`);
           }} />
       )}
       {modal?.kind === "deal" && (
@@ -1044,6 +1086,98 @@ function ActivitiesView({ db, setModal }) {
 }
 
 /* ────────────────────────────────────────────────────────────
+   Diseño HTML del correo
+   Una plantilla de correo puede llevar, además del texto, una pieza en HTML:
+   la que diseñaste aparte y guardaste como .html. Se carga del disco o se
+   pega, se queda dentro de la plantilla y viaja junto al texto en el mismo
+   correo, así que quien no vea el diseño lee el mensaje igual.
+   ──────────────────────────────────────────────────────────── */
+
+/* La vista previa va dentro de un iframe con el sandbox vacío: el diseño se
+   ve tal como saldrá, pero no puede ejecutar scripts ni tocar el CRM. Es la
+   misma cautela que aplica cualquier lector de correo. */
+const HtmlPreview = ({ html, height = 240 }) => (
+  <iframe title="Vista previa del diseño" sandbox="" srcDoc={html || ""}
+    style={{ width: "100%", height, border: `1px solid ${C.line}`, borderRadius: 8, background: "#fff", display: "block" }} />
+);
+
+const pesoKb = (t) => Math.round(new Blob([t || ""]).size / 1024);
+
+/* Anexar el HTML: cargarlo de un archivo o pegarlo, verlo y quitarlo.
+   El archivo se lee en el navegador; no se sube a ningún lado. */
+function HtmlAttach({ value, onChange }) {
+  const input = useRef(null);
+  const [tab, setTab] = useState("diseno");
+  const [err, setErr] = useState("");
+  const html = value || "";
+  const kb = pesoKb(html);
+
+  const cargar = (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = ""; // permite volver a cargar el mismo archivo tras editarlo
+    if (!f) return;
+    setErr("");
+    if (f.size > 500_000) {
+      setErr("El archivo pesa más de 500 KB. Un correo así no lo acepta ningún lector: aligera el diseño o deja las imágenes enlazadas en vez de incrustadas.");
+      return;
+    }
+    const fr = new FileReader();
+    fr.onload = () => { onChange(String(fr.result || "")); setTab("diseno"); };
+    fr.onerror = () => setErr("No se pudo leer el archivo.");
+    fr.readAsText(f, "UTF-8");
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em", flex: 1 }}>
+          DISEÑO HTML (OPCIONAL)
+        </div>
+        {html && <Pill color={C.blue} soft={C.blueSoft}>{kb} KB</Pill>}
+        <input ref={input} type="file" accept=".html,.htm,text/html" onChange={cargar} style={{ display: "none" }} />
+        <Btn size="sm" variant="outline" Icon={Paperclip} onClick={() => input.current && input.current.click()}>
+          {html ? "Reemplazar archivo" : "Anexar archivo .html"}
+        </Btn>
+        {html && <Btn size="sm" variant="ghost" Icon={Trash2} onClick={() => { setErr(""); onChange(""); }}>Quitar</Btn>}
+      </div>
+
+      {!html && !err && (
+        <div style={{ border: `1px dashed ${C.line}`, borderRadius: 8, padding: "14px 14px", fontFamily: "var(--ui)", fontSize: 12, color: C.faint, lineHeight: 1.6 }}>
+          Sin diseño: el correo sale como texto. Anexa un archivo <b>.html</b> —o escríbelo aquí mismo— para
+          enviarlo con formato. Las variables {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"} y {"{{empresa}}"} también
+          se reemplazan dentro del HTML.
+          <div style={{ marginTop: 9 }}>
+            <Btn size="sm" variant="outline" Icon={Code2} onClick={() => { setTab("codigo"); onChange("<p>Hola {{nombre}},</p>\n"); }}>Escribir el HTML</Btn>
+          </div>
+        </div>
+      )}
+
+      {html && (
+        <>
+          <div style={{ display: "flex", gap: 6, marginBottom: 7 }}>
+            {[["diseno", "Diseño"], ["codigo", "Código"]].map(([k, l]) => (
+              <button key={k} type="button" onClick={() => setTab(k)} className="crm-btn"
+                style={{ border: `1px solid ${tab === k ? C.blue : C.line}`, background: tab === k ? C.blueSoft : C.panel, color: tab === k ? C.blue : C.mute, borderRadius: 999, padding: "3px 11px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer" }}>{l}</button>
+            ))}
+          </div>
+          {tab === "diseno"
+            ? <HtmlPreview html={html} />
+            : <textarea className="crm-in" rows={10} value={html} onChange={(e) => onChange(e.target.value)} spellCheck={false}
+                style={{ ...inputStyle, resize: "vertical", fontFamily: "var(--mono)", fontSize: 12, lineHeight: 1.5 }} />}
+          {kb > 100 && (
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.amber, marginTop: 6, lineHeight: 1.5 }}>
+              Pesa {kb} KB. Gmail recorta los correos que pasan de ~100 KB y muestra “Mensaje recortado”; conviene aligerarlo.
+            </div>
+          )}
+        </>
+      )}
+
+      {err && <div style={{ background: C.claySoft, borderRadius: 6, padding: "8px 10px", marginTop: 7, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>{err}</div>}
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
    Plantillas
    ──────────────────────────────────────────────────────────── */
 function TemplatesView({ db, setDb, say }) {
@@ -1064,7 +1198,7 @@ function TemplatesView({ db, setDb, say }) {
   return (
     <div>
       <Header eyebrow="Mensajería" title="Plantillas"
-        right={<Btn variant="solid" Icon={Plus} onClick={() => setDraft({ id: uid(), name: "", subject: "", body: "" })}>Nueva plantilla</Btn>} />
+        right={<Btn variant="solid" Icon={Plus} onClick={() => setDraft({ id: uid(), name: "", subject: "", body: "", html: "" })}>Nueva plantilla</Btn>} />
       <div style={{ padding: "14px 28px", display: "flex", gap: 7, borderBottom: `1px solid ${C.line}` }}>
         {[["whatsapp", "WhatsApp"], ["email", "Correo de marketing"]].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} className="crm-btn" style={{ border: `1px solid ${tab === k ? C.jade : C.line}`, background: tab === k ? C.jade : C.panel, color: tab === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>{l}</button>
@@ -1081,6 +1215,7 @@ function TemplatesView({ db, setDb, say }) {
               </div>
             </div>
             {t.subject && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.blue, marginTop: 6 }}>Asunto: {t.subject}</div>}
+            {t.html && <div style={{ marginTop: 7 }}><Pill color={C.blue} soft={C.blueSoft}>HTML anexo · {pesoKb(t.html)} KB</Pill></div>}
             <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginTop: 8, whiteSpace: "pre-wrap", lineHeight: 1.55 }}>{t.body}</div>
           </div>
         ))}
@@ -1088,12 +1223,23 @@ function TemplatesView({ db, setDb, say }) {
       </div>
 
       {draft && (
-        <Modal title="Plantilla" subtitle="Usa {{nombre}}, {{apellido}}, {{institucion}} o {{empresa}} para personalizar." onClose={() => setDraft(null)}
+        <Modal wide={tab === "email"} title="Plantilla" subtitle="Usa {{nombre}}, {{apellido}}, {{institucion}} o {{empresa}} para personalizar." onClose={() => setDraft(null)}
           footer={<><Btn variant="outline" onClick={() => setDraft(null)}>Cancelar</Btn><Btn variant="solid" Icon={Check} onClick={save}>Guardar plantilla</Btn></>}>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <Field def={{ label: "Nombre de la plantilla", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
             {tab === "email" && <Field def={{ label: "Asunto", type: "text" }} value={draft.subject} onChange={(v) => setDraft({ ...draft, subject: v })} />}
-            <Field def={{ label: "Mensaje", type: "textarea" }} value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+            <Field def={{ label: tab === "email" && draft.html ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }}
+              value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+            {tab === "email" && (
+              <>
+                {draft.html && !String(draft.body || "").trim() && (
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: -4, lineHeight: 1.5 }}>
+                    Si lo dejas vacío, el respaldo se saca automáticamente del diseño.
+                  </div>
+                )}
+                <HtmlAttach value={draft.html} onChange={(v) => setDraft({ ...draft, html: v })} />
+              </>
+            )}
           </div>
         </Modal>
       )}
@@ -1104,6 +1250,201 @@ function TemplatesView({ db, setDb, say }) {
 /* ────────────────────────────────────────────────────────────
    Configuración
    ──────────────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────
+   Conexiones
+   ──────────────────────────────────────────────────────────── */
+const Card = ({ title, badge, children }) => (
+  <div style={{ background: C.panel, border: "1px solid " + C.line, borderRadius: 9, padding: 18 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 10, flexWrap: "wrap" }}>
+      <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>{title}</div>
+      {badge}
+    </div>
+    {children}
+  </div>
+);
+
+const Prose = ({ children }) => (
+  <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.65 }}>{children}</div>
+);
+
+const Mono = ({ children }) => (
+  <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, background: "#F1F3EE", padding: "1px 5px", borderRadius: 4, color: C.ink, overflowWrap: "anywhere" }}>{children}</span>
+);
+
+function ConnectionsView({ db, setDb, say }) {
+  const integ = db.integrations;
+  const gmail = useGmail();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [probe, setProbe] = useState("");
+  const [guide, setGuide] = useState(false);
+
+  const patch = (canal, p) => setDb((d) => ({
+    ...d,
+    integrations: normalizeIntegrations({ ...d.integrations, [canal]: { ...d.integrations[canal], ...p } }),
+  }));
+
+  const gente = [...db.contacts, ...db.companies];
+  const conTel = gente.filter((r) => r.props.phone).length;
+  const conMail = gente.filter((r) => r.props.email).length;
+
+  const cc = integ.whatsapp.countryCode;
+  const ejemplo = probe || (gente.find((r) => r.props.phone) || {}).props?.phone || "";
+  const resuelto = toE164(ejemplo, cc);
+
+  const modo = integ.email.mode;
+  const origen = window.location.origin;
+  const [copiado, setCopiado] = useState(false);
+  const copiarOrigen = async () => {
+    try { await navigator.clipboard.writeText(origen); setCopiado(true); setTimeout(() => setCopiado(false), 1800); } catch (_) {}
+  };
+  const BotonOrigen = () => (
+    <button onClick={copiarOrigen} className="crm-btn"
+      style={{ border: "1px solid " + C.line, background: "#F1F3EE", borderRadius: 4, padding: "1px 6px", cursor: "pointer", fontFamily: "var(--mono)", fontSize: 11.5, color: C.ink }}>
+      {copiado ? "copiado ✓" : origen}
+    </button>
+  );
+
+  const conectar = async () => {
+    setErr(""); setBusy(true);
+    try {
+      const st = await connectGmail(integ.email.clientId);
+      patch("email", { account: st.account });
+      say(st.account ? "Gmail conectado · " + st.account : "Gmail conectado");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <Header eyebrow="Ajustes" title="Conexiones" />
+      <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 20, maxWidth: 880 }}>
+
+        {/* ── WhatsApp ── */}
+        <Card title="WhatsApp" badge={<Pill color={C.jade} soft={C.jadeSoft}>Listo para usar</Pill>}>
+          <Prose>
+            El CRM personaliza el mensaje con los datos de cada registro y abre WhatsApp con el texto
+            ya escrito en el chat correcto: tú das el último clic para enviar. Funciona con tu WhatsApp
+            de siempre —el del celular o WhatsApp Web—, sin cuenta de empresa ni permisos de Meta.
+            <br /><br />
+            El envío automático existe (WhatsApp Cloud API), pero pide un token permanente de Meta.
+            Guardarlo aquí lo dejaría legible para cualquiera que abra este navegador, y además Meta
+            sólo deja iniciar conversaciones con plantillas que ellos aprueban antes. Por eso el CRM
+            no lo ofrece: haría falta un servidor propio donde el token esté a resguardo.
+          </Prose>
+
+          <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 14, marginTop: 16, alignItems: "start" }}>
+            <Field def={{ label: "Indicativo del país" }} value={cc} onChange={(v) => patch("whatsapp", { countryCode: v.replace(/\D/g, "").slice(0, 4) })} />
+            <Field def={{ label: "Probar un número" }} value={probe} onChange={setProbe} />
+          </div>
+          <Prose>
+            <div style={{ marginTop: 10 }}>
+              {ejemplo ? (
+                resuelto
+                  ? <>Se marcará a <Mono>+{resuelto}</Mono>{" · "}
+                      <a href={waLink(ejemplo, "", cc)} target="_blank" rel="noreferrer" style={{ color: C.jade, fontWeight: 600 }}>abrir este chat</a></>
+                  : <>Ese número no tiene dígitos que WhatsApp pueda marcar.</>
+              ) : <>Escribe un número arriba para ver cómo quedará marcado.</>}
+            </div>
+            <div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>
+              Los números que empiezan por <Mono>+</Mono> o <Mono>00</Mono> se respetan tal cual; a los demás se les
+              antepone el indicativo. {conTel} de {gente.length} registros tienen teléfono.
+            </div>
+          </Prose>
+        </Card>
+
+        {/* ── Correo ── */}
+        <Card title="Correo electrónico"
+          badge={modo === "gmailApi"
+            ? (gmail.connected
+                ? <Pill color={C.jade} soft={C.jadeSoft}>Conectado{gmail.account ? " · " + gmail.account : ""}</Pill>
+                : <Pill color={C.amber} soft={C.amberSoft}>Sin conectar</Pill>)
+            : <Pill color={C.blue} soft={C.blueSoft}>Listo para usar</Pill>}>
+          <Prose>Elige cómo quieres que salga cada correo desde el CRM.</Prose>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "14px 0" }}>
+            {Object.entries(EMAIL_MODES).map(([key, label]) => (
+              <label key={key} style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid " + (modo === key ? C.jade : C.line), background: modo === key ? "#F7FAF8" : C.panel, borderRadius: 7, padding: "10px 12px", cursor: "pointer" }}>
+                <input type="radio" name="modo-correo" checked={modo === key} onChange={() => { setErr(""); patch("email", { mode: key }); }} style={{ marginTop: 2, accentColor: C.jade }} />
+                <div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>{label}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>
+                    {key === "gmailApi" && "El CRM envía por ti, uno tras otro, y cada correo queda en tus Enviados de Gmail. Requiere autorizar la cuenta una vez (abajo)."}
+                    {key === "gmailCompose" && "Abre Gmail en una pestaña con el destinatario, el asunto y el texto ya puestos. Tú revisas y le das a Enviar. Sin configurar nada."}
+                    {key === "mailto" && "Abre el programa de correo del computador (Mail, Outlook) con el borrador listo."}
+                  </div>
+                </div>
+              </label>
+            ))}
+          </div>
+
+          {modo === "gmailApi" && (
+            <div style={{ borderTop: "1px solid " + C.line, paddingTop: 14 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "end" }}>
+                <Field def={{ label: "ID de cliente de Google" }} value={integ.email.clientId}
+                  onChange={(v) => { setErr(""); patch("email", { clientId: v.trim() }); }} />
+                {gmail.connected
+                  ? <Btn variant="outline" Icon={LogOut} onClick={() => { disconnectGmail(); patch("email", { account: "" }); say("Gmail desconectado"); }}>Desconectar</Btn>
+                  : <Btn variant="solid" Icon={ShieldCheck} disabled={busy || !integ.email.clientId} onClick={conectar}>{busy ? "Autorizando…" : "Conectar Gmail"}</Btn>}
+              </div>
+
+              {err && (
+                <div style={{ marginTop: 10, background: C.claySoft, color: C.clay, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6 }}>
+                  <div style={{ fontWeight: 600 }}>{err}</div>
+                  <div style={{ marginTop: 8, color: C.ink }}>
+                    Casi siempre es una de dos. En <b>Google Cloud → Credenciales → tu ID de cliente</b>:
+                    <ol style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                      <li>Que <b>Orígenes autorizados de JavaScript</b> tenga exactamente <BotonOrigen /> (clic para copiar). Si está vacío, Google responde <i>“no registered origin”</i>.</li>
+                      <li>Que tu correo esté en <b>Usuarios de prueba</b>, en la pantalla de consentimiento.</li>
+                    </ol>
+                    <div style={{ marginTop: 6, color: C.mute }}>Después de guardar en Google, los cambios tardan unos minutos en surtir efecto.</div>
+                  </div>
+                </div>
+              )}
+
+              <Prose>
+                <div style={{ marginTop: 10, fontSize: 11.5, color: C.faint }}>
+                  El CRM sólo pide el permiso <Mono>gmail.send</Mono>: alcanza para enviar y para nada más —no puede
+                  leer, buscar ni borrar tu correo. El permiso dura una hora, se queda en memoria y nunca se guarda
+                  en el disco; al recargar la página se renueva solo, sin volver a preguntarte.
+                </div>
+              </Prose>
+
+              <button onClick={() => setGuide(!guide)} className="crm-btn"
+                style={{ marginTop: 12, background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}>
+                <ChevronDown size={14} style={{ transform: guide ? "rotate(180deg)" : "none", transition: "transform .15s" }} />
+                Cómo obtener el ID de cliente
+              </button>
+
+              {guide && (
+                <ol style={{ margin: "10px 0 0", paddingLeft: 20, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.75 }}>
+                  <li>Entra a <a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer" style={{ color: C.jade }}>console.cloud.google.com</a> y crea un proyecto (o usa uno que ya tengas).</li>
+                  <li><b>APIs y servicios → Biblioteca</b>: busca <b>Gmail API</b> y actívala.</li>
+                  <li><b>Pantalla de consentimiento de OAuth</b>: tipo <b>Externo</b>. En <b>Usuarios de prueba</b> agrega tu propio correo, si no Google bloqueará la autorización.</li>
+                  <li><b>Credenciales → Crear credenciales → ID de cliente de OAuth</b>, tipo <b>Aplicación web</b>.</li>
+                  <li>En <b>Orígenes autorizados de JavaScript</b> agrega exactamente <BotonOrigen /> — sin barra al final, y es un campo distinto del de redireccionamiento. Sin esto Google rechaza la conexión con <i>“no registered origin”</i>.</li>
+                  <li>Copia el <b>ID de cliente</b> (termina en <Mono>.apps.googleusercontent.com</Mono>) y pégalo arriba. El <i>secreto</i> no se usa aquí: no hace falta y no debe pegarse.</li>
+                </ol>
+              )}
+            </div>
+          )}
+
+          <div style={{ borderTop: "1px solid " + C.line, paddingTop: 14, marginTop: 14 }}>
+            <Field def={{ label: "Firma al pie de cada correo", type: "textarea" }} value={integ.email.signature}
+              onChange={(v) => patch("email", { signature: v })} />
+            <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>Se agrega al final del mensaje, separada por una línea. {conMail} de {gente.length} registros tienen correo.</div></Prose>
+          </div>
+        </Card>
+
+        <Prose>
+          Las conexiones se guardan junto al resto del cuaderno y viajan en el respaldo. El ID de cliente de Google
+          no es un secreto —identifica la app, no a ti— pero el permiso de la cuenta nunca sale de esta pestaña.
+        </Prose>
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({ db, setDb, setModal, say }) {
   const exportBackup = () => {
     const url = URL.createObjectURL(new Blob([JSON.stringify(db, null, 2)], { type: "application/json" }));
@@ -1414,30 +1755,149 @@ function PropertyModal({ objKind, onClose, onCreate }) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   Envío de plantillas
+   Preparar y enviar
+   El texto se personaliza por destinatario y el envío sale por el canal que
+   esté configurado en Conexiones. Cada envío queda registrado en el momento
+   en que ocurre —uno a uno—, no en bloque al final: si algo falla a mitad de
+   camino, el historial refleja lo que de verdad salió.
    ──────────────────────────────────────────────────────────── */
-function SendModal({ db, channel, kind, ids, onClose, onSend }) {
+function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
+  const integ = db.integrations;
+  const gmail = useGmail();
   const templates = db.templates[channel];
   const [tid, setTid] = useState(templates[0]?.id || "");
   const t = templates.find((x) => x.id === tid);
   const [subject, setSubject] = useState(t?.subject || "");
   const [body, setBody] = useState(t?.body || "");
+  const [html, setHtml] = useState(t?.html || "");
 
-  useEffect(() => { const n = templates.find((x) => x.id === tid); setSubject(n?.subject || ""); setBody(n?.body || ""); }, [tid]);
+  useEffect(() => {
+    const n = templates.find((x) => x.id === tid);
+    setSubject(n?.subject || ""); setBody(n?.body || ""); setHtml(n?.html || "");
+  }, [tid]);
+
+  const [done, setDone] = useState(() => new Set());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [copied, setCopied] = useState("");
+  const [copiedHtml, setCopiedHtml] = useState("");
+  const [vista, setVista] = useState("diseno");
+
+  /* Quien recibe. La lista llega marcada entera —lo normal es escribirle a
+     todos los que se traian seleccionados— y quitar a alguien es un clic. */
+  const [chosen, setChosen] = useState(() => new Set(ids));
+  const [buscar, setBuscar] = useState("");
 
   const coll = kind === "contact" ? db.contacts : db.companies;
-  const recipients = coll.filter((r) => ids.includes(r.id));
+  const candidatos = coll.filter((r) => ids.includes(r.id));
+  const recipients = candidatos.filter((r) => chosen.has(r.id));
   const first = recipients[0];
   const ch = CHANNEL[channel];
+  const cc = integ.whatsapp.countryCode;
+  const modo = integ.email.mode;
+  const esCorreo = channel === "email";
+  const porApi = esCorreo && modo === "gmailApi";
 
-  const missingChannel = recipients.filter((r) => channel === "email" ? !r.props.email : !r.props.phone).length;
+  const destOf = (r) => (esCorreo ? String(r.props.email || "").trim() : toE164(r.props.phone, cc));
+  const sendable = recipients.filter((r) => destOf(r));
+  const missingChannel = recipients.length - sendable.length;
+  const pending = sendable.filter((r) => !done.has(r.id));
 
-  const [copied, setCopied] = useState("");
+  const conDato = candidatos.filter((r) => destOf(r));
+  const filtro = buscar.trim().toLowerCase();
+  const visibles = filtro
+    ? candidatos.filter((r) => `${titleOf(kind, r)} ${destOf(r)}`.toLowerCase().includes(filtro))
+    : candidatos;
+  /* Se pintan hasta 100 filas: una lista masiva no se recorre a ojo, se filtra.
+     Los botones de arriba siguen actuando sobre la lista completa. */
+  const listados = visibles.slice(0, 100);
+  const toggle = (id) => setChosen((s) => {
+    const n = new Set(s);
+    if (n.has(id)) n.delete(id); else n.add(id);
+    return n;
+  });
+
+  /* El diseño sólo cuenta en correo: por WhatsApp no hay HTML que valga. */
+  const conHtml = esCorreo && Boolean(String(html).trim());
+
+  const asuntoDe = (r) => (esCorreo ? applyTemplate(subject, r, kind).trim() || "Correo de marketing" : "");
+
+  /* Versión en texto: la escrita a mano y, si no hay, la que se saca del
+     diseño. Nunca se manda un correo con el cuerpo vacío. */
+  const cuerpoDe = (r) => {
+    const escrito = applyTemplate(body, r, kind);
+    const txt = escrito.trim() || (conHtml ? htmlToText(applyTemplate(html, r, kind, true)) : escrito);
+    return esCorreo ? withSignature(txt, integ.email.signature) : txt;
+  };
+
+  const htmlDe = (r) => (conHtml ? withSignatureHtml(applyTemplate(html, r, kind, true), integ.email.signature) : "");
+  const asuntoLog = (r) => (esCorreo ? asuntoDe(r) : t ? `WhatsApp · ${t.name}` : "Mensaje de WhatsApp");
+
+  const marcar = (r) => {
+    onLogOne(r.id, { subject: asuntoLog(r), body: cuerpoDe(r) });
+    setDone((s) => new Set(s).add(r.id));
+  };
+
+  /* mailto: no puede abrirse con window.open sin dejar una pestaña huérfana;
+     un enlace pinchado por código llama al programa de correo y ya. */
+  const abrirUrl = (url) => {
+    if (url.startsWith("mailto:")) {
+      const a = document.createElement("a");
+      a.href = url;
+      document.body.appendChild(a); a.click(); a.remove();
+      return true;
+    }
+    return Boolean(window.open(url, "_blank", "noopener,noreferrer"));
+  };
+
+  const abrirSiguiente = () => {
+    const r = pending[0];
+    if (!r) return;
+    setErr("");
+    const url = !esCorreo
+      ? waLink(r.props.phone, cuerpoDe(r), cc)
+      : modo === "mailto"
+        ? mailtoLink({ to: destOf(r), subject: asuntoDe(r), body: cuerpoDe(r) })
+        : gmailComposeLink({ to: destOf(r), subject: asuntoDe(r), body: cuerpoDe(r) });
+    if (!abrirUrl(url)) {
+      setErr("El navegador bloqueó la ventana. Permite las ventanas emergentes para este sitio y vuelve a intentar.");
+      return;
+    }
+    marcar(r);
+  };
+
+  /* Envío real por la API de Gmail, uno tras otro. Si uno falla se detiene ahí
+     y se dice cuántos alcanzaron a salir: seguir a ciegas dejaría el historial
+     mintiendo sobre lo que pasó. */
+  const enviarTodo = async () => {
+    const cola = pending;
+    setErr(""); setBusy(true);
+    let ok = 0;
+    for (const r of cola) {
+      try {
+        await sendGmail({ to: destOf(r), subject: asuntoDe(r), body: cuerpoDe(r), html: htmlDe(r), clientId: integ.email.clientId });
+        marcar(r);
+        ok++;
+      } catch (e) {
+        setErr(`Se enviaron ${ok} de ${cola.length}. Se detuvo en ${titleOf(kind, r)}: ${(e && e.message) || e}`);
+        break;
+      }
+    }
+    setBusy(false);
+  };
+
+  const conectarAqui = async () => {
+    setErr(""); setBusy(true);
+    try { await connectGmail(integ.email.clientId); }
+    catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy(false);
+  };
+
   const copyAll = async () => {
     const texto = recipients.map((r) => {
-      const dest = channel === "email" ? r.props.email || "sin correo" : r.props.phone || "sin teléfono";
-      const asunto = channel === "email" ? `\nAsunto: ${applyTemplate(subject, r, kind)}` : "";
-      return `${titleOf(kind, r)} · ${dest}${asunto}\n${applyTemplate(body, r, kind)}`;
+      const dest = destOf(r) || (esCorreo ? "sin correo" : "sin teléfono");
+      const asunto = esCorreo ? `\nAsunto: ${asuntoDe(r)}` : "";
+      return `${titleOf(kind, r)} · ${dest}${asunto}\n${cuerpoDe(r)}`;
     }).join("\n\n———\n\n");
     try {
       await navigator.clipboard.writeText(texto);
@@ -1448,49 +1908,173 @@ function SendModal({ db, channel, kind, ids, onClose, onSend }) {
     setTimeout(() => setCopied(""), 2000);
   };
 
+  /* Copia el diseño ya renderizado, no su código: pegado en un borrador de
+     Gmail entra con formato. Si el navegador no admite el portapapeles rico,
+     se copia el código para pegarlo a mano. */
+  const copiarDiseno = async () => {
+    const r = first;
+    if (!r) return;
+    const doc = htmlDe(r);
+    try {
+      if (typeof ClipboardItem === "function" && navigator.clipboard?.write) {
+        await navigator.clipboard.write([new ClipboardItem({
+          "text/html": new Blob([doc], { type: "text/html" }),
+          "text/plain": new Blob([cuerpoDe(r)], { type: "text/plain" }),
+        })]);
+        setCopiedHtml("Diseño copiado");
+      } else {
+        await navigator.clipboard.writeText(doc);
+        setCopiedHtml("Código copiado");
+      }
+    } catch (e) {
+      setCopiedHtml("No se pudo copiar");
+    }
+    setTimeout(() => setCopiedHtml(""), 2200);
+  };
+
+  const sinTexto = (!body.trim() && !conHtml) || recipients.length === 0;
+  const terminado = sendable.length > 0 && pending.length === 0;
+
+  const comoSale = !esCorreo
+    ? "Se abre WhatsApp con el mensaje escrito; tú das el último clic."
+    : porApi
+      ? (gmail.connected ? `El CRM envía desde ${gmail.account || "tu cuenta de Gmail"}${conHtml ? ", con el diseño HTML" : ""}.` : "Falta autorizar la cuenta de Gmail.")
+      : modo === "mailto"
+        ? "Se abre tu programa de correo con el borrador listo."
+        : "Se abre Gmail con el borrador listo; tú das el último clic.";
+
+  const principal = () => {
+    if (porApi && !gmail.connected) {
+      return <Btn variant="solid" Icon={ShieldCheck} disabled={busy || !integ.email.clientId} onClick={conectarAqui}>{busy ? "Autorizando…" : "Conectar Gmail"}</Btn>;
+    }
+    if (porApi) {
+      return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
+        onClick={enviarTodo}>{busy ? "Enviando…" : `Enviar ${pending.length} por Gmail`}</Btn>;
+    }
+    return <Btn variant="solid" Icon={ExternalLink} disabled={sinTexto || !pending.length} onClick={abrirSiguiente}>
+      {esCorreo ? "Abrir borrador" : "Abrir WhatsApp"} · {pending.length} sin enviar
+    </Btn>;
+  };
+
   return (
-    <Modal wide title={channel === "whatsapp" ? "Preparar mensaje de WhatsApp" : "Preparar correo de marketing"}
-      subtitle={`${recipients.length} destinatario(s) · el CRM personaliza el texto y deja la actividad registrada; el envío lo haces desde WhatsApp o tu correo.`} onClose={onClose}
-      footer={<><Btn variant="outline" onClick={onClose}>Cancelar</Btn>
-        <Btn variant="outline" Icon={Copy} disabled={!body.trim() || recipients.length === 0} onClick={copyAll}>{copied || "Copiar textos"}</Btn>
-        <Btn variant="solid" Icon={Check} disabled={!body.trim() || recipients.length === 0}
-          onClick={() => onSend({ subject: t ? `Plantilla: ${t.name}` : channel === "email" ? subject || "Correo de marketing" : "Mensaje de WhatsApp", body })}>
-          Registrar en {recipients.length}</Btn></>}>
+    <Modal wide title={esCorreo ? "Enviar correo" : "Enviar por WhatsApp"}
+      subtitle={`${recipients.length} de ${candidatos.length} destinatario(s) · ${comoSale}`} onClose={onClose}
+      footer={<><Btn variant="outline" onClick={onClose}>{done.size ? "Cerrar" : "Cancelar"}</Btn>
+        <Btn variant="outline" Icon={Copy} disabled={sinTexto} onClick={copyAll}>{copied || "Copiar textos"}</Btn>
+        <Btn variant="outline" Icon={Check} disabled={sinTexto}
+          onClick={() => onSend({ subject: t ? `Plantilla: ${t.name}` : esCorreo ? subject || "Correo de marketing" : "Mensaje de WhatsApp", body: body.trim() || (conHtml ? htmlToText(html) : body), ids: recipients.map((r) => r.id) })}>
+          Registrar sin enviar</Btn>
+        {principal()}</>}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <Field def={{ label: "Plantilla", type: "select", options: templates.map((x) => x.name) }}
             value={t?.name || ""} onChange={(name) => setTid((templates.find((x) => x.name === name) || {}).id || "")} />
-          {channel === "email" && <Field def={{ label: "Asunto", type: "text" }} value={subject} onChange={setSubject} />}
-          <Field def={{ label: "Mensaje", type: "textarea" }} value={body} onChange={setBody} />
+          {esCorreo && <Field def={{ label: "Asunto", type: "text" }} value={subject} onChange={setSubject} />}
+          <Field def={{ label: conHtml ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }} value={body} onChange={setBody} />
           <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Variables: {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"}, {"{{empresa}}"}</div>
+
+          {esCorreo && <HtmlAttach value={html} onChange={setHtml} />}
+
+          {conHtml && !porApi && (
+            <div style={{ background: C.amberSoft, borderRadius: 6, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12, color: C.amber, lineHeight: 1.55 }}>
+              El diseño no cabe en un enlace: el borrador que se abre sale sólo con el texto. Copia el diseño y pégalo
+              en el borrador, o cambia a <b>“Gmail conectado”</b> en Conexiones para que el CRM lo mande con formato.
+              <div style={{ marginTop: 8 }}>
+                <Btn size="sm" variant="outline" Icon={Copy} disabled={!first} onClick={copiarDiseno}>{copiedHtml || "Copiar diseño"}</Btn>
+              </div>
+            </div>
+          )}
+
+          {porApi && !gmail.connected && (
+            <div style={{ background: C.amberSoft, borderRadius: 6, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12, color: C.amber, lineHeight: 1.55 }}>
+              {integ.email.clientId
+                ? "La cuenta de Gmail no está autorizada en esta pestaña. Conéctala aquí abajo y el envío sale solo."
+                : "Falta el ID de cliente de Google. Ve a Conexiones para configurarlo, o usa “Registrar sin enviar”."}
+            </div>
+          )}
+
           {missingChannel > 0 && (
             <div style={{ background: C.claySoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>
-              {missingChannel} destinatario(s) no tienen {channel === "email" ? "correo" : "teléfono"}. Complétalos para poder contactarlos.
+              {missingChannel} destinatario(s) no tienen {esCorreo ? "correo" : "teléfono"}. Se omiten del envío; compléta{missingChannel === 1 ? "lo" : "los"} para poder contactarlos.
+            </div>
+          )}
+
+          {err && (
+            <div style={{ background: C.claySoft, borderRadius: 6, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.55 }}>{err}</div>
+          )}
+
+          {terminado && !err && (
+            <div style={{ background: C.jadeSoft, borderRadius: 6, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12, color: C.jade, lineHeight: 1.55 }}>
+              Listo: {done.size} {porApi ? "enviado(s)" : "abierto(s)"} y registrado(s) en el historial.
             </div>
           )}
         </div>
+
         <div>
-          <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 6 }}>VISTA PREVIA · {first ? titleOf(kind, first) : "sin destinatario"}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, flex: 1, minWidth: 0 }}>VISTA PREVIA · {first ? titleOf(kind, first) : "sin destinatario"}</div>
+            {conHtml && [["diseno", "Diseño"], ["texto", "Texto"]].map(([k, l]) => (
+              <button key={k} type="button" onClick={() => setVista(k)} className="crm-btn"
+                style={{ border: `1px solid ${vista === k ? C.blue : C.line}`, background: vista === k ? C.blueSoft : C.panel, color: vista === k ? C.blue : C.mute, borderRadius: 999, padding: "3px 11px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer" }}>{l}</button>
+            ))}
+          </div>
           <div style={{ border: `1px solid ${C.line}`, borderRadius: 9, overflow: "hidden" }}>
             <div style={{ background: ch.soft, padding: "9px 12px", display: "flex", alignItems: "center", gap: 8 }}>
               <ch.Icon size={14} color={ch.color} />
               <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, color: ch.color }}>{ch.label}</span>
             </div>
-            <div style={{ padding: 14, background: channel === "whatsapp" ? "#F4F7F2" : C.panel, minHeight: 170 }}>
-              {channel === "email" && <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, marginBottom: 8, paddingBottom: 8, borderBottom: `1px solid ${C.line}` }}>{first ? applyTemplate(subject, first, kind) : subject}</div>}
-              <div style={{ fontFamily: "var(--ui)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", background: channel === "whatsapp" ? "#DCF8C6" : "transparent", padding: channel === "whatsapp" ? "10px 12px" : 0, borderRadius: channel === "whatsapp" ? 9 : 0 }}>
-                {first ? applyTemplate(body, first, kind) : body}
-              </div>
+            <div style={{ padding: 14, background: !esCorreo ? "#F4F7F2" : C.panel, minHeight: 170 }}>
+              {esCorreo && <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, marginBottom: 8, paddingBottom: 8, borderBottom: `1px solid ${C.line}` }}>{first ? asuntoDe(first) : subject}</div>}
+              {conHtml && vista === "diseno" ? (
+                <HtmlPreview html={first ? htmlDe(first) : html} height={260} />
+              ) : (
+                <div style={{ fontFamily: "var(--ui)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", background: !esCorreo ? "#DCF8C6" : "transparent", padding: !esCorreo ? "10px 12px" : 0, borderRadius: !esCorreo ? 9 : 0 }}>
+                  {first ? cuerpoDe(first) : body}
+                </div>
+              )}
             </div>
           </div>
-          <div style={{ marginTop: 10, maxHeight: 120, overflowY: "auto" }}>
-            {recipients.slice(0, 20).map((r) => (
-              <div key={r.id} style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, padding: "3px 0" }}>
-                {titleOf(kind, r)} · <span style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{channel === "email" ? r.props.email || "sin correo" : r.props.phone || "sin teléfono"}</span>
-              </div>
-            ))}
-            {recipients.length > 20 && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>y {recipients.length - 20} más…</div>}
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute }}>
+              DESTINATARIOS · {recipients.length} de {candidatos.length}
+            </div>
+            <div style={{ display: "flex", gap: 2 }}>
+              <Btn size="sm" onClick={() => setChosen(new Set(candidatos.map((r) => r.id)))}>Todos</Btn>
+              <Btn size="sm" onClick={() => setChosen(new Set(conDato.map((r) => r.id)))}>{esCorreo ? "Con correo" : "Con teléfono"}</Btn>
+              <Btn size="sm" onClick={() => setChosen(new Set())}>Ninguno</Btn>
+            </div>
           </div>
+          {candidatos.length > 8 && (
+            <input className="crm-in" placeholder="Filtrar por nombre o dato…" value={buscar} onChange={(e) => setBuscar(e.target.value)}
+              style={{ ...inputStyle, marginTop: 6, padding: "6px 9px", fontSize: 12 }} />
+          )}
+          <div style={{ marginTop: 6, maxHeight: 186, overflowY: "auto", border: `1px solid ${C.line}`, borderRadius: 8 }}>
+            {listados.map((r) => {
+              const dest = destOf(r);
+              const ya = done.has(r.id);
+              return (
+                <label key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "var(--ui)", fontSize: 12, color: ya ? C.jade : C.mute, padding: "5px 9px", cursor: "pointer", borderBottom: `1px solid ${C.canvas}` }}>
+                  <input type="checkbox" checked={chosen.has(r.id)} onChange={() => toggle(r.id)} style={{ accentColor: C.jade, flexShrink: 0 }} />
+                  <span style={{ overflowWrap: "anywhere", flex: 1 }}>
+                    {titleOf(kind, r)} · <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: dest ? "inherit" : C.clay }}>
+                      {esCorreo ? dest || "sin correo" : dest ? `+${dest}` : "sin teléfono"}
+                    </span>
+                  </span>
+                  {ya && <Check size={12} strokeWidth={3} style={{ flexShrink: 0 }} />}
+                </label>
+              );
+            })}
+            {listados.length === 0 && (
+              <div style={{ padding: "10px 9px", fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>
+                {candidatos.length ? "Nadie coincide con el filtro." : "No hay registros para enviar."}
+              </div>
+            )}
+          </div>
+          {visibles.length > listados.length && (
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 5 }}>
+              y {visibles.length - listados.length} más… usa el filtro para llegar a alguien puntual, o los botones de arriba para marcarlos todos.
+            </div>
+          )}
         </div>
       </div>
     </Modal>
