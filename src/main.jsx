@@ -1,6 +1,14 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import CRM from "./CRM.jsx";
+import { almacenNube } from "./nube.js";
+
+/* La versión publicada (`npm run deploy`) guarda en el servidor del CRM, y
+   así el cuaderno es el mismo en cada equipo. `npm run dev` sigue guardando
+   en este navegador, para probar sin tocar los datos de verdad. */
+if (!window.storage && import.meta.env.VITE_NUBE === "1") {
+  window.storage = almacenNube();
+}
 
 /* CRM.jsx was authored for the Claude Artifacts sandbox, which supplies a
    `window.storage` key/value API. Outside that sandbox it is undefined, and the

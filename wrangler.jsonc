@@ -1,0 +1,38 @@
+/* La versión publicada del CRM: la app y su almacén en Cloudflare.
+   Se publica con `npm run deploy`. Ver nube/README.md. */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crm-raad",
+  "account_id": "37a4f1c5346b8417a7e4d73114b5b281", // cuenta ivan@raadsports.com, la del dominio
+  "main": "nube/worker.js",
+  "compatibility_date": "2026-05-01",
+
+  /* Lo que sale de `vite build`. Sólo /api/ pasa por el Worker; el resto lo
+     sirve Cloudflare directo, y cualquier otra ruta abre la app. */
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "CUADERNO", "class_name": "Cuaderno" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cuaderno"] }],
+
+  /* Sólo la dirección propia, que es la que cuida Cloudflare Access. Las
+     direcciones automáticas de workers.dev quedarían fuera de Access. */
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "crm.raadsports.com", "custom_domain": true }],
+
+  /* Se llenan después de crear la aplicación en Cloudflare Access (paso 3 del
+     README). Mientras estén vacíos, /api/ no responde a nadie. */
+  "vars": {
+    "ACCESS_EQUIPO": "https://quiet-hill-7383.cloudflareaccess.com",
+    "ACCESS_AUD": "f77abf9451e89957aab1122906de15f8f91c772104433288ecec3f7d4b2dae7e"
+  },
+
+  "observability": { "enabled": true }
+}
