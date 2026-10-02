@@ -103,3 +103,52 @@ npm run nube:local
 Levanta la versión de nube en `http://localhost:8787` con un almacén de
 prueba, sin Access (`.dev.vars` lo desactiva sólo en local). No toca ni
 tus datos del navegador ni los de la nube.
+
+## Claude
+
+El CRM se conecta con Claude de dos maneras, y las dos pasan por la misma
+puerta de Cloudflare Access.
+
+### Claude lee y edita el CRM (`/mcp`)
+
+`nube/mcp.js` es un servidor MCP en `https://crm.raadsports.com/mcp`. Desde
+claude.ai, Claude Desktop o Claude Code se le puede pedir «¿qué contactos
+nuevos no he llamado esta semana?» o «crea el negocio de Laura y déjale una
+nota». Sus herramientas: `resumen_crm`, `ver_esquema`, `buscar_registros`,
+`ver_registro`, `listar_actividades`, `crear_registro`,
+`actualizar_registro` y `agregar_nota`.
+
+- No borra nada, y las conexiones (la clave del puente, Gmail) no salen.
+- Lo que escribe aparece en las pestañas abiertas al instante y queda en
+  las copias, firmado como «tu-correo vía Claude».
+- Lo que crea Claude no dispara las automatizaciones: ésas corren en la
+  app cuando la cambia una persona.
+
+Para encenderlo:
+
+1. En Cloudflare → **Zero Trust → Access controls → Applications** → la
+   aplicación `CRM` → **Edit → Advanced settings** → activa
+   **Managed OAuth** y guarda. Con eso Access le hace a Claude el mismo
+   inicio de sesión por correo que a ti.
+2. `npm run deploy`.
+3. En claude.ai → **Settings → Connectors → Add custom connector**, con la
+   dirección `https://crm.raadsports.com/mcp`. Al conectar se abre la
+   página de Access para entrar con tu correo.
+   En Claude Code: `claude mcp add --transport http crm https://crm.raadsports.com/mcp`.
+
+### Claude dentro del CRM (`/api/claude`)
+
+En cada ficha hay un panel **Asistente**: resumir, proponer el siguiente
+paso, redactar el WhatsApp o el correo, o responder una pregunta. Lo que
+escribe es un borrador para copiar; no envía ni guarda nada solo.
+
+Usa la API de Claude (se paga por uso, con el modelo Claude Opus 5.5).
+Para encenderlo, crea una clave en https://platform.claude.com y guárdala
+como secreto del Worker:
+
+```sh
+npx wrangler secret put ANTHROPIC_API_KEY
+```
+
+Para probarlo en local con `npm run nube:local`, agrega
+`ANTHROPIC_API_KEY=...` a `.dev.vars`.

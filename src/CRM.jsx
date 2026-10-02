@@ -1651,13 +1651,45 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
     if (fresh.length) setCols((c) => [...c, ...fresh.filter((k) => !c.includes(k))]);
   }, [schema]);
 
-  const filtered = useMemo(() => rows.filter((r) => {
-    const hay = norm(Object.values(r.props).join(" "));
-    return (!q || hay.includes(norm(q))) && (!status || r.props.leadStatus === status);
-  }), [rows, q, status]);
+  /* El texto en que se busca se arma una vez por cambio en los registros, no
+     una vez por tecla: quitar tildes y símbolos a miles de fichas en cada
+     letra es lo que trababa la búsqueda. */
+  const indice = useMemo(() => rows.map((r) => ({ r, hay: norm(Object.values(r.props).join(" ")) })), [rows]);
+
+  /* La casilla responde al instante y el filtro va un paso detrás: si la
+     lista tarda, React la deja para después en vez de congelar el teclado. */
+  const qDiferida = React.useDeferredValue(q);
+  const filtered = useMemo(() => {
+    const nq = norm(qDiferida);
+    return indice.filter(({ r, hay }) => (!nq || hay.includes(nq)) && (!status || r.props.leadStatus === status)).map((x) => x.r);
+  }, [indice, qDiferida, status]);
+
+  /* Se pintan de a 100 filas: dibujar miles de una vez es lo que más pesa, y
+     una lista larga no se recorre a ojo, se filtra. Seleccionar todos sigue
+     marcando la lista completa, no sólo lo pintado. */
+  const [limite, setLimite] = useState(100);
+  useEffect(() => { setLimite(100); }, [kind, qDiferida, status]);
+  const pintados = filtered.length > limite ? filtered.slice(0, limite) : filtered;
+  const marcados = useMemo(() => new Set(sel), [sel]);
 
   const shown = schema.filter((f) => cols.includes(f.key));
   const allSel = filtered.length > 0 && sel.length === filtered.length;
+
+  /* Borrar no se deshace desde la app, así que se pregunta antes. Con pocos
+     registros basta confirmar; desde 10 hay que escribir ELIMINAR, porque un
+     "seleccionar todos" con un filtro equivocado se lleva la base entera de
+     un clic. */
+  const [confirmar, setConfirmar] = useState(false);
+  const [palabra, setPalabra] = useState("");
+  const pideEscribir = sel.length >= 10;
+  const puedeBorrar = !pideEscribir || palabra.trim().toUpperCase() === "ELIMINAR";
+  const nombreLista = sel.length === 1 ? OBJ[kind].singular.toLowerCase() : OBJ[kind].plural.toLowerCase();
+  const borrar = () => {
+    if (!puedeBorrar) return;
+    onDelete(sel);
+    setSel([]);
+    setConfirmar(false);
+  };
 
   return (
     <div>
@@ -1701,7 +1733,7 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
           <Btn size="sm" variant="outline" Icon={Briefcase} onClick={() => setModal({ kind: "deal", contactIds: kind === "contact" ? sel : [], companyId: kind === "company" ? sel[0] : undefined, presets: { source: "Manual" } })}>Crear negocio</Btn>
           <Btn size="sm" variant="outline" Icon={Pencil} onClick={() => setModal({ kind: "bulk", objKind: kind, ids: sel })}>Editar propiedad</Btn>
           <div style={{ flex: 1 }} />
-          <Btn size="sm" variant="danger" Icon={Trash2} onClick={() => { onDelete(sel); setSel([]); }}>Eliminar</Btn>
+          <Btn size="sm" variant="danger" Icon={Trash2} onClick={() => { setPalabra(""); setConfirmar(true); }}>Eliminar</Btn>
         </div>
       )}
 
@@ -1723,10 +1755,10 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((r) => (
+              {pintados.map((r) => (
                 <tr key={r.id} className="crm-row" style={{ borderBottom: `1px solid #EEF1EC` }}>
                   <td style={{ padding: "9px 12px 9px 28px" }}>
-                    <input type="checkbox" checked={sel.includes(r.id)} onChange={() => setSel((s) => s.includes(r.id) ? s.filter((x) => x !== r.id) : [...s, r.id])} />
+                    <input type="checkbox" checked={marcados.has(r.id)} onChange={() => setSel((s) => s.includes(r.id) ? s.filter((x) => x !== r.id) : [...s, r.id])} />
                   </td>
                   {shown.map((f, i) => (
                     <td key={f.key} style={{ padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 13, color: C.ink, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -1742,6 +1774,41 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
               ))}
             </tbody>
           </table>
+        )}
+        {confirmar && (
+          <Modal title={`¿Eliminar ${sel.length} ${nombreLista}?`}
+            subtitle="Esta acción no se puede deshacer desde el CRM."
+            onClose={() => setConfirmar(false)}
+            footer={<>
+              <Btn variant="outline" onClick={() => setConfirmar(false)}>Cancelar</Btn>
+              <Btn variant="danger" Icon={Trash2} disabled={!puedeBorrar} onClick={borrar}
+                style={puedeBorrar ? { background: C.clay, color: "#fff", borderColor: C.clay } : { opacity: 0.5, cursor: "not-allowed" }}>
+                Eliminar {sel.length} {nombreLista}
+              </Btn>
+            </>}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.6 }}>
+              Se borrarán estos registros con todas sus propiedades:
+              <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: C.mute }}>
+                {rows.filter((r) => marcados.has(r.id)).slice(0, 5).map((r) => <li key={r.id}>{titleOf(kind, r)}</li>)}
+                {sel.length > 5 && <li>y {sel.length - 5} más…</li>}
+              </ul>
+            </div>
+            {pideEscribir && (
+              <label style={{ display: "block", marginTop: 16 }}>
+                <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.ink, marginBottom: 6 }}>
+                  Para confirmar, escribe <b>ELIMINAR</b>:
+                </div>
+                <input className="crm-in" autoFocus value={palabra} onChange={(e) => setPalabra(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") borrar(); }} style={inputStyle} />
+              </label>
+            )}
+          </Modal>
+        )}
+        {filtered.length > pintados.length && (
+          <div style={{ padding: "14px 28px", display: "flex", alignItems: "center", gap: 12, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute }}>
+            Mostrando {pintados.length} de {filtered.length}. Escribe en el buscador para llegar a alguien puntual.
+            <Btn size="sm" variant="outline" onClick={() => setLimite((n) => n + 100)}>Mostrar 100 más</Btn>
+          </div>
         )}
       </div>
     </div>
@@ -2393,15 +2460,20 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
   const [filtro, setFiltro] = useState("all");
   const [sync, setSync] = useState({ busy: false, nota: "", err: "" });
 
+  /* Igual que en Contactos: la casilla responde al instante y la lista se
+     filtra un paso detrás, y se pintan de a 100. */
+  const buscarDiferido = React.useDeferredValue(buscar);
+  const [limite, setLimite] = useState(100);
+  useEffect(() => { setLimite(100); }, [buscarDiferido, filtro]);
   const filtradas = useMemo(() => {
-    const q = norm(buscar);
+    const q = norm(buscarDiferido);
     return conversaciones.filter((c) => {
       if (filtro === "nuevos" && !c.nuevos) return false;
       if ((filtro === "whatsapp" || filtro === "email") && !c.canales.includes(filtro)) return false;
       if (!q) return true;
       return norm(`${c.nombre} ${c.rec.props.email || ""} ${c.rec.props.phone || ""} ${resumen(c.ultimo)}`).includes(q);
     });
-  }, [conversaciones, buscar, filtro]);
+  }, [conversaciones, buscarDiferido, filtro]);
 
   /* La conversación abierta se sigue por su clave, no por posición: al entrar
      un mensaje nuevo la lista se reordena y una posición fija saltaría sola a
@@ -2478,7 +2550,7 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
         )}
 
         <div style={{ flex: 1, overflowY: "auto" }}>
-          {filtradas.map((c) => {
+          {filtradas.slice(0, limite).map((c) => {
             const on = c.clave === sel;
             const ch = CHANNEL[c.ultimo.type];
             return (
@@ -2504,6 +2576,11 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
               </button>
             );
           })}
+          {filtradas.length > limite && (
+            <div style={{ padding: "12px 14px", textAlign: "center" }}>
+              <Btn size="sm" variant="outline" onClick={() => setLimite((n) => n + 100)}>Mostrar 100 más ({filtradas.length - limite} restantes)</Btn>
+            </div>
+          )}
           {filtradas.length === 0 && (
             <div style={{ padding: "30px 18px", textAlign: "center", fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, lineHeight: 1.6 }}>
               {sinNada
@@ -5131,7 +5208,10 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const cc = integ.whatsapp.countryCode;
   const modo = integ.email.mode;
   const esCorreo = channel === "email";
-  const porApi = esCorreo && modo === "gmailApi";
+  /* "Enviar directo" desde aquí mismo: usa la vía de Gmail conectado para esta
+     tanda sin tener que ir a Conexiones a cambiar el modo de toda la cuenta. */
+  const [directo, setDirecto] = useState(false);
+  const porApi = esCorreo && (modo === "gmailApi" || directo);
   const porWa = !esCorreo && integ.whatsapp.modo === "api";
 
   const destOf = (r) => (esCorreo ? String(r.props.email || "").trim() : toE164(r.props.phone, cc));
@@ -5348,9 +5428,15 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
       return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
         onClick={enviarTodoWa}>{busy ? "Enviando…" : `Enviar ${pending.length} por WhatsApp`}</Btn>;
     }
-    return <Btn variant="solid" Icon={ExternalLink} disabled={sinTexto || !pending.length} onClick={abrirSiguiente}>
-      {esCorreo ? "Abrir borrador" : "Abrir WhatsApp"} · {pending.length} sin enviar
-    </Btn>;
+    return <>
+      {esCorreo && (
+        <Btn variant="outline" Icon={Send} disabled={sinTexto || !pending.length}
+          onClick={() => { setErr(""); setDirecto(true); }}>Enviar directo</Btn>
+      )}
+      <Btn variant="solid" Icon={ExternalLink} disabled={sinTexto || !pending.length} onClick={abrirSiguiente}>
+        {esCorreo ? "Abrir borrador" : "Abrir WhatsApp"} · {pending.length} sin enviar
+      </Btn>
+    </>;
   };
 
   return (
@@ -5481,6 +5567,116 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
 /* ────────────────────────────────────────────────────────────
    Detalle de registro
    ──────────────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────
+   Asistente de Claude en la ficha
+   Manda la ficha abierta —propiedades con su etiqueta, empresa, negocios e
+   historial reciente— al Worker (/api/claude), que es quien guarda la clave
+   de la API. Lo que vuelve es un borrador para leer y copiar; nada se envía
+   ni se guarda solo. Sólo funciona en la versión publicada (`npm run deploy`
+   o `npm run nube:local`), porque `npm run dev` no tiene Worker detrás.
+   ──────────────────────────────────────────────────────────── */
+const TAREAS_CLAUDE = [
+  { key: "resumir", label: "Resumir" },
+  { key: "siguiente", label: "Siguiente paso" },
+  { key: "whatsapp", label: "Redactar WhatsApp" },
+  { key: "correo", label: "Redactar correo" },
+];
+
+function fichaParaClaude(db, kind, rec, acts, relatedDeals) {
+  const conEtiquetas = (k, r) => Object.fromEntries((db.schema[k] || [])
+    .filter((f) => r.props[f.key] != null && r.props[f.key] !== "")
+    .map((f) => [f.label, r.props[f.key]]));
+  const empresa = rec.companyId && db.companies.find((c) => c.id === rec.companyId);
+  const contactos = (rec.contactIds || []).map((cid) => db.contacts.find((c) => c.id === cid)).filter(Boolean);
+  return {
+    tipo: OBJ[kind].singular,
+    nombre: titleOf(kind, rec),
+    propiedades: conEtiquetas(kind, rec),
+    ...(empresa ? { empresa: { nombre: titleOf("company", empresa), ...conEtiquetas("company", empresa) } } : {}),
+    ...(contactos.length ? { contactos: contactos.map((c) => ({ nombre: titleOf("contact", c), ...conEtiquetas("contact", c) })) } : {}),
+    ...(relatedDeals.length ? { negocios: relatedDeals.map((d) => ({ nombre: d.props.name, etapa: d.props.stage, valor: d.props.amount })) } : {}),
+    /* Las 40 más recientes y cada cuerpo recortado: una conversación larga
+       de correos con citas y firmas no cabe entera ni hace falta. */
+    historial: acts.slice(0, 40).map((a) => ({
+      canal: (CHANNEL[a.type] || {}).label || a.type,
+      sentido: a.dir === "in" ? "recibido" : "enviado",
+      fecha: a.at,
+      ...(a.subject ? { asunto: a.subject } : {}),
+      ...(a.body ? { texto: htmlToText(String(a.body)).slice(0, 3000) } : {}),
+    })),
+  };
+}
+
+function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
+  const [pregunta, setPregunta] = useState("");
+  const [estado, setEstado] = useState({ cargando: null, texto: "", error: "" });
+  const [copiado, setCopiado] = useState(false);
+
+  /* Al cambiar de ficha se borra lo anterior: un borrador para otra persona
+     a la vista es justo el que termina enviado a quien no era. */
+  useEffect(() => { setEstado({ cargando: null, texto: "", error: "" }); setPregunta(""); }, [rec.id]);
+
+  const pedir = async (tarea) => {
+    setEstado({ cargando: tarea, texto: "", error: "" });
+    setCopiado(false);
+    try {
+      const r = await fetch("/api/claude", {
+        method: "POST",
+        redirect: "manual",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Origen": "asistente" },
+        body: JSON.stringify({ tarea, pregunta, ficha: fichaParaClaude(db, kind, rec, acts, relatedDeals) }),
+      });
+      if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+      const tipo = r.headers.get("Content-Type") || "";
+      if (!tipo.includes("application/json")) throw new Error("El asistente sólo funciona en la versión publicada del CRM.");
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+      setEstado({ cargando: null, texto: data.texto, error: "" });
+    } catch (e) {
+      setEstado({ cargando: null, texto: "", error: (e && e.message) || String(e) });
+    }
+  };
+
+  const copiar = async () => {
+    try { await navigator.clipboard.writeText(estado.texto); setCopiado(true); setTimeout(() => setCopiado(false), 1800); } catch (_) {}
+  };
+
+  const ocupado = Boolean(estado.cargando);
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>
+        <Sparkles size={14} color={C.plum} /> Asistente
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+        {TAREAS_CLAUDE.map((t) => (
+          <Btn key={t.key} size="sm" variant="outline" disabled={ocupado} onClick={() => pedir(t.key)}>
+            {estado.cargando === t.key ? "Pensando…" : t.label}
+          </Btn>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 7 }}>
+        <input className="crm-in" placeholder="Pregúntale algo sobre esta ficha, o da indicaciones para el borrador…" value={pregunta}
+          onChange={(e) => setPregunta(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && pregunta.trim() && !ocupado) pedir("pregunta"); }}
+          style={inputStyle} />
+        <Btn variant="outline" disabled={!pregunta.trim() || ocupado} onClick={() => pedir("pregunta")}>
+          {estado.cargando === "pregunta" ? "Pensando…" : "Preguntar"}
+        </Btn>
+      </div>
+      {estado.error && <div style={{ marginTop: 10, fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay }}>{estado.error}</div>}
+      {estado.texto && (
+        <div style={{ marginTop: 12, background: C.plumSoft, borderRadius: 7, padding: 12 }}>
+          <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{estado.texto}</div>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+            <Btn size="sm" variant="outline" Icon={copiado ? Check : Copy} onClick={copiar}>{copiado ? "Copiado" : "Copiar"}</Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
   const { kind, id } = detail;
   const coll = kind === "contact" ? db.contacts : kind === "company" ? db.companies : db.deals;
@@ -5538,6 +5734,8 @@ function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
               ))}
             </div>
           )}
+
+          <AsistenteClaude db={db} kind={kind} rec={rec} acts={acts} relatedDeals={relatedDeals} />
 
           <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
             <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>Historial</div>

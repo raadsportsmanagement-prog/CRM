@@ -19,6 +19,8 @@
    ──────────────────────────────────────────────────────────── */
 
 import { DurableObject } from "cloudflare:workers";
+import { atenderMcp } from "./mcp.js";
+import { atenderClaude } from "./claude.js";
 
 /* Las claves que guarda la app empiezan todas así; cualquier otra cosa se
    rechaza para que el almacén no sirva de depósito de lo que sea. */
@@ -195,6 +197,16 @@ export class Cuaderno extends DurableObject {
     return { rev, at };
   }
 
+  /* Para quien lee, cambia y vuelve a guardar desde el servidor (Claude, por
+     /mcp): sólo escribe si nadie guardó entre medias. Si alguien lo hizo,
+     devuelve ok: false y el que llama vuelve a leer y reintenta, en vez de
+     pisar lo que la app acababa de escribir. */
+  escribirSi(clave, texto, quien, revLeida) {
+    const actual = (this.#meta(clave) || {}).rev || 0;
+    if (actual !== revLeida) return { ok: false, rev: actual };
+    return { ok: true, ...this.escribir(clave, texto, quien, "") };
+  }
+
   borrar(clave, origen) {
     this.ctx.storage.transactionSync(() => this.#borrarCrudo(clave));
     this.#avisar({ tipo: "borrado", clave }, origen);
@@ -240,7 +252,8 @@ export class Cuaderno extends DurableObject {
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
-    if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(req);
+    const esMcp = url.pathname === "/mcp";
+    if (!esMcp && !url.pathname.startsWith("/api/")) return env.ASSETS.fetch(req);
 
     const quien = await quienEs(req, env);
     if (!quien) return json({ error: "Sin acceso. Entra por la dirección del CRM para iniciar sesión." }, 401);
@@ -248,11 +261,20 @@ export default {
     const cuaderno = env.CUADERNO.getByName("principal");
     const origen = (req.headers.get("X-Origen") || url.searchParams.get("origen") || "").slice(0, 64);
 
+    if (esMcp) return atenderMcp(req, cuaderno, quien);
+
     if (url.pathname === "/api/yo") return json({ email: quien });
 
     if (url.pathname === "/api/vivo") return cuaderno.fetch(req);
 
     if (url.pathname === "/api/copias") return json(await cuaderno.copias());
+
+    /* Cada llamada a Claude cuesta: como al escribir, se exige X-Origen para
+       que otro sitio no pueda gastarla aprovechando la sesión. */
+    if (url.pathname === "/api/claude") {
+      if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
+      return atenderClaude(req, env);
+    }
 
     const m = url.pathname.match(/^\/api\/kv\/(.+)$/);
     if (m) {
