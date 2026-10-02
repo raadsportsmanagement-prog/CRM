@@ -1,21 +1,32 @@
 /* ────────────────────────────────────────────────────────────
    Conexiones: WhatsApp y Gmail
 
-   El CRM vive entero en el navegador y no tiene servidor propio. Eso decide
-   qué conexión es honesta para cada canal:
+   El CRM vive entero en el navegador. Eso decide qué conexión es honesta para
+   cada canal, y la regla que las ordena a todas es una: un permiso que se
+   pueda pedir desde el navegador se pide aquí; un token que valga por tu
+   cuenta entera no puede estar aquí.
 
-   · Gmail sí se conecta de verdad. Google permite pedir permiso desde el
-     navegador (OAuth con Google Identity Services) y llamar a la API de Gmail
-     con ese permiso, así que "Enviar" manda el correo de verdad, desde tu
-     cuenta, y queda en tus Enviados. El permiso dura una hora y no se guarda
-     en el disco: se renueva solo mientras la pestaña esté abierta.
+   · Gmail sí se conecta de verdad, y desde el navegador. Google permite pedir
+     permiso con OAuth (Google Identity Services) y llamar a la API de Gmail
+     con él, así que "Enviar" manda el correo de verdad, desde tu cuenta, y
+     queda en tus Enviados. El permiso dura una hora y no se guarda en el
+     disco: se renueva solo mientras la pestaña esté abierta.
 
-   · WhatsApp se conecta por enlace. La API oficial (WhatsApp Cloud API) exige
-     un token permanente de Meta, y guardarlo aquí lo dejaría a la vista de
-     cualquiera que abra este navegador; además Meta sólo deja iniciar
-     conversaciones con plantillas aprobadas por ellos. Así que el CRM arma el
-     mensaje ya personalizado y abre WhatsApp con el texto puesto: tú das el
-     último clic. Sin token, sin cuenta de empresa, y funciona hoy.
+   · WhatsApp tiene dos caminos, y ninguno de los dos es un parche:
+
+       "enlace" arma el mensaje ya personalizado y abre WhatsApp con el texto
+       puesto; tú das el último clic. Sin token, sin cuenta de empresa, con tu
+       WhatsApp de siempre, y funciona hoy.
+
+       "api" lo manda solo, por la WhatsApp Cloud API. Eso exige un token
+       permanente de Meta, que no vive aquí sino en el puente (ver
+       `anuncios.js` y `tracker/`), y aun así Meta sólo deja iniciar una
+       conversación con plantillas que ellos aprueban antes. Por eso el primero
+       sigue siendo, muchas veces, el único que sirve para el primer mensaje.
+
+   Lo que necesita un token —los leads de Meta y de Google Ads, y el envío por
+   WhatsApp Cloud API— vive en `anuncios.js`, que no llama a nadie de fuera:
+   le habla al puente, y el puente guarda las llaves.
    ──────────────────────────────────────────────────────────── */
 
 export const WHATSAPP_MODES = {
@@ -311,11 +322,63 @@ const mimePart = (type, content) => [
    aparezca dentro del contenido; por eso lleva una parte al azar. */
 const boundary = () => `----crm-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 
+/* Una imagen incrustada, como parte del mensaje. El contenido ya viene en
+   base64 dentro del data:, así que sólo se reparte en líneas de 76. */
+const parteImagen = (p) => [
+  `Content-Type: ${p.tipo}`,
+  "Content-Transfer-Encoding: base64",
+  `Content-ID: <${p.id}>`,
+  `Content-Disposition: inline; filename="${p.nombre}"`,
+  "",
+  p.datos.replace(/(.{76})/g, "$1\r\n"),
+].join("\r\n");
+
+/* ── Las fotos del diseño ──
+   Un diseño exportado trae sus fotos dentro del propio archivo, escritas como
+   "data:image/jpeg;base64,…". Así se ven en el navegador y así NO se ven en el
+   correo: Gmail borra esas direcciones al recibir el mensaje y en su lugar
+   queda el hueco. La forma que sí funciona —la que usa cualquier boletín— es
+   mandar cada foto como una parte más del mensaje y apuntarla desde el HTML
+   con "cid:". Se ve igual, y de paso las fotos dejan de contar para los ~100 KB
+   con los que Gmail decide recortar: una parte adjunta no es cuerpo.
+
+   Devuelve el HTML con las referencias cambiadas y las partes ya listas. */
+function extraerImagenes(html) {
+  const partes = [];
+  const vistas = new Map();
+  const marca = Date.now().toString(36);
+  const con = String(html).replace(
+    /data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/gi,
+    (todo, tipo, datos) => {
+      if (!datos) return todo;
+      const clave = `${tipo}|${datos}`;
+      /* La misma foto repetida —un logo en la cabecera y en el pie— viaja una
+         sola vez: dos referencias apuntando al mismo cid. */
+      if (vistas.has(clave)) return `cid:${vistas.get(clave)}`;
+      const n = partes.length + 1;
+      const id = `img${n}.${marca}@crm`;
+      vistas.set(clave, id);
+      partes.push({
+        id, datos,
+        tipo: tipo.toLowerCase(),
+        nombre: `imagen-${n}.${(tipo.split("/")[1] || "img").replace(/[^a-z0-9]/gi, "").slice(0, 8) || "img"}`,
+      });
+      return `cid:${id}`;
+    });
+  return { html: con, partes };
+}
+
 export function buildMime({ to, subject, body, html }) {
   const cabeceras = [`To: ${header(to)}`, `Subject: ${header(subject)}`, "MIME-Version: 1.0"];
-  const dis = String(html || "").trim();
+  /* Se aligera antes de armarlo: los scripts que trae un diseño exportado de
+     la web no los ejecuta ningún lector de correo, pero sí cuentan para el
+     peso, y el peso es lo que hace que Gmail lo recorte. Ver aligerarHtml,
+     al final de este archivo. */
+  const dis = aligerarHtml(html).trim();
 
   if (!dis) return [...cabeceras, mimePart("text/plain", body)].join("\r\n");
+
+  const { html: conCid, partes } = extraerImagenes(dis);
 
   /* multipart/alternative: van las dos versiones del mismo mensaje y el
      programa de correo elige. El orden importa: el texto plano primero y el
@@ -323,20 +386,87 @@ export function buildMime({ to, subject, body, html }) {
      interpretar. Así, quien tenga HTML ve el diseño y quien no —o quien lo
      tenga bloqueado— lee el texto igual. */
   const b = boundary();
-  return [
-    ...cabeceras,
+  const alternativa = [
     `Content-Type: multipart/alternative; boundary="${b}"`,
     "",
     `--${b}`,
     mimePart("text/plain", body),
     "",
     `--${b}`,
-    mimePart("text/html", dis),
+    mimePart("text/html", conCid),
     "",
     `--${b}--`,
     "",
+  ];
+
+  if (!partes.length) return [...cabeceras, ...alternativa].join("\r\n");
+
+  /* multipart/related: el mensaje y las fotos que ese mensaje usa, atados
+     juntos. Dentro va la alternativa de siempre, así que quien no vea imágenes
+     —ni HTML— sigue leyendo el texto igual. */
+  const rel = boundary();
+  return [
+    ...cabeceras,
+    `Content-Type: multipart/related; boundary="${rel}"`,
+    "",
+    `--${rel}`,
+    ...alternativa,
+    ...partes.flatMap((p) => [`--${rel}`, parteImagen(p), ""]),
+    `--${rel}--`,
+    "",
   ].join("\r\n");
 }
+
+/* ── Envío ──
+   Google no deja mandar tan rápido como uno quisiera: hay un tope por segundo
+   —y otro por día— y al pasarse responde "User-rate limit exceeded" con la
+   hora a la que se puede volver a intentar. Eso no es un error del correo ni
+   de la cuenta: el mismo mensaje, tal cual está, sale bien un momento después.
+   Por eso el CRM espera y reintenta solo, en lugar de dar por fallido un envío
+   que nadie rechazó.
+
+   Se reintenta hasta REINTENTOS veces, y sólo mientras la espera que pide
+   Google quepa en MAX_ESPERA. Si pide más, se dice cuánto hay que esperar y se
+   devuelve el control: quedarse media hora con el botón girando no es esperar,
+   es colgarse. */
+const REINTENTOS = 4;
+const MAX_ESPERA = 90_000;
+
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Cuánto falta para poder reintentar. Google lo dice de dos maneras y ninguna
+   es obligatoria: dentro del texto del error ("Retry after 2026-08-28T04:46:03.697Z")
+   y en la cabecera Retry-After, que puede venir en segundos o como fecha. Si no
+   dice nada, se dobla la espera en cada intento —2 s, 4 s, 8 s…—, que es lo que
+   recomienda su propia documentación. */
+function esperaGmail(res, detalle, intento) {
+  const enFecha = (v) => {
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? Math.max(0, t - Date.now()) : NaN;
+  };
+
+  const dicho = /retry after\s+(\S+)/i.exec(String(detalle || ""));
+  if (dicho) { const ms = enFecha(dicho[1]); if (Number.isFinite(ms)) return ms; }
+
+  const cab = res.headers.get("Retry-After");
+  if (cab) {
+    const seg = Number(cab);
+    if (Number.isFinite(seg)) return Math.max(0, seg * 1000);
+    const ms = enFecha(cab);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return 2000 * 2 ** intento;
+}
+
+/* La espera, dicha como la diría una persona. */
+const enEspera = (ms) => {
+  const seg = Math.ceil(ms / 1000);
+  if (seg < 90) return `${seg} segundo${seg === 1 ? "" : "s"}`;
+  const min = Math.round(seg / 60);
+  if (min < 90) return `${min} minutos`;
+  const horas = Math.round(min / 6) / 10;
+  return `${horas} hora${horas === 1 ? "" : "s"}`;
+};
 
 /* Envía de verdad. Devuelve el id del mensaje en Gmail. No se pone cabecera
    From: Gmail usa la cuenta que dio el permiso, que es justo lo que se quiere.
@@ -344,17 +474,45 @@ export function buildMime({ to, subject, body, html }) {
 export async function sendGmail({ to, subject, body, html, clientId }) {
   const dest = String(to || "").trim();
   if (!dest) throw new Error("El destinatario no tiene correo.");
-  const token = await validToken(clientId);
+  /* El mensaje se arma una sola vez: reintentar es volver a mandar lo mismo,
+     no volver a componerlo. */
+  const raw = b64url(buildMime({ to: dest, subject, body, html }));
 
-  const r = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ raw: b64url(buildMime({ to: dest, subject, body, html })) }),
-  });
+  for (let intento = 0; ; intento++) {
+    const token = await validToken(clientId);
 
-  if (!r.ok) {
-    let detail = `HTTP ${r.status}`;
-    try { detail = (await r.json())?.error?.message || detail; } catch (_) {}
+    const r = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ raw }),
+    });
+    if (r.ok) return (await r.json()).id;
+
+    let error = null;
+    try { error = (await r.json())?.error || null; } catch (_) {}
+    const detail = error?.message || `HTTP ${r.status}`;
+    const motivo = `${error?.status || ""} ${(error?.errors || []).map((e) => e?.reason || "").join(" ")} ${detail}`;
+
+    /* El tope de envío llega como 429 y, a veces, como 403: el mismo código con
+       el que Google niega un permiso. Distinguirlos importa, porque unas líneas
+       más abajo se borra la sesión, y tomar un "vas muy rápido" por un "no
+       tienes permiso" desconectaría la cuenta a mitad de un envío que iba bien. */
+    const limitado = r.status === 429 || (r.status === 403 && /rate.?limit|quota|user.?rate/i.test(motivo));
+    /* Un 5xx es Google teniendo un mal momento, no una respuesta sobre este
+       correo: también se reintenta. */
+    const tropiezo = r.status >= 500;
+
+    if (limitado || tropiezo) {
+      const espera = esperaGmail(r, detail, intento);
+      if (intento < REINTENTOS && espera <= MAX_ESPERA) { await dormir(espera); continue; }
+      if (limitado) {
+        throw new Error(
+          `Gmail llegó a su tope de envíos por ahora (${detail}). Espera ${enEspera(espera)} y vuelve a darle a Enviar: ` +
+          `los que ya salieron quedan marcados y no se repiten.`);
+      }
+      throw new Error(`Gmail no respondió bien (${detail}). Vuelve a intentar en un momento: los que ya salieron no se repiten.`);
+    }
+
     if (r.status === 401 || r.status === 403) {
       session = { ...session, token: "", expiresAt: 0, scope: "" };
       emit();
@@ -362,7 +520,6 @@ export async function sendGmail({ to, subject, body, html, clientId }) {
     }
     throw new Error(`Gmail no aceptó el envío: ${detail}`);
   }
-  return (await r.json()).id;
 }
 
 /* ────────────────────────────────────────────────────────────
@@ -871,3 +1028,87 @@ export const htmlToText = (html) => String(html || "")
   .split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n")
   .replace(/\n{3,}/g, "\n\n")
   .trim();
+
+/* ── Diseños que en realidad son una página web ──
+   Hay editores que no exportan un correo: exportan una página que se dibuja
+   sola al abrirla, con JavaScript. En el navegador se ve perfecta; en el
+   correo llega en blanco, o con el aviso de "esta página necesita JavaScript",
+   porque ningún lector ejecuta scripts.
+
+   Lo que casi nadie sabe es que dentro de ese archivo, guardado aparte, viene
+   el correo de verdad: tablas, estilos en línea, sin un solo script, y las
+   fotos que usa. Eso es lo que había que anexar desde el principio. Aquí se
+   abre el archivo y se saca: la pieza buena, con sus fotos puestas donde iban.
+   Si el archivo no es de ésos, se devuelve tal cual y no pasa nada. */
+export function desempaquetarHtml(html) {
+  const src = String(html || "");
+  if (!/__bundler\/template/.test(src)) return src;
+
+  const dentro = (tipo) => {
+    const m = new RegExp(`<script[^>]*type=["']__bundler/${tipo}["'][^>]*>([\\s\\S]*?)</script\\s*>`, "i").exec(src);
+    if (!m) return null;
+    try { return JSON.parse(m[1].trim()); } catch (_) { return null; }
+  };
+
+  const pieza = dentro("template");
+  if (typeof pieza !== "string" || !pieza.trim()) return src;
+
+  /* Las fotos viajan aparte, cada una con su identificador, y dentro del HTML
+     se las nombra por ese identificador en vez de por una dirección. Se pone
+     la foto misma en su lugar; buildMime la convertirá luego en una parte del
+     correo, que es como Gmail sí las muestra. */
+  const fotos = dentro("manifest");
+  if (!fotos || typeof fotos !== "object") return pieza;
+
+  return Object.entries(fotos).reduce((acc, [id, a]) => (
+    a && a.data && a.mime && id
+      ? acc.split(id).join(`data:${a.mime};base64,${a.data}`)
+      : acc
+  ), pieza);
+}
+
+/* ── El peso del diseño ──
+   Una pieza exportada de una herramienta web llega llena de cosas pensadas
+   para un navegador: <script> que arman la página al vuelo y comentarios que
+   dejó el editor. Ningún lector de correo ejecuta un script —Gmail, Outlook y
+   los demás los borran antes de pintar—, pero sí cuentan para el peso, y el
+   peso es exactamente lo que hace que Gmail corte el mensaje y muestre
+   "Mensaje recortado" a partir de unos 100 KB. Se quitan aquí: el correo se ve
+   igual y pesa lo que de verdad ocupa.
+
+   Los comentarios condicionales (<!--[if mso]>… <![endif]-->) se respetan:
+   ésos no son basura, son las instrucciones con las que un diseño de correo le
+   habla a Outlook, y borrarlas descuadra la pieza justo donde más cuesta
+   verlo. */
+export const aligerarHtml = (html) => String(html || "")
+  .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+  .replace(/<script\b[^>]*\/?>/gi, "")
+  .replace(/<!--[\s\S]*?-->/g, (c) => (/\[(?:if|endif)/i.test(c) ? c : ""))
+  .replace(/[ \t]+\n/g, "\n")
+  .replace(/\n{3,}/g, "\n\n");
+
+/* Qué trae el diseño, en números, para poder decirlo sin adivinar: cuánto pesa
+   entero, cuánto de eso es peso muerto, cuánto son imágenes incrustadas —la
+   otra mitad de la factura, casi siempre— y, lo que más duele descubrir tarde,
+   si lo que se ve en pantalla sólo se ve porque un navegador ejecutó
+   JavaScript. Un correo no lo ejecuta nunca: esa pieza llegaría en blanco. */
+export function analizarHtml(html) {
+  const src = String(html || "");
+  const pesa = (t) => new TextEncoder().encode(t).length;
+  const limpio = aligerarHtml(src);
+  const texto = htmlToText(limpio);
+  const incrustadas = limpio.match(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]+/gi) || [];
+
+  return {
+    limpio,
+    total: pesa(src),
+    /* Lo que se iría al aligerar. */
+    muerto: pesa(src) - pesa(limpio),
+    imagenes: incrustadas.reduce((n, s2) => n + s2.length, 0),
+    /* O lo dice la propia página, o se nota: sin scripts no queda nada que leer
+       y no hay ni una imagen que mirar. Lo que llenaba esa pantalla lo dibujaba
+       el navegador. */
+    enBlanco: /(requires?|needs?|enable|activa|habilita)[^.<]{0,24}javascript|javascript[^.<]{0,24}(to (view|display)|required)/i.test(texto)
+      || (texto.replace(/\s+/g, "").length < 40 && !/<img\b/i.test(limpio)),
+  };
+}

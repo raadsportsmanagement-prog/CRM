@@ -151,10 +151,16 @@ class Aviso extends Error {
   constructor(mensaje, status = 400) { super(mensaje); this.status = status; }
 }
 
-const falta = (que, secretos) => new Aviso(
-  `Falta configurar ${que} en el puente. Ejecuta: ${secretos.map((s) => `wrangler secret put ${s}`).join(" · ")}`,
-  503,
-);
+/* Los secretos y los identificadores no se ponen en el mismo sitio, y decirlo
+   mal manda a la gente a pelearse con el sitio equivocado: un token va cifrado
+   con `wrangler secret put`, y un número de cuenta va escrito en wrangler.toml,
+   que entra al repositorio porque no es un secreto. */
+const falta = (que, { secretos = [], vars = [] }) => {
+  const partes = [];
+  if (secretos.length) partes.push(`ejecuta ${secretos.map((x) => `wrangler secret put ${x}`).join(" y ")}`);
+  if (vars.length) partes.push(`pon ${vars.join(" y ")} en tracker/wrangler.toml`);
+  return new Aviso(`Falta configurar ${que} en el puente: ${partes.join("; y ")}.`, 503);
+};
 
 /* ── Hablar con una API ajena ──
    Los tres servicios contestan JSON y explican sus errores dentro del JSON, no
@@ -194,28 +200,82 @@ const graph = (ruta, params, token) => pedirJson(
    y no hay dos iguales. Aquí se traducen los nombres que Meta sí estandariza;
    lo demás no se tira, se manda aparte para que el CRM lo deje escrito en la
    ficha en vez de perderlo. */
+/* Los nombres de la izquierda no son sólo los estándar de Meta: cada anunciante
+   arma su formulario y el mismo dato llega escrito de varias maneras. El
+   teléfono es el caso claro —Meta documenta `phone_number`, pero muchos
+   formularios lo mandan como `phone`—, y quedarse con uno solo hace que el
+   número se guarde como respuesta suelta en vez de en la ficha: contactos sin
+   teléfono, sin WhatsApp posible, y sin forma de reconocer a quien vuelve. */
 const META_CAMPOS = {
-  full_name: "nombre_completo", first_name: "nombre", last_name: "apellido",
-  email: "correo", phone_number: "telefono",
-  city: "ciudad", ciudad: "ciudad", company_name: "empresa",
+  full_name: "nombre_completo", nombre_completo: "nombre_completo",
+  first_name: "nombre", nombre: "nombre",
+  last_name: "apellido", apellido: "apellido", apellidos: "apellido",
+  email: "correo", correo: "correo", correo_electronico: "correo", e_mail: "correo",
+  phone_number: "telefono", phone: "telefono", telefono: "telefono",
+  numero_de_telefono: "telefono", celular: "telefono", whatsapp: "telefono",
+  city: "ciudad", ciudad: "ciudad",
+  company_name: "empresa", empresa: "empresa", compania: "empresa",
+  job_title: "cargo", cargo: "cargo",
+  country: "pais", pais: "pais",
+  state: "region", province: "region",
+  post_code: "codigo_postal", zip_code: "codigo_postal",
 };
+
+/* Campos que Meta añade por su cuenta y que no son respuestas de nadie.
+   `inbox_url` es un enlace interno al chat, y aparecería en la ficha como una
+   pregunta más que el contacto nunca contestó. */
+const META_IGNORAR = new Set(["inbox_url", "lead_status", "is_organic"]);
 
 function leerCamposMeta(fieldData) {
   const campos = {}, extra = {};
   for (const f of Array.isArray(fieldData) ? fieldData : []) {
     const valor = String((f.values || [])[0] || "").trim();
     if (!valor) continue;
-    const clave = META_CAMPOS[String(f.name || "").toLowerCase()];
+    const nombre = String(f.name || "").toLowerCase();
+    if (META_IGNORAR.has(nombre)) continue;
+    const clave = META_CAMPOS[nombre];
     if (clave) campos[clave] = valor;
     else extra[String(f.name || "")] = valor;
   }
   return { campos, extra };
 }
 
+/* ── El token de la página ──
+   Los formularios y sus leads cuelgan de la página, y para eso Meta exige un
+   token de página: el del usuario de sistema, tal cual, responde
+   "(#190) This method must be called with a Page Access Token".
+
+   Ese token de página se saca del propio token del usuario, así que no hay que
+   guardar un segundo secreto ni volver a pasar por ninguna consola: se pide, se
+   guarda un rato y se reusa. Doce horas, no para siempre — no caduca, porque
+   viene de uno que tampoco caduca, pero cachearlo eternamente dejaría uno viejo
+   en pie si algún día se revoca el de arriba. */
+const PAGE_TOKEN = "meta:token-pagina";
+
+async function tokenDePagina(env) {
+  /* Si alguien lo puso a mano, manda el suyo. */
+  if (env.META_PAGE_TOKEN) return env.META_PAGE_TOKEN;
+
+  const guardado = await env.EVENTOS.get(PAGE_TOKEN);
+  if (guardado) return guardado;
+
+  const r = await graph("/me/accounts", { fields: "id,access_token", limit: "100" }, env.META_TOKEN);
+  const p = (Array.isArray(r.data) ? r.data : []).find((x) => String(x.id) === String(env.META_PAGE_ID));
+  if (!p || !p.access_token) {
+    throw new Aviso(
+      `El token de Meta no alcanza la página ${env.META_PAGE_ID}. Asígnasela al usuario de sistema en ` +
+      "Configuración del negocio → Usuarios del sistema → Asignar activos → Páginas.",
+      502,
+    );
+  }
+  await env.EVENTOS.put(PAGE_TOKEN, p.access_token, { expirationTtl: 43200 });
+  return p.access_token;
+}
+
 async function metaLeads(env, desdeMs) {
-  const token = env.META_PAGE_TOKEN || env.META_TOKEN;
-  if (!token) throw falta("el token de Meta", ["META_TOKEN"]);
-  if (!env.META_PAGE_ID) throw falta("el id de la página de Facebook", ["META_PAGE_ID"]);
+  if (!env.META_TOKEN) throw falta("el token de Meta", { secretos: ["META_TOKEN"] });
+  if (!env.META_PAGE_ID) throw falta("el id de la página de Facebook", { vars: ["META_PAGE_ID"] });
+  const token = await tokenDePagina(env);
 
   /* Los leads cuelgan de cada formulario, no de la página, así que primero hay
      que saber qué formularios existen. Se piden todos y no sólo los activos:
@@ -230,19 +290,45 @@ async function metaLeads(env, desdeMs) {
     ? Math.floor(desdeMs / 1000)
     : Math.floor((Date.now() - 90 * 86400000) / 1000);
 
+  /* Los campos del anuncio —de qué campaña vino el lead— sólo los devuelve Meta
+     si quien pidió el token puede anunciar en la cuenta publicitaria, además de
+     leer la página. Es una autorización aparte, y la mitad de la gente la
+     descubre el día que la necesita.
+
+     Meta no contesta a medias: si falta ese permiso tumba la petición entera, y
+     te quedarías sin los leads por culpa de una etiqueta. Así que se pide lo
+     bueno primero y, si Meta dice que no, se vuelve a pedir lo imprescindible.
+     Un lead sin nombre de campaña sirve; una campaña sin leads, no. */
+  const CAMPOS_CON_ANUNCIO = "id,created_time,field_data,ad_id,ad_name,campaign_id,campaign_name,platform,is_organic";
+  const CAMPOS_ESENCIALES = "id,created_time,field_data";
+  let campos = CAMPOS_CON_ANUNCIO;
+  let sinCampana = false;
+
   const leads = [];
   let cortado = false;
   for (const form of formularios) {
     let despues = null, paginas = 0;
     do {
-      const r = await graph(`/${form.id}/leads`, {
-        fields: "id,created_time,field_data,ad_id,ad_name,campaign_id,campaign_name,platform,is_organic",
+      const pedirLote = (queCampos) => graph(`/${form.id}/leads`, {
+        fields: queCampos,
         /* El filtro se lo hace Meta: pedir los 90 días enteros para descartar
            aquí lo viejo gastaría el presupuesto de peticiones en cada barrido. */
         filtering: JSON.stringify([{ field: "time_created", operator: "GREATER_THAN", value: piso }]),
         limit: "100",
         ...(despues ? { after: despues } : {}),
       }, token);
+
+      let r;
+      try {
+        r = await pedirLote(campos);
+      } catch (e) {
+        if (campos === CAMPOS_ESENCIALES) throw e;
+        /* Se baja de campos una sola vez y para todo lo que quede: si el token
+           no puede leer anuncios, tampoco va a poder en el formulario siguiente. */
+        campos = CAMPOS_ESENCIALES;
+        sinCampana = true;
+        r = await pedirLote(campos);
+      }
 
       for (const l of Array.isArray(r.data) ? r.data : []) {
         const { campos, extra } = leerCamposMeta(l.field_data);
@@ -269,13 +355,21 @@ async function metaLeads(env, desdeMs) {
   }
 
   leads.sort((a, b) => (a.at < b.at ? -1 : 1));
-  return { leads, formularios: formularios.length, truncado: cortado };
+  return {
+    leads,
+    formularios: formularios.length,
+    truncado: cortado,
+    ...(sinCampana ? {
+      aviso: "Los leads entraron, pero sin saber de qué campaña vienen: el token no tiene permiso para leer anuncios. " +
+        "Dale al usuario de sistema acceso a la cuenta publicitaria y vuelve a generar el token.",
+    } : {}),
+  };
 }
 
 async function metaCampanas(env, dias) {
   const token = env.META_TOKEN;
-  if (!token) throw falta("el token de Meta", ["META_TOKEN"]);
-  if (!env.META_AD_ACCOUNT) throw falta("la cuenta publicitaria de Meta", ["META_AD_ACCOUNT"]);
+  if (!token) throw falta("el token de Meta", { secretos: ["META_TOKEN"] });
+  if (!env.META_AD_ACCOUNT) throw falta("la cuenta publicitaria de Meta", { vars: ["META_AD_ACCOUNT"] });
   const cuenta = String(env.META_AD_ACCOUNT).startsWith("act_") ? env.META_AD_ACCOUNT : `act_${env.META_AD_ACCOUNT}`;
 
   const r = await graph(`/${cuenta}/insights`, {
@@ -323,8 +417,8 @@ async function metaCampanas(env, dias) {
    El CRM intenta texto libre y, si Meta cierra la puerta por la ventana de 24
    horas, lo dice con esas palabras en vez de con un número de error. */
 async function whatsappEnviar(env, cuerpo) {
-  if (!env.WA_TOKEN) throw falta("el token de WhatsApp", ["WA_TOKEN"]);
-  if (!env.WA_PHONE_ID) throw falta("el número de WhatsApp", ["WA_PHONE_ID"]);
+  if (!env.WA_TOKEN) throw falta("el token de WhatsApp", { secretos: ["WA_TOKEN"] });
+  if (!env.WA_PHONE_ID) throw falta("el número de WhatsApp", { vars: ["WA_PHONE_ID"] });
 
   const a = String(cuerpo.a || "").replace(/\D/g, "");
   if (!a) throw new Aviso("Falta el número de destino.");
@@ -398,7 +492,7 @@ function gadsRedirect(url) {
 
 async function gadsAccessToken(env) {
   if (!env.GADS_CLIENT_ID || !env.GADS_CLIENT_SECRET) {
-    throw falta("las credenciales de Google Ads", ["GADS_CLIENT_ID", "GADS_CLIENT_SECRET"]);
+    throw falta("las credenciales de Google Ads", { secretos: ["GADS_CLIENT_SECRET"], vars: ["GADS_CLIENT_ID"] });
   }
   /* El permiso de una hora se guarda para no pedir uno nuevo en cada llamada:
      Google limita cuántos se pueden pedir al día, y un barrido que consulte
@@ -439,7 +533,7 @@ async function gadsAccessToken(env) {
    su cursor, que es todo lo que hace falta aquí. */
 async function gadsConsulta(env, query) {
   const cid = soloDigitos(env.GADS_CUSTOMER_ID);
-  if (!cid) throw falta("el número de cuenta de Google Ads", ["GADS_CUSTOMER_ID"]);
+  if (!cid) throw falta("el número de cuenta de Google Ads", { vars: ["GADS_CUSTOMER_ID"] });
   const token = await gadsAccessToken(env);
 
   const cabeceras = {
@@ -485,17 +579,36 @@ async function gadsLeads(env, dias) {
   /* Google guarda las respuestas de los formularios 30 días y ni un minuto
      más; pedir un rango mayor no devuelve nada más viejo, sólo un error. */
   const rango = dias <= 7 ? "LAST_7_DAYS" : dias <= 14 ? "LAST_14_DAYS" : "LAST_30_DAYS";
+
+  /* Se piden exactamente los cuatro campos que la propia guía de Google enseña
+     en su ejemplo, y ni uno más. GAQL rechaza la consulta entera si un campo no
+     es seleccionable junto a este recurso —no la devuelve a medias—, así que
+     añadir uno "que seguramente vale" es arriesgar los leads de verdad por un
+     dato de adorno. El nombre de la campaña se busca aparte, abajo. */
   const filas = await gadsConsulta(env, `
     SELECT
       lead_form_submission_data.id,
       lead_form_submission_data.submission_date_time,
       lead_form_submission_data.lead_form_submission_fields,
-      lead_form_submission_data.campaign,
-      lead_form_submission_data.gclid,
-      campaign.name
+      lead_form_submission_data.campaign
     FROM lead_form_submission_data
     WHERE lead_form_submission_data.submission_date_time DURING ${rango}
   `);
+  if (!filas.length) return { leads: [] };
+
+  /* El lead trae la campaña como "customers/123/campaigns/456", que no le dice
+     nada a nadie. Se traducen los números a nombres con una segunda consulta,
+     que es barata y no lleva métricas —así devuelve también las campañas
+     apagadas, que igual pudieron dejar leads antes de pararse—. Si esta falla,
+     los leads entran igual sin nombre de campaña: valen mucho más que la
+     etiqueta. */
+  const nombres = new Map();
+  try {
+    for (const f of await gadsConsulta(env, "SELECT campaign.id, campaign.name FROM campaign")) {
+      const c = f.campaign || {};
+      if (c.id) nombres.set(String(c.id), c.name || "");
+    }
+  } catch (_) {}
 
   const leads = filas.map((f) => {
     const d = f.leadFormSubmissionData || {};
@@ -514,11 +627,10 @@ async function gadsLeads(env, dias) {
          decir cuál. Se convierte a ISO tal cual y se acepta el desfase: fingir
          una zona horaria sería inventarse una hora exacta que no se sabe. */
       at: String(d.submissionDateTime || "").replace(" ", "T") || new Date().toISOString(),
-      campana: (f.campaign && f.campaign.name) || "",
+      campana: nombres.get(String(d.campaign || "").split("/").pop()) || "",
       anuncio: "",
       plataforma: "google",
       formulario: "",
-      gclid: d.gclid || "",
       campos, extra,
     };
   }).filter((l) => l.ext !== "gads:");
@@ -563,7 +675,7 @@ async function gadsCampanas(env, dias) {
    conectada a tu puente. Se crea al entrar —que sí pide clave—, dura diez
    minutos y se gasta al usarse. */
 async function gadsEntrar(env, url) {
-  if (!env.GADS_CLIENT_ID) throw falta("las credenciales de Google Ads", ["GADS_CLIENT_ID", "GADS_CLIENT_SECRET"]);
+  if (!env.GADS_CLIENT_ID) throw falta("las credenciales de Google Ads", { secretos: ["GADS_CLIENT_SECRET"], vars: ["GADS_CLIENT_ID"] });
   const nonce = crypto.randomUUID();
   await env.EVENTOS.put(`gads:nonce:${nonce}`, "1", { expirationTtl: 600 });
   const destino = `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({

@@ -43,8 +43,11 @@ export const EVENTOS = [
   { key: "correo.abierto", label: "Abren un correo enviado", entidad: "contact", grupo: "Mensajes" },
   { key: "correo.clic", label: "Pinchan un enlace del correo", entidad: "contact", grupo: "Mensajes" },
   { key: "correo.rebotado", label: "Un correo rebota", entidad: "contact", grupo: "Mensajes" },
-  { key: "sin.actividad", label: "Una ficha se enfría", entidad: "contact", grupo: "Tiempo", arg: { tipo: "dias", label: "Días sin actividad", vacio: "7" } },
+  { key: "sin.actividad", label: "Un contacto se enfría", entidad: "contact", grupo: "Tiempo", arg: { tipo: "dias", label: "Días sin actividad", vacio: "7" } },
+  { key: "negocio.frio", label: "Un negocio se enfría", entidad: "deal", grupo: "Tiempo", arg: { tipo: "dias", label: "Días sin actividad", vacio: "7" } },
 ];
+/* Los disparadores que no avisa nadie: hay que ir a mirar cada tanto. */
+export const ENFRIAMIENTO = ["sin.actividad", "negocio.frio"];
 export const eventoDe = (k) => EVENTOS.find((e) => e.key === k) || EVENTOS[0];
 
 export const ACCIONES = [
@@ -322,6 +325,7 @@ export const EJEMPLOS = [
   "Si un contacto abre el correo, márcalo como Conectado y créale un negocio.",
   "Cuando alguien conteste por WhatsApp, avísame y pon el estado en Conectado.",
   "Si un contacto lleva 7 días sin actividad, avísame para volver a escribirle.",
+  "Cuando un negocio lleve 15 días sin moverse, avísame y déjale una nota.",
   "Cuando rebote un correo, marca el estado de lead como Descalificado.",
 ];
 
@@ -347,7 +351,7 @@ const VERBOS = [
   { fam: "crear", re: /\b(creale|creales|crea|crear|abrele|abre|abrir|genera|generar|levanta|levantar)\b/g },
   { fam: "propiedad", re: /\b(marcalo|marcala|marcalos|marca|marcar|ponle|ponlo|ponla|pon|poner|cambiale|cambia|cambiar|actualiza|actualizar|asignale|asigna|asignar|establece|establecer|fija|fijar|deja(?=l[oa]s? (en|como)))\b/g },
   { fam: "etapa", re: /\b(muevelo|muevela|muevelos|mueve|mover|pasalo|pasala|pasa|pasar|llevalo|llevala|lleva|llevar)\b/g },
-  { fam: "nota", re: /\b(anota|anotar|apunta|apuntar|registra|registrar|deja una nota|dejar una nota|documenta|documentar)\b/g },
+  { fam: "nota", re: /\b(anota|anotar|apunta|apuntar|registra|registrar|documenta|documentar|(?:deja|dejale|dejales|dejar|dejarle|dejarles|pon)\s+(?:una\s+|la\s+)?nota)\b/g },
   { fam: "aviso", re: /\b(avisame|avisenme|avisa|avisar|notificame|notifica|notificar|alertame|alerta|alertar|recuerdame|recuerda|recordar|dime|avisame)\b/g },
 ];
 
@@ -444,8 +448,7 @@ export function compilarVibe(texto, db) {
   const zonaCuando = original.slice(0, marcas.length ? marcas[0].i : original.length);
   const pc = plano(zonaCuando);
 
-  const ev = eventoDe(auto.cuando.evento);
-  const entidad = ev.entidad;
+  let ev = eventoDe(auto.cuando.evento);
 
   if (auto.cuando.evento === "negocio.etapa") {
     const etapas = etapasDe(db);
@@ -454,7 +457,8 @@ export function compilarVibe(texto, db) {
     else if (/\bse gane\b|\bgane\b|\bganado\b/.test(pc)) auto.cuando.arg = etapas.find((e) => plano(e).startsWith("gana")) || "";
     else if (/\bse pierda\b|\bperdid/.test(pc)) auto.cuando.arg = etapas.find((e) => plano(e).startsWith("perdi")) || "";
   }
-  if (auto.cuando.evento === "sin.actividad") {
+  if (auto.cuando.evento === "sin.actividad" && /\b(negocio|oportunidad|trato|deal)\b/.test(pc)) auto.cuando.evento = "negocio.frio";
+  if (ENFRIAMIENTO.includes(auto.cuando.evento)) {
     const m = pc.match(/(\d+)\s*(d[ií]a|semana|mes)/);
     const n = m ? Number(m[1]) * (plano(m[2]).startsWith("seman") ? 7 : plano(m[2]).startsWith("mes") ? 30 : 1) : 7;
     auto.cuando.arg = String(n);
@@ -463,6 +467,11 @@ export function compilarVibe(texto, db) {
     if (/\bwhats?app|wasap|wa\b/.test(pc)) auto.cuando.arg = "whatsapp";
     else if (/\bcorreo|email|mail\b/.test(pc)) auto.cuando.arg = "email";
   }
+  /* La entidad se fija aquí y no antes: hasta ahora el disparador pudo cambiar
+     —un "negocio sin actividad" pasa de contacto a negocio— y con él cambian
+     las propiedades que se pueden leer y escribir. */
+  ev = eventoDe(auto.cuando.evento);
+  const entidad = ev.entidad;
   if (auto.cuando.evento === "propiedad.cambiada") auto.cuando.arg = buscarCampo(zonaCuando, db, entidad);
 
   entendido.push(`Se dispara cuando ${ev.label.charAt(0).toLowerCase()}${ev.label.slice(1)}${auto.cuando.arg ? ` · ${auto.cuando.arg}` : ""}.`);
@@ -703,7 +712,7 @@ export function disparaCon(auto, evento) {
   if (evento.tipo === "negocio.etapa") return plano(evento.etapa) === arg;
   if (evento.tipo === "propiedad.cambiada") return (evento.campos || []).includes(auto.cuando.arg);
   if (evento.tipo === "mensaje.recibido" || evento.tipo === "mensaje.enviado") return plano(evento.canal) === arg;
-  if (evento.tipo === "sin.actividad") return true; // los días ya se filtraron al barrer
+  if (ENFRIAMIENTO.includes(evento.tipo)) return true; // los días ya se filtraron al barrer
   return true;
 }
 
@@ -756,7 +765,7 @@ export function barrerFrios(db, marcas) {
   const ahora = Date.now();
   const vistas = marcas && typeof marcas === "object" ? marcas : {};
   arr(db.automations).forEach((auto) => {
-    if (!auto.activa || auto.cuando.evento !== "sin.actividad") return;
+    if (!auto.activa || !ENFRIAMIENTO.includes(auto.cuando.evento)) return;
     const dias = Math.max(1, Number(auto.cuando.arg) || 7);
     const limite = dias * 86400000;
     const ent = eventoDe(auto.cuando.evento).entidad;
@@ -769,7 +778,7 @@ export function barrerFrios(db, marcas) {
          luego la persona escribe, la referencia cambia y la regla puede volver
          a dispararse; mientras no pase nada, no se repite. */
       if (vistas[`${auto.id}:${rec.id}`] === ref) return;
-      eventos.push({ tipo: "sin.actividad", kind: ent, recId: rec.id, rec, at: nowISO(), marca: [`${auto.id}:${rec.id}`, ref] });
+      eventos.push({ tipo: auto.cuando.evento, kind: ent, recId: rec.id, rec, at: nowISO(), marca: [`${auto.id}:${rec.id}`, ref] });
     });
   });
   return eventos;

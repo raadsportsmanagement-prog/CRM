@@ -10,7 +10,7 @@ compatibility_date = "2025-01-01"
 # una vez y renueva solo. Por eso hace falta aunque no midas correos.
 [[kv_namespaces]]
 binding = "EVENTOS"
-id = "PEGA_AQUI_EL_ID"
+id = "d0e635cc8b7140feb25259c02d505de6"
 
 # La clave NO va en este archivo: este archivo entra al repositorio.
 # Se guarda cifrada en Cloudflare con:
@@ -32,11 +32,11 @@ id = "PEGA_AQUI_EL_ID"
 [vars]
 # Meta — la página de Facebook cuyos formularios de Lead Ads se leen.
 # Está en la página → Configuración → Información, como "Identificador".
-META_PAGE_ID = ""
+META_PAGE_ID = "100575104770549"
 
 # Meta — la cuenta publicitaria, para las métricas de campaña.
 # Está en el Administrador de anuncios, arriba, como "act_123456789".
-META_AD_ACCOUNT = ""
+META_AD_ACCOUNT = "act_281487689280491"
 
 # WhatsApp — el identificador del número remitente. NO es el número de
 # teléfono: está en developers.facebook.com → tu app → WhatsApp → Configuración

@@ -12,10 +12,11 @@ import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
   gmailComposeLink, mailtoLink, gmailStatus, onGmailChange, connectGmail,
   disconnectGmail, sendGmail, withSignature, withSignatureHtml, htmlToText, escapeHtml,
+  aligerarHtml, analizarHtml, desempaquetarHtml,
   traerCorreos, traerRebotes,
 } from "./integrations.js";
 import {
-  midiendo, nuevoTrk, marcarHtml, textoAHtml, traerEventos, probarMedidor, estadoDe,
+  midiendo, nuevoTrk, marcarHtml, textoAHtml, traerEventos, estadoDe,
 } from "./tracking.js";
 import {
   traerLeads, traerCampanas, enviarWhatsApp, probarPuente,
@@ -635,10 +636,28 @@ export default function CRM() {
   /* ── mutaciones ── */
   const collKey = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : "deals");
 
-  const addRecords = (kind, list) => setDb((d) => ({ ...d, [collKey(kind)]: [...list, ...d[collKey(kind)]] }));
-  const updateRecord = (kind, id, props) => setDb((d) => ({
-    ...d, [collKey(kind)]: d[collKey(kind)].map((r) => (r.id === id ? { ...r, props: { ...r.props, ...props } } : r)),
-  }));
+  const addRecords = (kind, list) => {
+    setDb((d) => ({ ...d, [collKey(kind)]: [...list, ...d[collKey(kind)]] }));
+    const tipo = kind === "contact" ? "contacto.creado" : kind === "company" ? "empresa.creada" : "negocio.creado";
+    list.forEach((r) => emitir({ tipo, kind, recId: r.id, rec: r }));
+  };
+  /* Una propiedad que cambia puede ser dos noticias a la vez: que cambió una
+     propiedad y, si era la etapa de un negocio, que el negocio se movió. Se
+     avisan las dos, porque una regla puede estar escrita de cualquiera de las
+     dos maneras. El estado anterior se lee antes de escribir: sin eso, guardar
+     la misma etapa dos veces dispararía el mismo aviso dos veces. */
+  const updateRecord = (kind, id, props) => {
+    const antes = buscarFicha(dbRef.current || {}, kind, id);
+    setDb((d) => ({
+      ...d, [collKey(kind)]: d[collKey(kind)].map((r) => (r.id === id ? { ...r, props: { ...r.props, ...props } } : r)),
+    }));
+    if (!antes) return;
+    const rec = { ...antes, props: { ...antes.props, ...props } };
+    const campos = Object.keys(props).filter((k) => String(antes.props[k] == null ? "" : antes.props[k]) !== String(props[k] == null ? "" : props[k]));
+    if (!campos.length) return;
+    emitir({ tipo: "propiedad.cambiada", kind, recId: id, rec, campos });
+    if (kind === "deal" && campos.includes("stage")) emitir({ tipo: "negocio.etapa", kind, recId: id, rec, etapa: props.stage });
+  };
   const deleteRecords = (kind, ids) => setDb((d) => ({ ...d, [collKey(kind)]: d[collKey(kind)].filter((r) => !ids.includes(r.id)) }));
 
   /* Un mismo valor en muchas fichas de una sola pasada. `mode` decide a quién
@@ -661,7 +680,12 @@ export default function CRM() {
     return n;
   };
 
-  const logActivity = (act) => setDb((d) => {
+  const logActivity = (act) => {
+    registrarActividad(act);
+    emitirActividad({ ...act, at: act.at || nowISO() });
+  };
+
+  const registrarActividad = (act) => setDb((d) => {
     const at = act.at || nowISO();
     const dir = act.dir === "in" ? "in" : "out";
     const stamp = (arr) => arr.map((r) => ((act.contactIds || []).includes(r.id) || (act.companyIds || []).includes(r.id)) ? { ...r, props: { ...r.props, lastActivityAt: at } } : r);
@@ -716,6 +740,12 @@ export default function CRM() {
         companies: sellar(d.companies),
       };
     });
+    /* Un barrido puede traer cien correos viejos de golpe. Sólo se avisa de los
+       que entraron —los que salieron ya se anotaron cuando salieron— y de los
+       que llegaron hoy: una regla de "cuando me contesten" no debe despertar
+       por una respuesta de hace tres meses que el CRM apenas está leyendo. */
+    const frescos = Date.now() - 36 * 3600 * 1000;
+    conId.forEach((a) => { if (a.dir === "in" && Date.parse(a.at) >= frescos) emitirActividad(a); });
     return conId.length;
   };
 
@@ -865,6 +895,25 @@ export default function CRM() {
       contacts: sellar(d.contacts),
       companies: sellar(d.companies),
     }));
+    /* Una apertura por ficha y por pasada: un correo reenviado dentro de un
+       club puede sumar veinte aperturas del mismo envío, y eso es una noticia,
+       no veinte. */
+    const avisados = new Set();
+    for (const a of actuales) {
+      const evs = a.trk && porTrk.get(a.trk);
+      if (!evs || !cambios.has(a.id)) continue;
+      const tipos = new Set(evs.map((e) => (e.tipo === "clic" ? "correo.clic" : "correo.abierto")));
+      for (const id of [...(a.contactIds || []), ...(a.companyIds || [])]) {
+        const kind = (a.contactIds || []).includes(id) ? "contact" : "company";
+        const rec = buscarFicha(dbRef.current || {}, kind, id);
+        if (!rec) continue;
+        tipos.forEach((tipo) => {
+          if (avisados.has(`${tipo}:${id}`)) return;
+          avisados.add(`${tipo}:${id}`);
+          emitir({ tipo, kind, recId: id, rec });
+        });
+      }
+    }
     return cambios.size;
   };
 
@@ -911,10 +960,21 @@ export default function CRM() {
       contacts: sellar(d.contacts),
       companies: sellar(d.companies),
     }));
-    /* Se cuentan los que no se habían visto: volver a marcar uno viejo es
-       inofensivo —se escribe lo mismo encima— pero anunciarlo como novedad
-       haría que cada actualización pareciera traer rebotes nuevos. */
-    return lista.filter((r) => !yaEstaban.has(r.ext)).length;
+    /* Sólo se avisa de los rebotes nuevos, por lo mismo: volver a marcar uno
+       viejo es inofensivo, pero disparar una regla por él sería inventarse un
+       rebote que ocurrió hace semanas. */
+    const nuevos = lista.filter((r) => !yaEstaban.has(r.ext));
+    const yaAvisado = new Set();
+    nuevos.forEach((r) => {
+      [...(r.contactIds || []), ...(r.companyIds || [])].forEach((id) => {
+        if (yaAvisado.has(id)) return;
+        yaAvisado.add(id);
+        const kind = (r.contactIds || []).includes(id) ? "contact" : "company";
+        const rec = buscarFicha(dbRef.current || {}, kind, id);
+        if (rec) emitir({ tipo: "correo.rebotado", kind, recId: id, rec });
+      });
+    });
+    return nuevos.length;
   };
 
   /* ────────────────────────────────────────────────────────────
@@ -1071,12 +1131,10 @@ export default function CRM() {
     const enlaces = enlacesDe(p.kind, p.recId);
 
     if (!esCorreo) {
-      if (!toE164(rec.props.phone, integ.whatsapp.countryCode)) return { ok: false, err: "El contacto no tiene teléfono." };
-      if (!window.open(waLink(rec.props.phone, cuerpo, integ.whatsapp.countryCode), "_blank", "noopener,noreferrer")) {
-        return { ok: false, err: "El navegador bloqueó la ventana. Permite las ventanas emergentes para este sitio." };
-      }
+      const r = await mandarWhatsApp(integ, rec.props.phone, cuerpo);
+      if (!r.ok) return r;
       logActivity({ type: "whatsapp", subject: asunto, body: cuerpo, auto: p.autoId, ...enlaces });
-      return { ok: true, texto: `WhatsApp abierto para ${titleOf(ent, rec)}` };
+      return { ok: true, texto: `${r.solo ? "WhatsApp enviado a" : "WhatsApp abierto para"} ${titleOf(ent, rec)}` };
     }
 
     const to = String(rec.props.email || "").trim();
@@ -1145,7 +1203,14 @@ export default function CRM() {
      mirar. Se mira al abrir y cada medio minuto mientras el CRM esté abierto.
      Con la pestaña cerrada no corre nada, y es honesto que así sea: esto vive
      en el navegador, no en un servidor. */
+  /* Se espera a que el cuaderno esté cargado antes de empezar a mirar. Con el
+     efecto atado al montaje el primer pase caía con `db` todavía en null y no
+     hacía nada, así que un envío programado que ya venía vencido de la sesión
+     anterior se quedaba media hora quieto en la pantalla —el tiempo hasta el
+     siguiente latido— con la hora de salida ya pasada a la vista. */
+  const datosListos = Boolean(db);
   useEffect(() => {
+    if (!datosListos) return undefined;
     let vivo = true;
     const tic = async () => {
       const d = dbRef.current;
@@ -1162,7 +1227,11 @@ export default function CRM() {
           const quedan = [];
           for (const x of n.autoCola) {
             if (!ids.has(x.id)) { quedan.push(x); continue; }
-            if (necesitaMano(x.accion.tipo)) { quedan.push({ ...x, estado: "listo" }); continue; }
+            if (necesitaMano(x.accion.tipo)) {
+              quedan.push({ ...x, estado: "listo" });
+              log.push(lineaLog(x, "espera", `Cumplió la espera · ${textoAccion(x.accion, n, entidadDeKind(x.kind))}`));
+              continue;
+            }
             const r = aplicarAccionPura(n, x);
             n = r.d;
             log.push(lineaLog(x, r.nivel, `${r.texto} (programado)`));
@@ -1197,7 +1266,7 @@ export default function CRM() {
     tic();
     const h = setInterval(tic, 30000);
     return () => { vivo = false; clearInterval(h); };
-  }, []);
+  }, [datosListos]);
 
   const marcarBuzon = (parche) => setDb((d) => ({ ...d, buzon: { ...d.buzon, ...parche } }));
   const activarLectura = () => setDb((d) => ({
@@ -1224,6 +1293,7 @@ export default function CRM() {
   }
 
   const sinLeer = contarSinLeer(db);
+  const porAtender = (db.autoCola || []).filter((x) => x.estado === "listo").length;
 
   const NAV = [
     { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
@@ -1233,6 +1303,7 @@ export default function CRM() {
     { key: "deal", label: "Negocios", Icon: Briefcase },
     { key: "activities", label: "Actividades", Icon: Activity },
     { key: "templates", label: "Plantillas", Icon: MessageSquare },
+    { key: "automations", label: "Automatizaciones", Icon: Zap },
     { key: "connections", label: "Conexiones", Icon: Plug },
     { key: "settings", label: "Configuración", Icon: Settings },
   ];
@@ -1262,7 +1333,7 @@ export default function CRM() {
           </div>
           {NAV.map(({ key, label, Icon }) => {
             const on = view === key;
-            const nuevos = key === "messages" ? sinLeer : 0;
+            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : 0;
             return (
               <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
                 style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
@@ -1304,6 +1375,10 @@ export default function CRM() {
               onLeerBandeja={activarLectura} onLeads={importarLeads} />
           )}
           {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say} />}
+          {view === "automations" && (
+            <AutomationsView db={db} setDb={setDb} say={say} setDetail={setDetail}
+              onAtender={atenderPendiente} onCerrar={cerrarPendiente} />
+          )}
           {view === "connections" && <ConnectionsView db={db} setDb={setDb} say={say} onLeads={importarLeads} onBuzon={marcarBuzon} />}
           {view === "settings" && <SettingsView db={db} setDb={setDb} setModal={setModal} say={say} />}
         </main>
@@ -2096,6 +2171,49 @@ const resumen = (a) => {
    Cada fuente falla por su cuenta y se cuenta aparte. Que el medidor esté caído
    no puede impedir que se enteren de un rebote, que es el dato caro.
    ──────────────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────
+   Mandar un WhatsApp
+
+   Dos caminos y una sola puerta, para que los tres sitios desde donde el CRM
+   manda WhatsApp —el hilo de Mensajes, el envío masivo y las automatizaciones—
+   no tengan que saber cuál está encendido.
+
+     · "enlace": se abre WhatsApp con el texto ya escrito y tú das el último
+       clic. Funciona hoy, sin configurar nada, con tu WhatsApp de siempre.
+
+     · "api": lo manda el puente por la WhatsApp Cloud API y no se abre nada.
+       Pide cuenta de empresa en Meta y un token, que vive allá.
+
+   La diferencia que importa no es la comodidad: por enlace, "enviar" siempre
+   necesita una persona delante, así que una automatización de WhatsApp deja el
+   mensaje preparado y espera. Por API sale sola.
+
+   Devuelve qué pasó en vez de avisar por su cuenta, porque quien llama sabe si
+   toca pintar un error o anotarlo en el historial.
+   ──────────────────────────────────────────────────────────── */
+async function mandarWhatsApp(integ, telefono, texto) {
+  const cc = integ.whatsapp.countryCode;
+  const numero = toE164(telefono, cc);
+  if (!numero) return { ok: false, err: "No tiene un teléfono que WhatsApp pueda marcar." };
+
+  if (integ.whatsapp.modo !== "api") {
+    if (!window.open(waLink(telefono, texto, cc), "_blank", "noopener,noreferrer")) {
+      return { ok: false, err: "El navegador bloqueó la ventana. Permite las ventanas emergentes para este sitio." };
+    }
+    return { ok: true, solo: false };
+  }
+
+  if (!integ.puente.base || !integ.puente.clave) {
+    return { ok: false, err: "WhatsApp está puesto en “envía solo”, pero falta el puente. Configúralo en Conexiones." };
+  }
+  try {
+    await enviarWhatsApp({ base: integ.puente.base, clave: integ.puente.clave, a: numero, texto });
+    return { ok: true, solo: true };
+  } catch (e) {
+    return { ok: false, err: (e && e.message) || String(e) };
+  }
+}
+
 async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads }) {
   const integ = db.integrations;
   const mide = midiendo(integ.medicion);
@@ -2527,13 +2645,13 @@ function Conversacion({ conv, db, say, setDetail, onLog }) {
 
     if (!esCorreo) {
       const cuerpo = crudo;
-      if (!abrirUrl(waLink(rec.props.phone, cuerpo, integ.whatsapp.countryCode))) {
-        setErr("El navegador bloqueó la ventana. Permite las ventanas emergentes para este sitio.");
-        return;
-      }
+      setBusy(true);
+      const r = await mandarWhatsApp(integ, rec.props.phone, cuerpo);
+      setBusy(false);
+      if (!r.ok) { setErr(r.err); return; }
       registrarSalida(cuerpo);
       limpiar();
-      say("WhatsApp abierto y registrado");
+      say(r.solo ? "WhatsApp enviado" : "WhatsApp abierto y registrado");
       return;
     }
 
@@ -2784,20 +2902,72 @@ function HtmlAttach({ value, onChange }) {
   const input = useRef(null);
   const [tab, setTab] = useState("diseno");
   const [err, setErr] = useState("");
+  const [nota, setNota] = useState("");
   const html = value || "";
   const kb = pesoKb(html);
+
+  /* Qué hay dentro, para poder avisar con números en vez de con un "conviene
+     aligerarlo" a secas: cuánto es peso muerto, cuánto son imágenes pegadas
+     dentro del propio archivo y si la pieza necesita JavaScript para verse. */
+  const info = useMemo(() => analizarHtml(html), [html]);
+  const kbMuerto = Math.round(info.muerto / 1024);
+  const kbImagenes = Math.round(info.imagenes / 1024);
+  /* Lo que Gmail mira para decidir si recorta es el cuerpo del mensaje, y las
+     fotos incrustadas ya no viajan en el cuerpo: salen como partes aparte (ver
+     buildMime). Así que el aviso de "mensaje recortado" se mide sobre lo que
+     de verdad va a ir en el cuerpo, no sobre lo que pesa el archivo. */
+  const kbCuerpo = Math.max(0, Math.round((info.total - info.muerto - info.imagenes) / 1024));
+  /* ¿Este archivo es en realidad una página web que trae el correo escondido
+     dentro? Si lo es, se puede abrir y quedarse con la pieza buena. */
+  const empaquetado = useMemo(() => desempaquetarHtml(html) !== html, [html]);
+
+  /* Abrir el envoltorio: cambia una página que llegaría en blanco por el correo
+     que traía dentro. Se dice qué pasó, porque lo que queda anexado ya no es el
+     archivo que la persona tiene en el disco. */
+  const desempaquetar = (crudo) => {
+    const dentro = aligerarHtml(desempaquetarHtml(crudo));
+    onChange(dentro);
+    setErr("");
+    setNota("Este archivo era una página que se dibujaba con JavaScript: llegaría en blanco. Dentro traía el correo de verdad —tablas y estilos, sin scripts— y es el que quedó anexado, con sus imágenes.");
+    setTab("diseno");
+  };
+
+  /* Aligerar es quitar lo que ningún lector de correo iba a ejecutar, así que
+     no cambia lo que llega: cambia lo que pesa. Se dice cuánto se fue, para que
+     nadie tenga que descubrir por su cuenta que lo anexado no es byte a byte
+     el archivo que tiene en el disco. */
+  const aligerar = (crudo) => {
+    const limpio = aligerarHtml(crudo);
+    const menos = pesoKb(crudo) - pesoKb(limpio);
+    onChange(limpio);
+    setNota(menos >= 1
+      ? `Se quitaron ${menos} KB de scripts y comentarios: ningún lector de correo los ejecuta, sólo hacían pesar el correo.`
+      : "");
+  };
 
   const cargar = (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = ""; // permite volver a cargar el mismo archivo tras editarlo
     if (!f) return;
-    setErr("");
-    if (f.size > 500_000) {
-      setErr("El archivo pesa más de 500 KB. Un correo así no lo acepta ningún lector: aligera el diseño o deja las imágenes enlazadas en vez de incrustadas.");
+    setErr(""); setNota("");
+    /* El tope ya no es el que aguanta el cuerpo del correo —las fotos salen
+       como partes aparte y no cuentan para el recorte—, sino el que aguanta el
+       envío: la API de Gmail recibe el mensaje entero en una sola petición y lo
+       codificado pesa un tercio más, así que 3 MB de archivo es el límite
+       cómodo. El peso del cuerpo se avisa aparte, más abajo. */
+    if (f.size > 3_000_000) {
+      setErr("El archivo pesa más de 3 MB y Gmail no acepta un envío así. Casi siempre es una sola foto sin comprimir: exporta la pieza con la imagen más liviana y vuelve a anexarla.");
       return;
     }
     const fr = new FileReader();
-    fr.onload = () => { onChange(String(fr.result || "")); setTab("diseno"); };
+    fr.onload = () => {
+      const crudo = String(fr.result || "");
+      /* Un archivo exportado de una herramienta web trae el correo escondido
+         dentro: se saca al vuelo, para que nadie anexe una página en blanco
+         sin enterarse. */
+      if (desempaquetarHtml(crudo) !== crudo) { desempaquetar(crudo); return; }
+      aligerar(crudo); setTab("diseno");
+    };
     fr.onerror = () => setErr("No se pudo leer el archivo.");
     fr.readAsText(f, "UTF-8");
   };
@@ -2808,12 +2978,12 @@ function HtmlAttach({ value, onChange }) {
         <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em", flex: 1 }}>
           DISEÑO HTML (OPCIONAL)
         </div>
-        {html && <Pill color={C.blue} soft={C.blueSoft}>{kb} KB</Pill>}
+        {html && <Pill color={kb > 100 ? C.amber : C.blue} soft={kb > 100 ? C.amberSoft : C.blueSoft}>{kb} KB</Pill>}
         <input ref={input} type="file" accept=".html,.htm,text/html" onChange={cargar} style={{ display: "none" }} />
         <Btn size="sm" variant="outline" Icon={Paperclip} onClick={() => input.current && input.current.click()}>
           {html ? "Reemplazar archivo" : "Anexar archivo .html"}
         </Btn>
-        {html && <Btn size="sm" variant="ghost" Icon={Trash2} onClick={() => { setErr(""); onChange(""); }}>Quitar</Btn>}
+        {html && <Btn size="sm" variant="ghost" Icon={Trash2} onClick={() => { setErr(""); setNota(""); onChange(""); }}>Quitar</Btn>}
       </div>
 
       {!html && !err && (
@@ -2837,11 +3007,74 @@ function HtmlAttach({ value, onChange }) {
           </div>
           {tab === "diseno"
             ? <HtmlPreview html={html} />
-            : <textarea className="crm-in" rows={10} value={html} onChange={(e) => onChange(e.target.value)} spellCheck={false}
+            : <textarea className="crm-in" rows={10} value={html}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (desempaquetarHtml(v) !== v) { desempaquetar(v); return; }
+                  setNota(""); onChange(v);
+                }} spellCheck={false}
                 style={{ ...inputStyle, resize: "vertical", fontFamily: "var(--mono)", fontSize: 12, lineHeight: 1.5 }} />}
-          {kb > 100 && (
+
+          {nota && (
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.jade, marginTop: 6, lineHeight: 1.5 }}>{nota}</div>
+          )}
+
+          {/* Lo primero que hay que decir, porque no se arregla aligerando: una
+              pieza que se dibuja con JavaScript llega en blanco. La vista previa
+              de arriba lo muestra tal cual —el iframe tampoco ejecuta scripts—,
+              pero conviene decirlo con todas las letras antes de que salga. */}
+          {info.enBlanco && (
+            <div style={{ background: C.claySoft, borderRadius: 6, padding: "9px 11px", marginTop: 7, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.55 }}>
+              Este diseño se dibuja con JavaScript y ningún lector de correo lo ejecuta: llegaría en blanco, o con el
+              aviso de “esta página necesita JavaScript”. Tal como está, lo único que se leería es el mensaje en texto.
+              {empaquetado ? (
+                <>
+                  <div style={{ marginTop: 6 }}>
+                    Pero este archivo trae el correo de verdad guardado dentro —tablas e imágenes, sin scripts—.
+                    Se puede sacar y anexar ése.
+                  </div>
+                  <div style={{ marginTop: 8 }}>
+                    <Btn size="sm" variant="outline" onClick={() => desempaquetar(html)}>Usar el correo que trae dentro</Btn>
+                  </div>
+                </>
+              ) : (
+                <div style={{ marginTop: 6 }}>
+                  Exporta la pieza como <b>HTML de correo</b> —tablas e imágenes, sin scripts— o pega aquí la versión
+                  que tu herramienta llame “para email”.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Aligerar sólo se ofrece cuando quitar los scripts no cambia lo que se
+              ve. En una página que se dibuja con JavaScript, esos scripts son el
+              diseño entero: aligerarla la deja vacía, y ese botón sería una
+              trampa. Ahí el camino es el de arriba, sacar el correo de dentro. */}
+          {kbMuerto >= 1 && !empaquetado && (
+            <div style={{ background: C.amberSoft, borderRadius: 6, padding: "9px 11px", marginTop: 7, fontFamily: "var(--ui)", fontSize: 12, color: C.amber, lineHeight: 1.55 }}>
+              {kbMuerto} KB de este diseño son scripts y comentarios que ningún correo ejecuta. Quitarlos no cambia
+              lo que se ve.
+              <div style={{ marginTop: 8 }}>
+                <Btn size="sm" variant="outline" onClick={() => aligerar(html)}>Aligerar</Btn>
+              </div>
+            </div>
+          )}
+
+          {kbCuerpo > 100 && (
             <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.amber, marginTop: 6, lineHeight: 1.5 }}>
-              Pesa {kb} KB. Gmail recorta los correos que pasan de ~100 KB y muestra “Mensaje recortado”; conviene aligerarlo.
+              El cuerpo del correo pesa {kbCuerpo} KB. Gmail recorta los que pasan de ~100 KB y muestra
+              “Mensaje recortado”. Conviene aligerarlo.
+            </div>
+          )}
+
+          {/* Las fotos incrustadas ya no son un problema de peso: salen como
+              partes del mensaje, que es además la única forma en que Gmail las
+              muestra. Se dice, porque el número de KB de arriba asusta y no
+              debería. */}
+          {kbImagenes >= 20 && (
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>
+              {kbImagenes} KB de este diseño son imágenes incrustadas. Al enviar por Gmail conectado viajan como
+              parte del correo y se ven dentro del mensaje, sin contar para los ~100 KB del recorte.
             </div>
           )}
         </>
@@ -2923,6 +3156,686 @@ function TemplatesView({ db, setDb, say }) {
 }
 
 /* ────────────────────────────────────────────────────────────
+   Automatizaciones
+   ────────────────────────────────────────────────────────────
+   Tres maneras de escribir la misma regla y una sola regla debajo. Se dicta en
+   español, se arma con menús o se escribe línea a línea, y en cualquier momento
+   se puede saltar de una forma a otra: lo que se dictó mal se corrige con un
+   menú sin volver a redactar la frase.
+
+   Lo que se dicta nunca se activa solo. Sale primero como reglas legibles —con
+   lo que se entendió y lo que no— y activarla es un gesto aparte, porque una
+   frase ambigua no puede acabar escribiéndole a doscientos contactos.
+   ──────────────────────────────────────────────────────────── */
+
+const ORIGEN = {
+  vibe: { label: "Dictada", color: C.plum, soft: C.plumSoft },
+  visual: { label: "Armada", color: C.blue, soft: C.blueSoft },
+  codigo: { label: "Escrita", color: C.amber, soft: C.amberSoft },
+};
+
+const areaStyle = { ...inputStyle, minHeight: 92, resize: "vertical", lineHeight: 1.55, fontFamily: "var(--ui)" };
+const codigoStyle = { ...inputStyle, minHeight: 190, resize: "vertical", fontFamily: "var(--mono)", fontSize: 12.5, lineHeight: 1.8 };
+
+const Interruptor = ({ on, onClick, titulo }) => (
+  <button className="crm-btn" onClick={onClick} title={titulo} aria-pressed={on}
+    style={{ width: 38, height: 21, borderRadius: 999, border: "none", cursor: "pointer", padding: 2, background: on ? C.jade : "#C8CFC6", display: "flex", justifyContent: on ? "flex-end" : "flex-start", transition: "background .15s" }}>
+    <span style={{ width: 17, height: 17, borderRadius: 999, background: "#fff", display: "block" }} />
+  </button>
+);
+
+const Etiqueta = ({ children }) => (
+  <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, letterSpacing: ".09em", textTransform: "uppercase", marginBottom: 5 }}>{children}</div>
+);
+
+const Renglon = ({ children, onQuitar }) => (
+  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", background: "#F7F9F5", border: `1px solid ${C.line}`, borderRadius: 7, padding: "7px 8px" }}>
+    {children}
+    {onQuitar && <button className="crm-btn" onClick={onQuitar} title="Quitar" style={{ marginLeft: "auto", background: "transparent", border: "none", cursor: "pointer", color: C.faint, padding: 3, borderRadius: 5 }}><X size={14} /></button>}
+  </div>
+);
+
+const sel = { ...inputStyle, width: "auto", padding: "5px 7px", fontSize: 12.5 };
+
+/* La espera se guarda en minutos y se muestra en la unidad más grande que dé
+   redonda: 1440 se lee "1 día" y no "1440 minutos". */
+const UNI = [["m", 1, "minutos"], ["h", 60, "horas"], ["d", 1440, "días"]];
+/* Sin espera no se pinta nada: casi ninguna acción la lleva, y tres renglones
+   diciendo "tras 0 minutos" hacen creer que hay una demora donde no la hay. */
+const EsperaCtl = ({ min, onChange }) => {
+  if (!min) {
+    return (
+      <button className="crm-btn" onClick={() => onChange(10)} title="Esperar antes de hacerlo"
+        style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "transparent", border: "none", cursor: "pointer", color: C.faint, fontFamily: "var(--ui)", fontSize: 11.5, padding: "3px 5px", borderRadius: 5 }}>
+        <Clock size={12} /> al instante
+      </button>
+    );
+  }
+  const u = [...UNI].reverse().find(([, f]) => min % f === 0) || UNI[0];
+  const n = min / u[1];
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+      <Clock size={12} color={C.faint} />
+      <span style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>tras</span>
+      <input className="crm-in" type="number" min="0" value={n} onChange={(e) => onChange(Math.max(0, Number(e.target.value) || 0) * u[1])}
+        style={{ ...sel, width: 58 }} />
+      <select className="crm-in" value={u[0]} onChange={(e) => onChange(n * (UNI.find(([k]) => k === e.target.value) || UNI[0])[1])} style={sel}>
+        {UNI.map(([k, , l]) => <option key={k} value={k}>{l}</option>)}
+      </select>
+    </span>
+  );
+};
+
+/* Un valor de una propiedad de lista se elige; uno libre se escribe. */
+const ValorCtl = ({ db, entidad, campo, value, onChange, ancho = 168 }) => {
+  const f = campoDe(db, entidad, campo);
+  if (f && (f.options || []).length) {
+    return (
+      <select className="crm-in" value={value} onChange={(e) => onChange(e.target.value)} style={{ ...sel, maxWidth: ancho + 40 }}>
+        <option value="">— elige —</option>
+        {f.options.map((o) => <option key={o}>{o}</option>)}
+      </select>
+    );
+  }
+  return <input className="crm-in" value={value} onChange={(e) => onChange(e.target.value)} placeholder="valor" style={{ ...sel, width: ancho }} />;
+};
+
+function AutomationsView({ db, setDb, say, setDetail, onAtender, onCerrar }) {
+  const [tab, setTab] = useState("reglas");
+  const [editando, setEditando] = useState(null);
+  const [prueba, setPrueba] = useState(null);
+
+  const cola = db.autoCola || [];
+  const porAtender = cola.filter((x) => x.estado === "listo");
+  const programados = cola.filter((x) => x.estado === "espera");
+  const cerrados = cola.filter((x) => ["hecho", "fallo", "descartado"].includes(x.estado));
+  const activas = db.automations.filter((a) => a.activa).length;
+
+  const guardar = (a) => {
+    setDb((d) => {
+      const existe = d.automations.some((x) => x.id === a.id);
+      return { ...d, automations: existe ? d.automations.map((x) => (x.id === a.id ? a : x)) : [...d.automations, a] };
+    });
+    setEditando(null);
+    say("Automatización guardada");
+  };
+
+  const cambiar = (id, parche) => setDb((d) => ({ ...d, automations: d.automations.map((a) => (a.id === id ? normalizaAutomatizacion({ ...a, ...parche }) : a)) }));
+  const borrar = (id) => setDb((d) => ({ ...d, automations: d.automations.filter((a) => a.id !== id) }));
+
+  /* Prender una regla rota no falla en silencio: se dice qué le falta y se
+     queda apagada. El día que le toque disparar ya no habrá nadie mirando. */
+  const alternar = (a) => {
+    const faltas = avisosDe(a, db);
+    if (!a.activa && faltas.length) { say(faltas[0]); return; }
+    cambiar(a.id, { activa: !a.activa });
+    say(a.activa ? `«${a.nombre}» pausada` : `«${a.nombre}» activada`);
+  };
+
+  /* Probar no ejecuta nada: cuenta a cuántas fichas de las que ya hay
+     alcanzarían las condiciones. Contesta la pregunta que da miedo antes de
+     encender —"¿a cuántos les va a escribir esto?"— sin escribirle a nadie. */
+  const probar = (a) => {
+    const ent = eventoDe(a.cuando.evento).entidad;
+    const lista = db[coleccionDe(ent)] || [];
+    setPrueba({ auto: a, ent, total: lista.length, pasan: lista.filter((r) => a.si.every((c) => cumple(c, r))) });
+  };
+
+  const TABS = [["reglas", "Reglas", db.automations.length], ["pendientes", "Pendientes", porAtender.length + programados.length], ["historial", "Historial", 0]];
+
+  return (
+    <div>
+      <Header eyebrow={db.automations.length ? `${activas} activa${activas === 1 ? "" : "s"} de ${db.automations.length}` : "Nada corriendo todavía"}
+        title="Automatizaciones"
+        right={<>
+          <Btn variant="outline" Icon={Plus} onClick={() => setEditando({ ...automatizacionVacia(), origen: "visual" })}>En blanco</Btn>
+          <Btn variant="solid" Icon={Sparkles} onClick={() => setEditando({ ...automatizacionVacia(), origen: "vibe", dictar: true })}>Dictar una</Btn>
+        </>} />
+
+      <div style={{ padding: "14px 28px", display: "flex", gap: 7, borderBottom: `1px solid ${C.line}`, flexWrap: "wrap" }}>
+        {TABS.map(([k, l, n]) => (
+          <button key={k} onClick={() => setTab(k)} className="crm-btn"
+            style={{ border: `1px solid ${tab === k ? C.jade : C.line}`, background: tab === k ? C.jade : C.panel, color: tab === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+            {l}{n > 0 && <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, opacity: tab === k ? 0.85 : 0.7 }}>{n}</span>}
+          </button>
+        ))}
+      </div>
+
+      {tab === "reglas" && (
+        <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 12 }}>
+          {db.automations.length === 0 && (
+            <Empty title="Todavía no hay automatizaciones"
+              hint="Dicta lo que quieres que pase —«cuando entre un contacto nuevo de Meta Lead Ads, mándale el WhatsApp de bienvenida»— y el CRM lo convierte en reglas que puedes revisar antes de encender."
+              action={<Btn variant="solid" Icon={Sparkles} onClick={() => setEditando({ ...automatizacionVacia(), origen: "vibe", dictar: true })}>Dictar la primera</Btn>} />
+          )}
+          {db.automations.map((a) => (
+            <TarjetaRegla key={a.id} a={a} db={db}
+              onAlternar={() => alternar(a)}
+              onEditar={() => setEditando(a)}
+              onDuplicar={() => { const c = normalizaAutomatizacion({ ...a, id: undefined, nombre: `${a.nombre} (copia)`, activa: false, corridas: 0, ultimaEn: "" }); guardar(c); }}
+              onBorrar={() => { borrar(a.id); say("Automatización eliminada"); }}
+              onProbar={() => probar(a)} />
+          ))}
+        </div>
+      )}
+
+      {tab === "pendientes" && (
+        <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 18 }}>
+          {porAtender.length === 0 && programados.length === 0 && cerrados.length === 0 && (
+            <Empty title="Nada esperando" hint="Aquí caen los envíos que una automatización preparó y los avisos que dejó, para que los apruebes uno por uno." />
+          )}
+          {porAtender.length > 0 && (
+            <Grupo titulo="Esperan tu visto bueno" n={porAtender.length}>
+              {porAtender.map((p) => <FilaPendiente key={p.id} p={p} db={db} setDetail={setDetail} onAtender={onAtender} onCerrar={onCerrar} say={say} />)}
+            </Grupo>
+          )}
+          {programados.length > 0 && (
+            <Grupo titulo="Programados" n={programados.length}>
+              {programados.map((p) => <FilaPendiente key={p.id} p={p} db={db} setDetail={setDetail} onAtender={onAtender} onCerrar={onCerrar} say={say} />)}
+            </Grupo>
+          )}
+          {cerrados.length > 0 && (
+            <Grupo titulo="Ya atendidos" n={cerrados.length}
+              extra={<Btn size="sm" variant="ghost" Icon={Trash2} onClick={() => { setDb((d) => ({ ...d, autoCola: d.autoCola.filter((x) => !["hecho", "fallo", "descartado"].includes(x.estado)) })); say("Lista limpia"); }}>Limpiar</Btn>}>
+              {cerrados.slice(0, 40).map((p) => <FilaPendiente key={p.id} p={p} db={db} setDetail={setDetail} onAtender={onAtender} onCerrar={onCerrar} say={say} />)}
+            </Grupo>
+          )}
+        </div>
+      )}
+
+      {tab === "historial" && (
+        <div style={{ padding: 28 }}>
+          {(db.autoLog || []).length === 0 && <Empty title="Sin historial" hint="Cada vez que una automatización haga algo, quedará anotado aquí." />}
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            {(db.autoLog || []).map((l) => {
+              const col = l.nivel === "fallo" ? C.clay : l.nivel === "ok" ? C.jade : l.nivel === "espera" ? C.amber : C.faint;
+              return (
+                <div key={l.id} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "8px 0", borderBottom: "1px solid #EEF1EC" }}>
+                  <span style={{ width: 7, height: 7, borderRadius: 99, background: col, flexShrink: 0, transform: "translateY(-1px)" }} />
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.faint, whiteSpace: "nowrap" }}>{fmt(l.at)}</span>
+                  <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, whiteSpace: "nowrap", maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis" }}>{l.auto}</span>
+                  <span style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink }}>{l.texto}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {editando && (
+        <EditorAutomatizacion db={db} inicial={editando} onClose={() => setEditando(null)} onSave={guardar} />
+      )}
+
+      {prueba && (
+        <Modal title="Prueba en seco" subtitle={`«${prueba.auto.nombre || "Sin nombre"}» · no se envió ni se cambió nada`} onClose={() => setPrueba(null)}
+          footer={<Btn variant="outline" onClick={() => setPrueba(null)}>Cerrar</Btn>}>
+          <Prose>
+            De {prueba.total} {prueba.ent === "deal" ? "negocios" : prueba.ent === "company" ? "empresas" : "contactos"} que hay hoy,{" "}
+            <strong style={{ color: C.ink }}>{prueba.pasan.length}</strong> cumplen las condiciones.
+            {prueba.auto.si.length === 0 && " Sin condiciones, la regla alcanza a todos los que disparen el evento."}
+          </Prose>
+          {prueba.pasan.length > 0 && (
+            <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {prueba.pasan.slice(0, 12).map((r) => <Pill key={r.id}>{titleOf(prueba.ent, r)}</Pill>)}
+              {prueba.pasan.length > 12 && <Pill soft="transparent" color={C.faint}>y {prueba.pasan.length - 12} más</Pill>}
+            </div>
+          )}
+          <div style={{ marginTop: 16 }}>
+            <Etiqueta>Lo que haría con cada uno</Etiqueta>
+            <Prose>
+              {prueba.auto.entonces.map((x, i) => <div key={i}>· {textoAccion(x, db, prueba.ent)}</div>)}
+              {prueba.auto.entonces.length === 0 && "Nada: no tiene acciones."}
+            </Prose>
+          </div>
+          <div style={{ marginTop: 14, fontFamily: "var(--ui)", fontSize: 12, color: C.faint, lineHeight: 1.6 }}>
+            Esto sólo mide las condiciones contra lo que ya está guardado. La regla dispara con «{eventoDe(prueba.auto.cuando.evento).label.toLowerCase()}», que es algo que pasa de aquí en adelante: no actúa sobre las fichas viejas.
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+const Grupo = ({ titulo, n, extra, children }) => (
+  <div>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+      <Etiqueta>{titulo}</Etiqueta>
+      <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, marginTop: -5 }}>{n}</span>
+      <span style={{ marginLeft: "auto", marginTop: -5 }}>{extra}</span>
+    </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>{children}</div>
+  </div>
+);
+
+function TarjetaRegla({ a, db, onAlternar, onEditar, onDuplicar, onBorrar, onProbar }) {
+  const r = resumenDe(a, db);
+  const faltas = avisosDe(a, db);
+  const org = ORIGEN[a.origen] || ORIGEN.visual;
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${a.activa ? C.jadeSoft : C.line}`, borderRadius: 9, padding: 16, opacity: a.activa ? 1 : 0.82 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <Interruptor on={a.activa} onClick={onAlternar} titulo={a.activa ? "Pausar" : "Activar"} />
+        <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>{a.nombre || "Sin nombre"}</div>
+        <Pill color={org.color} soft={org.soft}>{org.label}</Pill>
+        {a.modo === "auto" && <Pill color={C.amber} soft={C.amberSoft}>Sin preguntar</Pill>}
+        <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+          <Btn size="sm" variant="ghost" Icon={Gauge} onClick={onProbar}>Probar</Btn>
+          <Btn size="sm" variant="ghost" Icon={Pencil} onClick={onEditar}>Editar</Btn>
+          <Btn size="sm" variant="ghost" Icon={Copy} onClick={onDuplicar} />
+          <Btn size="sm" variant="ghost" Icon={Trash2} onClick={onBorrar} />
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "76px 1fr", gap: "6px 12px", alignItems: "baseline" }}>
+        <Etiqueta>Cuando</Etiqueta>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink }}>{r.cuando}</div>
+        {r.si.length > 0 && <><Etiqueta>Sólo si</Etiqueta>
+          <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink }}>{r.si.join(" · ")}</div></>}
+        <Etiqueta>Entonces</Etiqueta>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, display: "flex", flexDirection: "column", gap: 2 }}>
+          {r.haz.map((h, i) => <div key={i}>{h}</div>)}
+          {r.haz.length === 0 && <span style={{ color: C.faint }}>nada todavía</span>}
+        </div>
+      </div>
+
+      {faltas.length > 0 && (
+        <div style={{ marginTop: 11, background: C.claySoft, border: `1px solid ${C.claySoft}`, borderRadius: 7, padding: "8px 10px", display: "flex", gap: 8 }}>
+          <AlertTriangle size={14} color={C.clay} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.55 }}>
+            {faltas.map((f, i) => <div key={i}>{f}</div>)}
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 11, fontFamily: "var(--mono)", fontSize: 11, color: C.faint }}>
+        {a.corridas > 0 ? `${a.corridas} disparo${a.corridas === 1 ? "" : "s"} · último ${fmt(a.ultimaEn)}` : "Nunca ha disparado"}
+      </div>
+    </div>
+  );
+}
+
+function FilaPendiente({ p, db, setDetail, onAtender, onCerrar, say }) {
+  const ent = p.kind === "company" ? "company" : p.kind === "deal" ? "deal" : "contact";
+  const rec = buscarFicha(db, p.kind, p.recId);
+  const abierto = p.estado === "listo" || p.estado === "espera";
+  const col = p.estado === "fallo" ? C.clay : p.estado === "hecho" ? C.jade : p.estado === "descartado" ? C.faint : p.estado === "espera" ? C.amber : C.blue;
+  const esAviso = p.accion.tipo === "aviso";
+
+  const descartar = () => { onCerrar(p.id, "descartado", "", null); say("Descartado"); };
+  const marcarVisto = () => { onCerrar(p.id, "hecho", "", null); };
+
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${col}`, borderRadius: 7, padding: "10px 12px", display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+      <div style={{ minWidth: 200, flex: "1 1 320px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+          {rec ? (
+            <button onClick={() => setDetail({ kind: ent, id: p.recId })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: 600, color: C.jade }}>{titleOf(ent, rec)}</button>
+          ) : <span style={{ fontFamily: "var(--ui)", fontSize: 13.5, color: C.faint }}>Ficha eliminada</span>}
+          <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>· {p.auto}</span>
+        </div>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginTop: 3 }}>
+          {esAviso ? p.accion.texto : textoAccion(p.accion, db, ent)}
+        </div>
+        {p.estado === "espera" && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.amber, marginTop: 3 }}>Sale {fmt(p.listaEn)}</div>}
+        {p.nota && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 3 }}>{p.nota}</div>}
+      </div>
+      <div style={{ display: "flex", gap: 5, marginLeft: "auto" }}>
+        {abierto && esAviso && <Btn size="sm" variant="outline" Icon={Check} onClick={marcarVisto}>Visto</Btn>}
+        {abierto && !esAviso && p.estado === "listo" && rec && (
+          <Btn size="sm" variant="solid" Icon={Send} onClick={() => onAtender(p)}>
+            {p.accion.tipo === "whatsapp" ? "Abrir WhatsApp" : "Enviar"}
+          </Btn>
+        )}
+        {p.estado === "fallo" && rec && <Btn size="sm" variant="outline" Icon={RefreshCw} onClick={() => onAtender(p)}>Reintentar</Btn>}
+        {p.estado !== "descartado" && p.estado !== "hecho" && <Btn size="sm" variant="ghost" Icon={X} onClick={descartar} />}
+        {(p.estado === "hecho" || p.estado === "descartado") && <Pill color={col} soft="#F1F3EE">{p.estado === "hecho" ? "Hecho" : "Descartado"}</Pill>}
+      </div>
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   El editor: tres pestañas sobre la misma regla
+   ──────────────────────────────────────────────────────────── */
+function EditorAutomatizacion({ db, inicial, onClose, onSave }) {
+  const [draft, setDraft] = useState(() => normalizaAutomatizacion(inicial));
+  const [tab, setTab] = useState(inicial.dictar || inicial.origen === "vibe" ? "dictar" : "reglas");
+  const [dictado, setDictado] = useState(inicial.dictado || "");
+  const [vibe, setVibe] = useState(null);
+
+  const faltas = avisosDe(draft, db);
+  const nuevo = !db.automations.some((a) => a.id === draft.id);
+
+  const interpretar = () => {
+    const r = compilarVibe(dictado, db);
+    setVibe(r);
+    /* Se conserva la identidad y si estaba encendida: volver a dictar es
+       corregir la misma regla, no crear otra que deje huérfano su historial. */
+    setDraft(normalizaAutomatizacion({ ...r.auto, id: draft.id, activa: draft.activa, corridas: draft.corridas, ultimaEn: draft.ultimaEn, creadaEn: draft.creadaEn }));
+  };
+
+  const TABS = [["dictar", "Dictar", Sparkles], ["reglas", "Reglas", ListChecks], ["codigo", "Código", Braces]];
+
+  return (
+    <Modal wide title={nuevo ? "Nueva automatización" : "Automatización"}
+      subtitle="Dícta­la, ármala con menús o escríbela. Son la misma regla vista de tres maneras."
+      onClose={onClose}
+      footer={<>
+        <div style={{ marginRight: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <Interruptor on={draft.activa} onClick={() => {
+            if (!draft.activa && faltas.length) return;
+            setDraft({ ...draft, activa: !draft.activa });
+          }} titulo="Activa" />
+          <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: faltas.length && !draft.activa ? C.faint : C.mute }}>
+            {draft.activa ? "Activa al guardar" : faltas.length ? "No se puede activar todavía" : "Guardar pausada"}
+          </span>
+        </div>
+        <Btn variant="outline" onClick={onClose}>Cancelar</Btn>
+        <Btn variant="solid" Icon={Check} onClick={() => onSave(normalizaAutomatizacion(draft))}>Guardar</Btn>
+      </>}>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+        {TABS.map(([k, l, Icon]) => (
+          <button key={k} onClick={() => setTab(k)} className="crm-btn"
+            style={{ display: "flex", alignItems: "center", gap: 6, border: `1px solid ${tab === k ? C.jade : C.line}`, background: tab === k ? C.jadeSoft : C.panel, color: tab === k ? C.jade : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: tab === k ? 600 : 400, cursor: "pointer" }}>
+            <Icon size={13} /> {l}
+          </button>
+        ))}
+      </div>
+
+      {tab === "dictar" && (
+        <PanelDictado db={db} dictado={dictado} setDictado={setDictado} vibe={vibe} interpretar={interpretar} draft={draft} irAReglas={() => setTab("reglas")} />
+      )}
+      {tab === "reglas" && <PanelReglas db={db} draft={draft} setDraft={setDraft} />}
+      {tab === "codigo" && <PanelCodigo db={db} draft={draft} setDraft={setDraft} />}
+
+      {faltas.length > 0 && (
+        <div style={{ marginTop: 16, background: C.claySoft, borderRadius: 7, padding: "9px 11px", display: "flex", gap: 8 }}>
+          <AlertTriangle size={14} color={C.clay} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.55 }}>
+            {faltas.map((f, i) => <div key={i}>{f}</div>)}
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function PanelDictado({ db, dictado, setDictado, vibe, interpretar, draft, irAReglas }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div>
+        <Etiqueta>Dilo como se lo dirías a alguien</Etiqueta>
+        <textarea className="crm-in" value={dictado} onChange={(e) => setDictado(e.target.value)} style={areaStyle}
+          placeholder="Cuando entre un contacto nuevo de Meta Lead Ads, mándale el WhatsApp de bienvenida a los 10 minutos y márcalo como Abierto." />
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {EJEMPLOS.slice(0, 4).map((e) => (
+          <button key={e} className="crm-btn" onClick={() => setDictado(e)}
+            style={{ border: `1px dashed ${C.line}`, background: "transparent", color: C.mute, borderRadius: 999, padding: "4px 10px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer", textAlign: "left" }}>
+            {e.length > 62 ? `${e.slice(0, 62)}…` : e}
+          </button>
+        ))}
+      </div>
+
+      <div><Btn variant="solid" Icon={Sparkles} onClick={interpretar} disabled={!dictado.trim()}>Convertir en reglas</Btn></div>
+
+      {vibe && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+          {vibe.entendido.length > 0 && (
+            <div>
+              <Etiqueta>Lo que entendí</Etiqueta>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {vibe.entendido.map((e, i) => (
+                  <div key={i} style={{ display: "flex", gap: 7, fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.5 }}>
+                    <Check size={14} color={C.jade} style={{ flexShrink: 0, marginTop: 3 }} />{e}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {vibe.dudas.length > 0 && (
+            <div>
+              <Etiqueta>Lo que no pude resolver</Etiqueta>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {vibe.dudas.map((e, i) => (
+                  <div key={i} style={{ display: "flex", gap: 7, fontFamily: "var(--ui)", fontSize: 13, color: C.clay, lineHeight: 1.5 }}>
+                    <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 3 }} />{e}
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 7 }}><Btn size="sm" variant="outline" Icon={ListChecks} onClick={irAReglas}>Terminarla en Reglas</Btn></div>
+            </div>
+          )}
+
+          <div>
+            <Etiqueta>La regla, escrita</Etiqueta>
+            <pre style={{ margin: 0, background: "#F4F6F1", border: `1px solid ${C.line}`, borderRadius: 7, padding: "10px 12px", fontFamily: "var(--mono)", fontSize: 12, lineHeight: 1.75, color: C.ink, overflowX: "auto" }}>{aDsl(draft)}</pre>
+          </div>
+        </div>
+      )}
+
+      {!vibe && (
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, lineHeight: 1.6, borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+          Nada se activa por dictarlo. Al convertir verás la regla en limpio, con lo que entendí y lo que no; encenderla es un paso aparte.
+          Conoce tus plantillas, tus etapas y las propiedades que hayas creado, así que puedes nombrarlas tal cual.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PanelReglas({ db, draft, setDraft }) {
+  const ev = eventoDe(draft.cuando.evento);
+  const ent = ev.entidad;
+  const campos = camposDe(db, ent);
+  const etapas = etapasDe(db);
+  const set = (parche) => setDraft(normalizaAutomatizacion({ ...draft, ...parche }));
+  const setAccion = (i, parche) => set({ entonces: draft.entonces.map((x, j) => (j === i ? { ...x, ...parche } : x)) });
+  const grupos = [...new Set(EVENTOS.map((e) => e.grupo))];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <Etiqueta>Nombre</Etiqueta>
+        <input className="crm-in" value={draft.nombre} onChange={(e) => set({ nombre: e.target.value })} placeholder="Bienvenida a los leads de Meta" style={inputStyle} />
+      </div>
+
+      <div>
+        <Etiqueta>Cuando</Etiqueta>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <select className="crm-in" value={draft.cuando.evento} onChange={(e) => set({ cuando: { evento: e.target.value, arg: "" } })} style={{ ...sel, minWidth: 260 }}>
+            {grupos.map((g) => (
+              <optgroup key={g} label={g}>
+                {EVENTOS.filter((e) => e.grupo === g).map((e) => <option key={e.key} value={e.key}>{e.label}</option>)}
+              </optgroup>
+            ))}
+          </select>
+          {ev.arg && (
+            <>
+              <span style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>{ev.arg.label}</span>
+              {ev.arg.tipo === "etapa" && (
+                <select className="crm-in" value={draft.cuando.arg} onChange={(e) => set({ cuando: { ...draft.cuando, arg: e.target.value } })} style={sel}>
+                  <option value="">{ev.arg.vacio}</option>
+                  {etapas.map((x) => <option key={x}>{x}</option>)}
+                </select>
+              )}
+              {ev.arg.tipo === "campo" && (
+                <select className="crm-in" value={draft.cuando.arg} onChange={(e) => set({ cuando: { ...draft.cuando, arg: e.target.value } })} style={sel}>
+                  <option value="">{ev.arg.vacio}</option>
+                  {campos.map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}
+                </select>
+              )}
+              {ev.arg.tipo === "canal" && (
+                <select className="crm-in" value={draft.cuando.arg} onChange={(e) => set({ cuando: { ...draft.cuando, arg: e.target.value } })} style={sel}>
+                  <option value="">{ev.arg.vacio}</option>
+                  <option value="whatsapp">WhatsApp</option>
+                  <option value="email">Correo</option>
+                </select>
+              )}
+              {ev.arg.tipo === "dias" && (
+                <input className="crm-in" type="number" min="1" value={draft.cuando.arg || ev.arg.vacio}
+                  onChange={(e) => set({ cuando: { ...draft.cuando, arg: String(Math.max(1, Number(e.target.value) || 1)) } })} style={{ ...sel, width: 70 }} />
+              )}
+            </>
+          )}
+        </div>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 5 }}>
+          Actúa sobre {ent === "deal" ? "el negocio" : ent === "company" ? "la empresa" : "el contacto"} que provocó el evento.
+        </div>
+      </div>
+
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Etiqueta>Sólo si</Etiqueta>
+          <Btn size="sm" variant="ghost" Icon={Plus} style={{ marginTop: -5 }}
+            onClick={() => set({ si: [...draft.si, { campo: (campos[0] || {}).key || "", op: "es", valor: "" }] })}>Condición</Btn>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {draft.si.length === 0 && <Prose>Sin condiciones: dispara siempre que ocurra el evento.</Prose>}
+          {draft.si.map((c, i) => {
+            const op = OPERADORES.find((o) => o.key === c.op) || OPERADORES[0];
+            return (
+              <Renglon key={i} onQuitar={() => set({ si: draft.si.filter((_, j) => j !== i) })}>
+                <select className="crm-in" value={c.campo} onChange={(e) => set({ si: draft.si.map((x, j) => (j === i ? { ...x, campo: e.target.value, valor: "" } : x)) })} style={sel}>
+                  {!campos.some((f) => f.key === c.campo) && <option value={c.campo}>{c.campo || "—"}</option>}
+                  {campos.map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}
+                </select>
+                <select className="crm-in" value={c.op} onChange={(e) => set({ si: draft.si.map((x, j) => (j === i ? { ...x, op: e.target.value } : x)) })} style={sel}>
+                  {OPERADORES.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                </select>
+                {op.valor && <ValorCtl db={db} entidad={ent} campo={c.campo} value={c.valor} onChange={(v) => set({ si: draft.si.map((x, j) => (j === i ? { ...x, valor: v } : x)) })} />}
+              </Renglon>
+            );
+          })}
+        </div>
+      </div>
+
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Etiqueta>Entonces</Etiqueta>
+          <Btn size="sm" variant="ghost" Icon={Plus} style={{ marginTop: -5 }}
+            onClick={() => set({ entonces: [...draft.entonces, { tipo: "aviso", texto: "", tras: 0 }] })}>Acción</Btn>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {draft.entonces.length === 0 && <Prose>Todavía no hace nada.</Prose>}
+          {draft.entonces.map((x, i) => (
+            <Renglon key={i} onQuitar={() => set({ entonces: draft.entonces.filter((_, j) => j !== i) })}>
+              <select className="crm-in" value={x.tipo} onChange={(e) => set({ entonces: draft.entonces.map((y, j) => (j === i ? { tipo: e.target.value, tras: y.tras } : y)) })} style={sel}>
+                {ACCIONES.map((a) => <option key={a.key} value={a.key}>{a.label}</option>)}
+              </select>
+
+              {(x.tipo === "whatsapp" || x.tipo === "correo") && (() => {
+                const lista = (db.templates[x.tipo === "correo" ? "email" : "whatsapp"]) || [];
+                return (
+                  <select className="crm-in" value={x.plantilla} onChange={(e) => setAccion(i, { plantilla: e.target.value })} style={{ ...sel, maxWidth: 230 }}>
+                    <option value="">— elige plantilla —</option>
+                    {!lista.some((t) => t.name === x.plantilla) && x.plantilla && <option value={x.plantilla}>{x.plantilla} (no existe)</option>}
+                    {lista.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}
+                  </select>
+                );
+              })()}
+
+              {x.tipo === "propiedad" && (<>
+                <select className="crm-in" value={x.campo} onChange={(e) => setAccion(i, { campo: e.target.value, valor: "" })} style={sel}>
+                  <option value="">— propiedad —</option>
+                  {campos.filter((f) => !f.readOnly).map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}
+                </select>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: C.faint }}>=</span>
+                <ValorCtl db={db} entidad={ent} campo={x.campo} value={x.valor} onChange={(v) => setAccion(i, { valor: v })} />
+              </>)}
+
+              {x.tipo === "etapa" && (
+                <select className="crm-in" value={x.etapa} onChange={(e) => setAccion(i, { etapa: e.target.value })} style={sel}>
+                  <option value="">— etapa —</option>
+                  {etapas.map((e2) => <option key={e2}>{e2}</option>)}
+                </select>
+              )}
+
+              {x.tipo === "negocio" && (<>
+                <input className="crm-in" value={x.nombre} onChange={(e) => setAccion(i, { nombre: e.target.value })} placeholder="nombre (vacío = el de la ficha)" style={{ ...sel, width: 200 }} />
+                <select className="crm-in" value={x.etapa} onChange={(e) => setAccion(i, { etapa: e.target.value })} style={sel}>
+                  {etapas.map((e2) => <option key={e2}>{e2}</option>)}
+                </select>
+                <input className="crm-in" type="number" value={x.valor} onChange={(e) => setAccion(i, { valor: e.target.value })} placeholder="valor" style={{ ...sel, width: 96 }} />
+              </>)}
+
+              {(x.tipo === "nota" || x.tipo === "aviso") && (
+                <input className="crm-in" value={x.texto} onChange={(e) => setAccion(i, { texto: e.target.value })}
+                  placeholder={x.tipo === "nota" ? "qué anotar en la ficha" : "qué avisarte"} style={{ ...sel, flex: "1 1 220px", minWidth: 160 }} />
+              )}
+
+              <EsperaCtl min={x.tras} onChange={(v) => setAccion(i, { tras: v })} />
+            </Renglon>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <Etiqueta>Con los envíos y los avisos</Etiqueta>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {[["sugerir", "Déjalos en Pendientes y los apruebo yo", "Lo más seguro: nada sale sin que alguien lo lea."],
+            ["auto", "Que salgan solos", "Los correos salen sin preguntar si Gmail está conectado. Un WhatsApp siempre pide un clic, porque lo abre el navegador."]].map(([k, l, sub]) => (
+            <label key={k} style={{ display: "flex", gap: 9, alignItems: "flex-start", cursor: "pointer", background: draft.modo === k ? "#F4F6F1" : "transparent", border: `1px solid ${draft.modo === k ? C.line : "transparent"}`, borderRadius: 7, padding: "8px 10px" }}>
+              <input type="radio" name={`modo-${draft.id}`} checked={draft.modo === k} onChange={() => set({ modo: k })} style={{ marginTop: 3 }} />
+              <span>
+                <span style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, display: "block" }}>{l}</span>
+                <span style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.faint, lineHeight: 1.5 }}>{sub}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PanelCodigo({ db, draft, setDraft }) {
+  const [texto, setTexto] = useState(() => aDsl(draft));
+  const [errores, setErrores] = useState([]);
+
+  /* Se escribe libre y sólo se adopta lo que compila: mientras haya una línea a
+     medio escribir, la regla de al lado sigue siendo la última buena. */
+  const cambiar = (v) => {
+    setTexto(v);
+    const { auto, errores: errs } = deDsl(v, draft);
+    setErrores(errs);
+    if (!errs.length) setDraft(auto);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div>
+        <Etiqueta>La regla, línea a línea</Etiqueta>
+        <textarea className="crm-in" value={texto} onChange={(e) => cambiar(e.target.value)} spellCheck={false} style={codigoStyle} />
+      </div>
+      {errores.length > 0 ? (
+        <div style={{ background: C.claySoft, borderRadius: 7, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.6 }}>
+          {errores.map((e, i) => <div key={i}>{e}</div>)}
+        </div>
+      ) : (
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.jade }}>Compila. Los cambios ya están en las otras dos pestañas.</div>
+      )}
+      <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+        <Etiqueta>La gramática entera</Etiqueta>
+        <pre style={{ margin: 0, fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.8, color: C.mute, overflowX: "auto" }}>{`nombre  "Bienvenida a los leads de Meta"
+cuando  ${EVENTOS.map((e) => e.key).join(" | ")}
+si      <propiedad> ${OPERADORES.map((o) => (o.key === "noEs" ? "no-es" : o.key)).join(" | ")} "valor"
+haz     whatsapp "Plantilla"        tras 10 minutos
+haz     correo "Plantilla"          tras 2 horas
+haz     propiedad leadStatus = "Abierto"
+haz     etapa "Ganado"
+haz     negocio "Nombre" etapa "Nuevo" valor 1200000
+haz     nota "texto"   ·   haz aviso "texto"
+modo    sugerir | auto`}</pre>
+      </div>
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
    Configuración
    ──────────────────────────────────────────────────────────── */
 /* ────────────────────────────────────────────────────────────
@@ -2942,11 +3855,20 @@ const Prose = ({ children }) => (
   <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.65 }}>{children}</div>
 );
 
+/* Una línea de "esto sí, esto todavía no". El punto de color hace el trabajo
+   de un párrafo: se ve de un vistazo qué falta y no hay que leer nada. */
+const Estado = ({ ok, children, falta }) => (
+  <div style={{ display: "flex", gap: 8, alignItems: "baseline", fontFamily: "var(--ui)", fontSize: 12.5, color: ok ? C.ink : C.mute, lineHeight: 1.6 }}>
+    <span style={{ width: 7, height: 7, borderRadius: 99, flexShrink: 0, background: ok ? C.jade : C.faint, transform: "translateY(-1px)" }} />
+    <span>{children}{!ok && falta ? <span style={{ color: C.faint }}> — falta {falta}</span> : null}</span>
+  </div>
+);
+
 const Mono = ({ children }) => (
   <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, background: "#F1F3EE", padding: "1px 5px", borderRadius: 4, color: C.ink, overflowWrap: "anywhere" }}>{children}</span>
 );
 
-function ConnectionsView({ db, setDb, say }) {
+function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
   const integ = db.integrations;
   const gmail = useGmail();
   const [busy, setBusy] = useState(false);
@@ -2955,6 +3877,16 @@ function ConnectionsView({ db, setDb, say }) {
   const [guide, setGuide] = useState(false);
   const [guiaMed, setGuiaMed] = useState(false);
   const [medProbe, setMedProbe] = useState({ tipo: "", texto: "" });
+  /* Lo que contestó el puente cuando se le preguntó qué tiene enchufado. Nulo
+     mientras no se le haya preguntado: la pantalla no supone nada del otro
+     lado, porque la mitad de los problemas de esto son un secreto sin poner y
+     adivinarlo desde aquí sería inventar. */
+  const [salud, setSalud] = useState(null);
+  const [guiaMeta, setGuiaMeta] = useState(false);
+  const [guiaGads, setGuiaGads] = useState(false);
+  const [leadProbe, setLeadProbe] = useState({ tipo: "", texto: "" });
+  const [campanas, setCampanas] = useState(null);
+  const [campProbe, setCampProbe] = useState({ tipo: "", texto: "" });
 
   const patch = (canal, p) => setDb((d) => ({
     ...d,
@@ -2966,11 +3898,15 @@ function ConnectionsView({ db, setDb, say }) {
   const conMail = gente.filter((r) => r.props.email).length;
 
   const cc = integ.whatsapp.countryCode;
+  const waModo = integ.whatsapp.modo;
   const ejemplo = probe || (gente.find((r) => r.props.phone) || {}).props?.phone || "";
   const resuelto = toE164(ejemplo, cc);
 
   const modo = integ.email.mode;
   const med = integ.medicion;
+  const pu = integ.puente;
+  const anun = integ.anuncios;
+  const hayPuente = Boolean(pu.base && pu.clave);
   const origen = window.location.origin;
   const [copiado, setCopiado] = useState(false);
   const copiarOrigen = async () => {
@@ -2993,23 +3929,120 @@ function ConnectionsView({ db, setDb, say }) {
     setBusy(false);
   };
 
+  /* Preguntarle al puente qué tiene puesto. Es lo primero que hay que hacer
+     cuando algo no funciona, y por eso su resultado se guarda y se enseña
+     debajo de cada conexión: dice cuál secreto falta, con su nombre. */
+  const revisarPuente = async () => {
+    setBusy(true); setMedProbe({ tipo: "", texto: "" });
+    try {
+      const st = await probarPuente({ base: pu.base, clave: pu.clave });
+      setSalud(st);
+      setMedProbe({ tipo: "ok", texto: "El puente responde y la clave es la correcta." });
+    } catch (e) {
+      setSalud(null);
+      setMedProbe({ tipo: "err", texto: (e && e.message) || String(e) });
+    }
+    setBusy(false);
+  };
+
+  const verCampanas = async () => {
+    setBusy(true); setCampProbe({ tipo: "", texto: "" });
+    try {
+      const r = await traerCampanas({ base: pu.base, clave: pu.clave, meta: anun.meta, google: anun.google, dias: anun.dias });
+      setCampanas(r.campanas);
+      if (r.notas.length) setCampProbe({ tipo: "aviso", texto: r.notas.join(" · ") });
+      else if (!r.campanas.length) setCampProbe({ tipo: "aviso", texto: "Ninguna campaña tuvo actividad en este periodo." });
+    } catch (e) {
+      setCampanas(null);
+      setCampProbe({ tipo: "err", texto: (e && e.message) || String(e) });
+    }
+    setBusy(false);
+  };
+
+  /* Traer los leads desde aquí, sin esperar al barrido de Actividades. Sirve
+     para lo de siempre: acabas de configurarlo y quieres ver si funciona. */
+  const traerAhora = async () => {
+    setBusy(true); setLeadProbe({ tipo: "", texto: "" });
+    try {
+      const r = await traerLeads({
+        base: pu.base, clave: pu.clave,
+        meta: anun.meta, google: anun.google,
+        desde: db.buzon.leadsAl, dias: anun.dias,
+      });
+      const hecho = onLeads(r.leads, anun.destino);
+      onBuzon({ leadsAl: nowISO() });
+      const cuenta = hecho.leads
+        ? `Entraron ${hecho.leads} lead(s)` + (hecho.fichas ? ` y ${hecho.fichas} ficha(s) nueva(s).` : ", todos de gente que ya estaba.")
+        : r.leads.length
+          ? "No entró ninguno: todos estaban ya traídos."
+          : "Las plataformas no tienen leads nuevos.";
+      /* Las notas son los fallos de una plataforma cuando la otra sí respondió.
+         Van pegadas al resultado y no en lugar de él: callarlas convertiría un
+         "Google está caído" en un "no llegó nadie". */
+      setLeadProbe({ tipo: r.notas.length ? "aviso" : "ok", texto: [cuenta, ...r.notas].join(" · ") });
+      if (hecho.leads) say(`${hecho.leads} lead(s) traídos`);
+    } catch (e) {
+      setLeadProbe({ tipo: "err", texto: (e && e.message) || String(e) });
+    }
+    setBusy(false);
+  };
+
   return (
     <div>
       <Header eyebrow="Ajustes" title="Conexiones" />
       <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 20, maxWidth: 880 }}>
 
         {/* ── WhatsApp ── */}
-        <Card title="WhatsApp" badge={<Pill color={C.jade} soft={C.jadeSoft}>Listo para usar</Pill>}>
-          <Prose>
-            El CRM personaliza el mensaje con los datos de cada registro y abre WhatsApp con el texto
-            ya escrito en el chat correcto: tú das el último clic para enviar. Funciona con tu WhatsApp
-            de siempre —el del celular o WhatsApp Web—, sin cuenta de empresa ni permisos de Meta.
-            <br /><br />
-            El envío automático existe (WhatsApp Cloud API), pero pide un token permanente de Meta.
-            Guardarlo aquí lo dejaría legible para cualquiera que abra este navegador, y además Meta
-            sólo deja iniciar conversaciones con plantillas que ellos aprueban antes. Por eso el CRM
-            no lo ofrece: haría falta un servidor propio donde el token esté a resguardo.
-          </Prose>
+        <Card title="WhatsApp"
+          badge={waModo === "api"
+            ? (salud
+                ? (salud.whatsapp?.enviar
+                    ? <Pill color={C.jade} soft={C.jadeSoft}>Conectado</Pill>
+                    : <Pill color={C.clay} soft={C.claySoft}>Falta el token</Pill>)
+                : <Pill color={C.amber} soft={C.amberSoft}>Sin probar</Pill>)
+            : <Pill color={C.jade} soft={C.jadeSoft}>Listo para usar</Pill>}>
+          <Prose>El CRM personaliza el mensaje con los datos de cada registro. Lo que cambia es quién lo manda.</Prose>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "14px 0" }}>
+            {Object.entries(WHATSAPP_MODES).map(([key, label]) => (
+              <label key={key} style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid " + (waModo === key ? C.jade : C.line), background: waModo === key ? "#F7FAF8" : C.panel, borderRadius: 7, padding: "10px 12px", cursor: "pointer" }}>
+                <input type="radio" name="modo-whatsapp" checked={waModo === key} onChange={() => patch("whatsapp", { modo: key })} style={{ marginTop: 2, accentColor: C.jade }} />
+                <div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>{label}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>
+                    {key === "enlace" && "Se abre WhatsApp con el texto ya escrito en el chat correcto y tú das el último clic. Tu WhatsApp de siempre —el del celular o WhatsApp Web—, sin cuenta de empresa ni permisos de Meta. Funciona hoy, sin configurar nada."}
+                    {key === "api" && "El CRM lo manda por la WhatsApp Cloud API y no se abre ninguna ventana. Necesita el puente publicado y una cuenta de empresa en Meta."}
+                  </div>
+                </div>
+              </label>
+            ))}
+          </div>
+
+          {waModo === "api" && (
+            <div style={{ background: C.amberSoft, color: C.amber, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6, marginBottom: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Dos reglas de Meta que conviene saber antes</div>
+              <div style={{ color: C.ink }}>
+                <b>La ventana de 24 horas.</b> Escribir texto libre sólo se puede si esa persona te escribió
+                a ti en las últimas 24 horas. Fuera de esa ventana Meta rechaza el mensaje, y el CRM te lo
+                dirá con esas palabras en vez de con un número de error.
+                <br /><br />
+                <b>Las plantillas.</b> Para <i>iniciar</i> una conversación hay que usar una plantilla que Meta
+                aprobó antes, una por una, con un par de días de revisión. Es lo que impide que esto se use
+                para escribirle en frío a una lista comprada.
+                <br /><br />
+                Por eso el modo de enlace no es el hermano pobre: para el primer mensaje a alguien que acaba
+                de llegar por un anuncio, muchas veces es el único que funciona hoy.
+              </div>
+            </div>
+          )}
+
+          {waModo === "api" && salud && !salud.whatsapp?.enviar && (
+            <div style={{ background: C.claySoft, color: C.clay, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6 }}>
+              El puente no puede mandar nada todavía. Falta <Mono>WA_TOKEN</Mono> como secreto,
+              o <Mono>WA_PHONE_ID</Mono> en <Mono>tracker/wrangler.toml</Mono> —que es el identificador del
+              número remitente, no el número—. Cómo sacarlos está en la guía de la tarjeta de Meta.
+            </div>
+          )}
 
           <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 14, marginTop: 16, alignItems: "start" }}>
             <Field def={{ label: "Indicativo del país" }} value={cc} onChange={(v) => patch("whatsapp", { countryCode: v.replace(/\D/g, "").slice(0, 4) })} />
@@ -3184,6 +4217,89 @@ function ConnectionsView({ db, setDb, say }) {
           </div>
         </Card>
 
+        {/* ── El puente ── */}
+        <Card title="El puente"
+          badge={!hayPuente
+            ? <Pill color={C.mute} soft="#E6E9E3">Sin publicar</Pill>
+            : salud
+              ? <Pill color={C.jade} soft={C.jadeSoft}>Responde</Pill>
+              : <Pill color={C.amber} soft={C.amberSoft}>Sin probar</Pill>}>
+          <Prose>
+            Casi todo el CRM vive en este navegador y con eso basta. Tres cosas no caben aquí, y las
+            tres por el mismo motivo:
+            <ul style={{ margin: "8px 0 0", paddingLeft: 17 }}>
+              <li><b>Saber si abrieron un correo.</b> Eso pasa en la máquina de otra persona, horas
+                después, con esta pestaña cerrada. Alguien tiene que estar despierto para recibir el aviso.</li>
+              <li><b>Traer los leads de Meta y de Google.</b> Hablar con ellas exige un token que vale por
+                tu cuenta entera —leer tus leads, gastar tu presupuesto—, y guardarlo aquí lo dejaría
+                legible para cualquiera que abra este navegador. Google además ni lo permite: su API no
+                acepta llamadas desde una página web.</li>
+              <li><b>Mandar un WhatsApp de verdad.</b> Mismo token, mismo problema.</li>
+            </ul>
+            <br />
+            Por eso hay un servicio diminuto que hay que publicar una vez. Está en la carpeta
+            <Mono>tracker/</Mono> y corre gratis en Cloudflare. Los tokens viven allá, cifrados, y nunca
+            bajan a este navegador: el CRM le pide las cosas y él es el único que habla con Meta y Google.
+          </Prose>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 14 }}>
+            <Field def={{ label: "Dirección del puente" }} value={pu.base}
+              onChange={(v) => { setMedProbe({ tipo: "", texto: "" }); setSalud(null); patch("puente", { base: v }); }} />
+            <Field def={{ label: "Clave" }} value={pu.clave}
+              onChange={(v) => { setMedProbe({ tipo: "", texto: "" }); setSalud(null); patch("puente", { clave: v }); }} />
+          </div>
+          <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>
+            La dirección es la que imprime <Mono>wrangler deploy</Mono>, algo como
+            <Mono>https://crm-medidor.tu-cuenta.workers.dev</Mono>. La clave es la misma que guardaste
+            con <Mono>wrangler secret put CLAVE</Mono>.
+          </div></Prose>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+            <Btn variant="outline" Icon={Gauge} disabled={busy || !hayPuente} onClick={revisarPuente}>
+              {busy ? "Preguntando…" : "Probar el puente"}
+            </Btn>
+            {medProbe.texto && (
+              <Prose><span style={{ fontSize: 12, color: medProbe.tipo === "ok" ? C.jade : C.clay, fontWeight: 500 }}>{medProbe.texto}</span></Prose>
+            )}
+          </div>
+
+          {salud && (
+            <div style={{ marginTop: 14, background: "#F6F8F4", border: "1px solid " + C.line, borderRadius: 7, padding: "11px 13px", display: "flex", flexDirection: "column", gap: 5 }}>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, marginBottom: 3 }}>Qué tiene enchufado</div>
+              <Estado ok>Medición de correos</Estado>
+              <Estado ok={salud.meta?.leads} falta={<Mono>META_TOKEN</Mono>}>Leads de Meta</Estado>
+              <Estado ok={salud.meta?.metricas} falta={<Mono>META_AD_ACCOUNT</Mono>}>Métricas de campaña de Meta</Estado>
+              <Estado ok={salud.whatsapp?.enviar} falta={<Mono>WA_TOKEN</Mono>}>Envío por WhatsApp Cloud API</Estado>
+              <Estado ok={salud.google?.credenciales} falta={<Mono>GADS_CLIENT_SECRET</Mono>}>Credenciales de Google Ads</Estado>
+              <Estado ok={salud.google?.developerToken} falta={<Mono>GADS_DEV_TOKEN</Mono>}>Developer token de Google Ads</Estado>
+              <Estado ok={salud.google?.autorizado} falta="dar el permiso una vez">Permiso de Google Ads</Estado>
+              <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>
+                El puente contesta con síes y noes, nunca con el valor: un token no sale de allá ni
+                recortado. Lo que falte se pone con <Mono>npx wrangler secret put NOMBRE</Mono>, dentro
+                de la carpeta <Mono>tracker/</Mono>, y se vuelve a publicar.
+              </div></Prose>
+            </div>
+          )}
+
+          <button onClick={() => setGuiaMed(!guiaMed)} className="crm-btn"
+            style={{ marginTop: 12, background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}>
+            <ChevronDown size={14} style={{ transform: guiaMed ? "rotate(180deg)" : "none", transition: "transform .15s" }} />
+            Cómo publicar el puente
+          </button>
+          {guiaMed && (
+            <ol style={{ margin: "10px 0 0", paddingLeft: 20, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.85 }}>
+              <li>Crea una cuenta gratuita en <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noreferrer" style={{ color: C.jade }}>Cloudflare</a>.</li>
+              <li>En una terminal, dentro de la carpeta del proyecto: <Mono>cd tracker</Mono> y luego <Mono>npx wrangler login</Mono>.</li>
+              <li><Mono>npx wrangler kv namespace create EVENTOS</Mono> — imprime un id; pégalo en <Mono>tracker/wrangler.toml</Mono>, donde dice <Mono>PEGA_AQUI_EL_ID</Mono>.</li>
+              <li><Mono>npx wrangler secret put CLAVE</Mono> — inventa una clave larga y apúntala: es la misma que va aquí arriba.</li>
+              <li>Si vas a usar Meta o Google Ads, pon también sus secretos ahora. Cuáles y de dónde se
+                sacan está en <Mono>tracker/.dev.vars.ejemplo</Mono> y en las dos tarjetas de abajo.</li>
+              <li><Mono>npx wrangler deploy</Mono>. Copia la dirección que imprime y pégala aquí arriba.</li>
+              <li>Pulsa <b>Probar el puente</b>: dirá exactamente qué quedó enchufado y qué falta.</li>
+            </ol>
+          )}
+        </Card>
+
         {/* ── Medición ── */}
         <Card title="Medición de correos"
           badge={midiendo(med)
@@ -3196,11 +4312,9 @@ function ConnectionsView({ db, setDb, say }) {
             invisibles a cada envío —una imagen de un píxel al final, y los enlaces pasando por un
             redirector— y con eso el CRM puede decir <b>quién abrió</b> y <b>quién pinchó</b>.
             <br /><br />
-            Hace falta publicar un servicio diminuto, una vez: la apertura ocurre en la máquina de otra
-            persona, horas después, con esta pestaña cerrada, y alguien tiene que estar despierto para
-            recibir el aviso. Está en la carpeta <Mono>tracker/</Mono> del proyecto y corre gratis en
-            Cloudflare. No guarda ni el correo ni el nombre de nadie: sólo el identificador aleatorio del
-            envío, que únicamente significa algo dentro de este CRM.
+            Lo recibe el puente de arriba, así que hace falta tenerlo publicado. No guarda ni el correo
+            ni el nombre de nadie: sólo el identificador aleatorio del envío, que únicamente significa
+            algo dentro de este CRM.
           </Prose>
 
           <div style={{ marginTop: 14, background: "#F6F8F4", border: "1px solid " + C.line, borderRadius: 7, padding: "11px 13px" }}>
@@ -3223,17 +4337,11 @@ function ConnectionsView({ db, setDb, say }) {
             </div>
           )}
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 14 }}>
-            <Field def={{ label: "Dirección del medidor" }} value={med.base}
-              onChange={(v) => { setMedProbe({ tipo: "", texto: "" }); patch("medicion", { base: v }); }} />
-            <Field def={{ label: "Clave" }} value={med.clave}
-              onChange={(v) => { setMedProbe({ tipo: "", texto: "" }); patch("medicion", { clave: v }); }} />
-          </div>
-          <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>
-            La dirección es la que imprime <Mono>wrangler deploy</Mono>, algo como
-            <Mono>https://crm-medidor.tu-cuenta.workers.dev</Mono>. La clave es la misma que guardaste
-            con <Mono>wrangler secret put CLAVE</Mono>.
-          </div></Prose>
+          {!hayPuente && (
+            <div style={{ marginTop: 12, background: C.amberSoft, color: C.amber, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6 }}>
+              Falta publicar el puente, arriba. Sin él las casillas se pueden marcar pero no miden nada.
+            </div>
+          )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
             {[
@@ -3251,43 +4359,244 @@ function ConnectionsView({ db, setDb, say }) {
             ))}
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
-            <Btn variant="outline" Icon={Gauge} disabled={busy || !med.base || !med.clave}
-              onClick={async () => {
-                setBusy(true); setMedProbe({ tipo: "", texto: "" });
-                try {
-                  await probarMedidor({ base: med.base, clave: med.clave });
-                  setMedProbe({ tipo: "ok", texto: "El medidor responde y la clave es la correcta." });
-                } catch (e) {
-                  setMedProbe({ tipo: "err", texto: (e && e.message) || String(e) });
-                }
-                setBusy(false);
-              }}>Probar el medidor</Btn>
-            {medProbe.texto && (
-              <Prose><span style={{ fontSize: 12, color: medProbe.tipo === "ok" ? C.jade : C.clay, fontWeight: 500 }}>{medProbe.texto}</span></Prose>
-            )}
-          </div>
-          <Prose><div style={{ marginTop: 8, fontSize: 11.5, color: C.faint }}>
+          <Prose><div style={{ marginTop: 12, fontSize: 11.5, color: C.faint }}>
             {db.buzon.eventosAl
               ? <>Lo anotado se recoge con <b>Actualizar estados</b>, en Actividades. Última vez: {fmt(db.buzon.eventosAl)}.</>
               : <>Lo anotado se recoge con <b>Actualizar estados</b>, en Actividades. Todavía sin recoger nada.</>}
           </div></Prose>
 
-          <button onClick={() => setGuiaMed(!guiaMed)} className="crm-btn"
+        </Card>
+
+        {/* ── Meta ── */}
+        <Card title="Meta · Facebook e Instagram"
+          badge={!anun.meta
+            ? <Pill color={C.mute} soft="#E6E9E3">Apagado</Pill>
+            : salud
+              ? (salud.meta?.leads
+                  ? <Pill color={C.jade} soft={C.jadeSoft}>Trayendo leads</Pill>
+                  : <Pill color={C.clay} soft={C.claySoft}>Falta el token</Pill>)
+              : <Pill color={C.amber} soft={C.amberSoft}>Sin probar</Pill>}>
+          <Prose>
+            Un anuncio con formulario recoge gente mientras duermes, y esa gente se queda dentro de Meta
+            hasta que alguien la saca. Esto la saca: cada lead entra como ficha, con lo que escribió en el
+            formulario, de qué campaña vino y si llegó por Facebook o por Instagram.
+            <br /><br />
+            <b>Meta borra los leads a los 90 días.</b> No es un detalle: con las demás conexiones, no
+            sincronizar significa enterarse tarde; con ésta significa no enterarse nunca. Si el CRM pasa
+            tres meses sin recoger, lo de antes no se recupera de ninguna manera.
+          </Prose>
+
+          <label style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid " + (anun.meta ? C.jade : C.line), background: anun.meta ? "#F7FAF8" : C.panel, borderRadius: 7, padding: "11px 12px", cursor: "pointer", margin: "14px 0 0" }}>
+            <input type="checkbox" checked={anun.meta} style={{ marginTop: 2, accentColor: C.jade }}
+              onChange={(e) => { setLeadProbe({ tipo: "", texto: "" }); patch("anuncios", { meta: e.target.checked }); }} />
+            <div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>Traer los leads de Lead Ads</div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>
+                Se leen los formularios de la página que configuraste en el puente, todos, también los de
+                campañas apagadas: una que paraste ayer puede tener leads de anteayer sin recoger.
+              </div>
+            </div>
+          </label>
+
+          {anun.meta && salud && !salud.meta?.leads && (
+            <div style={{ marginTop: 12, background: C.claySoft, color: C.clay, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6 }}>
+              El puente no tiene con qué pedirlos. Falta <Mono>META_TOKEN</Mono> como secreto,
+              o <Mono>META_PAGE_ID</Mono> en <Mono>tracker/wrangler.toml</Mono>. Mira la guía de aquí abajo.
+            </div>
+          )}
+
+          <button onClick={() => setGuiaMeta(!guiaMeta)} className="crm-btn"
             style={{ marginTop: 12, background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}>
-            <ChevronDown size={14} style={{ transform: guiaMed ? "rotate(180deg)" : "none", transition: "transform .15s" }} />
-            Cómo publicar el medidor
+            <ChevronDown size={14} style={{ transform: guiaMeta ? "rotate(180deg)" : "none", transition: "transform .15s" }} />
+            Cómo conectar Meta
           </button>
-          {guiaMed && (
+          {guiaMeta && (
             <ol style={{ margin: "10px 0 0", paddingLeft: 20, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.85 }}>
-              <li>Crea una cuenta gratuita en <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noreferrer" style={{ color: C.jade }}>Cloudflare</a>.</li>
-              <li>En una terminal, dentro de la carpeta del proyecto: <Mono>cd tracker</Mono> y luego <Mono>npx wrangler login</Mono>.</li>
-              <li><Mono>npx wrangler kv namespace create EVENTOS</Mono> — imprime un id; pégalo en <Mono>tracker/wrangler.toml</Mono>, donde dice <Mono>PEGA_AQUI_EL_ID</Mono>.</li>
-              <li><Mono>npx wrangler secret put CLAVE</Mono> — inventa una clave larga y apúntala: es la misma que va aquí arriba.</li>
-              <li><Mono>npx wrangler deploy</Mono>. Copia la dirección que imprime y pégala aquí arriba.</li>
-              <li>Pulsa <b>Probar el medidor</b>. Si responde, activa las casillas y manda un correo de prueba a una dirección tuya.</li>
+              <li>Necesitas <a href="https://business.facebook.com/" target="_blank" rel="noreferrer" style={{ color: C.jade }}>business.facebook.com</a> con la página y la cuenta publicitaria en el mismo portafolio.</li>
+              <li><b>Enciende el acceso a los leads.</b> En Meta Business Suite, el <b>engranaje</b> junto al portafolio → <b>Integraciones → Acceso a clientes potenciales → Personalizar acceso → Confirmar</b>. Sólo puede hacerlo quien tenga control total del portafolio. Éste es el paso que se salta todo el mundo: sin él la API contesta cero leads y no dice por qué.</li>
+              <li><b>Configuración del negocio → Usuarios → Usuarios de sistema → Agregar.</b> Créalo con rol <b>Employee</b> —el token no caduca nunca, así que conviene que sólo alcance a lo asignado— y dale <i>dos</i> activos por separado: la <b>página</b> y la <b>cuenta publicitaria</b>.</li>
+              <li><b>Crea una app y instálala en ese usuario.</b> Un token de usuario de sistema siempre se emite en nombre de una app, y sin ninguna el botón de generar aparece en gris. En <a href="https://developers.facebook.com/apps/creation/" target="_blank" rel="noreferrer" style={{ color: C.jade }}>developers.facebook.com</a>: caso de uso <b>Otro</b>, tipo <b>Empresa</b>, y elige tu portafolio. Luego, en el usuario de sistema, pestaña <b>Apps instaladas</b>, añádela. No hace falta publicarla ni pasarla por revisión.</li>
+              <li><b>Dale al usuario un rol dentro de esa app.</b> Instalarla no basta y son dos cosas distintas: en <b>Asignar activos</b>, tipo <b>Apps</b>, marca la tuya y concédele <b>Administrar app</b>. Sin esto, al generar el token la lista de permisos sale vacía —“no hay permisos disponibles”— y el botón se queda apagado.</li>
+              <li>Pulsa <b>Generar token</b> y marca los cinco permisos que pide Meta para esto: <Mono>leads_retrieval</Mono>, <Mono>pages_show_list</Mono>, <Mono>pages_read_engagement</Mono>, <Mono>pages_manage_ads</Mono> y <Mono>ads_management</Mono>. Si dejas fuera los dos últimos los leads entran igual, pero sin saber de qué campaña vienen.</li>
+              <li>Vuelve a <b>Acceso a clientes potenciales</b> y comprueba que el usuario de sistema aparece en la lista con acceso concedido.</li>
+              <li>Guarda el token en el puente: <Mono>cd tracker</Mono> y <Mono>npx wrangler secret put META_TOKEN</Mono>.</li>
+              <li>En <Mono>tracker/wrangler.toml</Mono> pon <Mono>META_PAGE_ID</Mono> —el identificador de la página, en su Configuración → Información— y <Mono>META_AD_ACCOUNT</Mono>, que es el <Mono>act_…</Mono> del Administrador de anuncios.</li>
+              <li><Mono>npx wrangler deploy</Mono> y vuelve a <b>Probar el puente</b>, arriba.</li>
             </ol>
           )}
+        </Card>
+
+        {/* ── Google Ads ── */}
+        <Card title="Google Ads"
+          badge={!anun.google
+            ? <Pill color={C.mute} soft="#E6E9E3">Apagado</Pill>
+            : salud
+              ? (salud.google?.autorizado && salud.google?.credenciales
+                  ? <Pill color={C.jade} soft={C.jadeSoft}>Trayendo leads</Pill>
+                  : <Pill color={C.clay} soft={C.claySoft}>Falta autorizar</Pill>)
+              : <Pill color={C.amber} soft={C.amberSoft}>Sin probar</Pill>}>
+          <Prose>
+            Lo mismo que Meta, para los formularios de Google. Cada envío entra como ficha con la campaña
+            de la que vino. <b>Google los guarda 30 días</b>, la mitad que Meta.
+            <br /><br />
+            Hay que decir una cosa antes de que pierdas la tarde: Google exige un <b>developer token</b>
+            para dejar entrar a su API, se solicita aparte y <b>tarda días en aprobarse</b>. No es un campo
+            que se rellene y ya. Existe un programa para no necesitarlo, pero sigue siendo un piloto
+            cerrado al que hay que postularse, así que hoy no es una salida.
+          </Prose>
+
+          <label style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid " + (anun.google ? C.jade : C.line), background: anun.google ? "#F7FAF8" : C.panel, borderRadius: 7, padding: "11px 12px", cursor: "pointer", margin: "14px 0 0" }}>
+            <input type="checkbox" checked={anun.google} style={{ marginTop: 2, accentColor: C.jade }}
+              onChange={(e) => { setLeadProbe({ tipo: "", texto: "" }); patch("anuncios", { google: e.target.checked }); }} />
+            <div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>Traer los leads de los formularios</div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>
+                Los de las extensiones de formulario de tus campañas, con el nombre de la campaña de cada uno.
+              </div>
+            </div>
+          </label>
+
+          {anun.google && (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+              <Btn variant={salud?.google?.autorizado ? "outline" : "solid"} Icon={ShieldCheck} disabled={!hayPuente}
+                onClick={() => window.open(`${pu.base}/gads/entrar?clave=${encodeURIComponent(pu.clave)}`, "_blank", "noopener")}>
+                {salud?.google?.autorizado ? "Volver a autorizar" : "Autorizar Google Ads"}
+              </Btn>
+              <Prose><span style={{ fontSize: 11.5, color: C.faint }}>
+                {hayPuente
+                  ? "Se abre Google en otra pestaña. El permiso se queda guardado en el puente, no aquí, y se renueva solo."
+                  : "Publica antes el puente, arriba."}
+              </span></Prose>
+            </div>
+          )}
+
+          <button onClick={() => setGuiaGads(!guiaGads)} className="crm-btn"
+            style={{ marginTop: 12, background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}>
+            <ChevronDown size={14} style={{ transform: guiaGads ? "rotate(180deg)" : "none", transition: "transform .15s" }} />
+            Cómo conectar Google Ads
+          </button>
+          {guiaGads && (
+            <ol style={{ margin: "10px 0 0", paddingLeft: 20, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.85 }}>
+              <li><b>Pide el developer token primero</b>, porque es lo que tarda: en Google Ads, <b>Herramientas → Configuración → Centro de API</b>. Hace falta una cuenta administradora (MCC).</li>
+              <li>En <a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer" style={{ color: C.jade }}>console.cloud.google.com</a>, con el mismo proyecto de Gmail o con otro: activa <b>Google Ads API</b> en la Biblioteca.</li>
+              <li><b>Credenciales → Crear credenciales → ID de cliente de OAuth</b>, tipo <b>Aplicación web</b>. Es uno distinto del de Gmail: éste vive en el puente, no en el navegador.</li>
+              <li>En <b>URIs de redireccionamiento autorizados</b> —ojo, ése, no el de orígenes— pega la dirección del puente seguida de <Mono>/gads/vuelta</Mono>.</li>
+              <li>Guarda los secretos: <Mono>npx wrangler secret put GADS_CLIENT_SECRET</Mono> y <Mono>npx wrangler secret put GADS_DEV_TOKEN</Mono>.</li>
+              <li>En <Mono>tracker/wrangler.toml</Mono> pon <Mono>GADS_CLIENT_ID</Mono> y <Mono>GADS_CUSTOMER_ID</Mono>. El <Mono>GADS_LOGIN_CUSTOMER_ID</Mono> sólo si la cuenta cuelga de un MCC: ponerlo cuando no toca hace que Google conteste que la cuenta no existe.</li>
+              <li><Mono>npx wrangler deploy</Mono>, y pulsa <b>Autorizar Google Ads</b> aquí arriba. Es una sola vez.</li>
+            </ol>
+          )}
+        </Card>
+
+        {/* ── Rendimiento ── */}
+        <Card title="Rendimiento de las campañas"
+          badge={anun.meta || anun.google
+            ? <Pill color={C.blue} soft={C.blueSoft}>Últimos {anun.dias} días</Pill>
+            : <Pill color={C.mute} soft="#E6E9E3">Nada encendido</Pill>}>
+          <Prose>
+            Lo que hay que preguntarle a un anuncio es una sola cosa: <b>cuánto costó cada persona que
+            llegó</b>. Eso se saca de aquí, sin abrir el administrador de anuncios de cada plataforma y sin
+            tener que sumar dos monedas mentalmente.
+            <br /><br />
+            No se guarda nada: se pide en el momento y se muestra. Los leads sí quedan en el CRM porque
+            son tuyos y las plataformas los borran; una cifra de gasto, en cambio, siempre va a estar allá.
+          </Prose>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+            <Btn variant="outline" Icon={Megaphone} disabled={busy || !hayPuente || (!anun.meta && !anun.google)} onClick={verCampanas}>
+              {busy ? "Pidiendo…" : "Ver campañas"}
+            </Btn>
+            {campProbe.texto && (
+              <Prose><span style={{ fontSize: 12, fontWeight: 500, color: campProbe.tipo === "aviso" ? C.amber : C.clay }}>{campProbe.texto}</span></Prose>
+            )}
+          </div>
+
+          {campanas && campanas.length > 0 && (
+            <div style={{ marginTop: 14, border: "1px solid " + C.line, borderRadius: 7, overflowX: "auto" }}>
+              <table style={{ fontFamily: "var(--ui)", fontSize: 12.5 }}>
+                <thead>
+                  <tr style={{ background: "#F6F8F4" }}>
+                    {["Campaña", "Dónde", "Gasto", "Leads", "Por lead"].map((h, i) => (
+                      <th key={h} style={{ textAlign: i > 1 ? "right" : "left", padding: "8px 11px", fontWeight: 600, color: C.mute, borderBottom: "1px solid " + C.line, whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {campanas.map((c) => {
+                    /* Sin leads no hay coste por lead: escribir un "0" o un
+                       infinito daría una cifra donde no hay ninguna. */
+                    const porLead = c.leads > 0 ? (c.gasto / c.leads) : null;
+                    return (
+                      <tr key={`${c.plataforma}:${c.id}`} className="crm-row">
+                        <td style={{ padding: "8px 11px", borderBottom: "1px solid " + C.line }}>{c.nombre || "Sin nombre"}</td>
+                        <td style={{ padding: "8px 11px", borderBottom: "1px solid " + C.line, color: C.mute }}>{nombrePlataforma(c.plataforma)}</td>
+                        <td style={{ padding: "8px 11px", borderBottom: "1px solid " + C.line, textAlign: "right", fontFamily: "var(--mono)" }}>{c.gasto.toLocaleString("es-CO", { maximumFractionDigits: 0 })}</td>
+                        <td style={{ padding: "8px 11px", borderBottom: "1px solid " + C.line, textAlign: "right", fontFamily: "var(--mono)" }}>{c.leads}</td>
+                        <td style={{ padding: "8px 11px", borderBottom: "1px solid " + C.line, textAlign: "right", fontFamily: "var(--mono)", fontWeight: 600, color: porLead == null ? C.faint : C.ink }}>
+                          {porLead == null ? "—" : porLead.toLocaleString("es-CO", { maximumFractionDigits: 0 })}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {campanas && campanas.length > 0 && (
+            <Prose><div style={{ marginTop: 8, fontSize: 11.5, color: C.faint }}>
+              Las cifras van en la moneda de cada cuenta, y si tienes una en pesos y otra en dólares no se
+              pueden sumar entre sí: mira cada fila por su lado.
+              {anun.google && <> En Google, la columna de leads cuenta <b>todas</b> las conversiones que tengas
+                configuradas, no sólo los formularios; si también mides llamadas o compras, ese número es
+                mayor que el de leads y el coste por lead sale más barato de lo que es.</>}
+            </div></Prose>
+          )}
+        </Card>
+
+        {/* ── Qué se hace con los leads ── */}
+        <Card title="Los leads que entran"
+          badge={anun.meta || anun.google
+            ? <Pill color={C.blue} soft={C.blueSoft}>{anun.meta && anun.google ? "Meta y Google" : anun.meta ? "Sólo Meta" : "Sólo Google"}</Pill>
+            : <Pill color={C.mute} soft="#E6E9E3">Nada encendido</Pill>}>
+          <Prose>
+            Cada lead se guarda partido en dos, a propósito: <b>la persona</b> se vuelve una ficha, y
+            <b> lo que escribió</b> queda como una actividad recibida con el formulario entero dentro. Va así
+            porque cada campaña pregunta otra cosa; convertir cada pregunta en una columna llenaría el CRM
+            de columnas vacías en un mes, y en cambio la respuesta a “¿qué deporte practica tu hijo?” —que
+            suele ser la única frase útil de todo el lead— se lee en la ficha, en su fecha.
+            <br /><br />
+            Antes de crear una ficha se busca si esa persona ya está, por correo y, si no hay, por
+            teléfono. Quien vuelve a llenar un formulario no se parte en dos fichas con la mitad del
+            historial cada una.
+          </Prose>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "14px 0" }}>
+            {[["contact", "Como contactos", "Lo normal: un formulario de anuncio lo llena una persona."],
+              ["company", "Como empresas", "Para quien le vende a instituciones y prefiere la ficha a nombre del colegio o el club."]].map(([key, label, detalle]) => (
+              <label key={key} style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid " + (anun.destino === key ? C.jade : C.line), background: anun.destino === key ? "#F7FAF8" : C.panel, borderRadius: 7, padding: "10px 12px", cursor: "pointer" }}>
+                <input type="radio" name="destino-leads" checked={anun.destino === key} onChange={() => patch("anuncios", { destino: key })} style={{ marginTop: 2, accentColor: C.jade }} />
+                <div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>{label}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>{detalle}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <Btn variant="solid" Icon={UserPlus} disabled={busy || !hayPuente || (!anun.meta && !anun.google)} onClick={traerAhora}>
+              {busy ? "Trayendo…" : "Traer leads ahora"}
+            </Btn>
+            {leadProbe.texto && (
+              <Prose><span style={{ fontSize: 12, fontWeight: 500, color: leadProbe.tipo === "ok" ? C.jade : leadProbe.tipo === "aviso" ? C.amber : C.clay }}>{leadProbe.texto}</span></Prose>
+            )}
+          </div>
+          <Prose><div style={{ marginTop: 8, fontSize: 11.5, color: C.faint }}>
+            No hace falta pulsarlo cada día: <b>Actualizar estados</b>, en Actividades, también los trae.
+            Este botón es para comprobar ahora que quedó bien configurado.
+            {db.buzon.leadsAl ? <> Última vez: {fmt(db.buzon.leadsAl)}.</> : <> Todavía sin traer nada.</>}
+          </div></Prose>
         </Card>
 
         <Prose>
@@ -3357,7 +4666,9 @@ function SettingsView({ db, setDb, setModal, say }) {
           <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Datos y respaldo</div>
           <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginBottom: 12, lineHeight: 1.6 }}>
             {db.contacts.length} contactos · {db.companies.length} empresas · {db.deals.length} negocios · {db.activities.length} actividades.
-            <br />Todo queda guardado en este navegador apenas lo escribes. El respaldo es un archivo con la copia completa: sirve para conservarla fuera del equipo o para pasarla a otro navegador.
+            <br />{import.meta.env.VITE_NUBE === "1"
+              ? "Todo queda guardado en el servidor del CRM apenas lo escribes, y aparece al instante en tus otros equipos. El respaldo es un archivo con la copia completa: sirve para conservarla fuera de la nube o para traer los datos de otro navegador."
+              : "Todo queda guardado en este navegador apenas lo escribes. El respaldo es un archivo con la copia completa: sirve para conservarla fuera del equipo o para pasarla a otro navegador."}
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <Btn variant="outline" Icon={Download} onClick={exportBackup}>Descargar respaldo</Btn>
@@ -3782,6 +5093,9 @@ function BulkEditModal({ db, objKind, ids, onClose, onApply }) {
    en que ocurre —uno a uno—, no en bloque al final: si algo falla a mitad de
    camino, el historial refleja lo que de verdad salió.
    ──────────────────────────────────────────────────────────── */
+const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
+const PAUSA_ENVIO = 500;
+
 function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const integ = db.integrations;
   const gmail = useGmail();
@@ -3818,6 +5132,7 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const modo = integ.email.mode;
   const esCorreo = channel === "email";
   const porApi = esCorreo && modo === "gmailApi";
+  const porWa = !esCorreo && integ.whatsapp.modo === "api";
 
   const destOf = (r) => (esCorreo ? String(r.props.email || "").trim() : toE164(r.props.phone, cc));
   const sendable = recipients.filter((r) => destOf(r));
@@ -3918,8 +5233,15 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
     const cola = pending;
     setErr(""); setBusy(true);
     let ok = 0;
-    for (const r of cola) {
+    for (let i = 0; i < cola.length; i++) {
+      const r = cola[i];
       try {
+        /* Gmail cuenta los envíos por segundo, no sólo por día: mandar la lista
+           entera de corrido es justo lo que dispara "User-rate limit exceeded"
+           y deja la tanda a medias. Medio segundo entre uno y otro se queda
+           holgadamente por debajo de su tope y ni se nota en una tanda de
+           doscientos. Si aun así frena, sendGmail espera y reintenta solo. */
+        if (i) await pausa(PAUSA_ENVIO);
         const { trk, html: cuerpoHtml } = await prepararEnvio(r);
         await sendGmail({ to: destOf(r), subject: asuntoDe(r), body: cuerpoDe(r), html: cuerpoHtml, clientId: integ.email.clientId });
         marcar(r, trk);
@@ -3928,6 +5250,26 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
         setErr(`Se enviaron ${ok} de ${cola.length}. Se detuvo en ${titleOf(kind, r)}: ${(e && e.message) || e}`);
         break;
       }
+    }
+    setBusy(false);
+  };
+
+  /* Lo mismo por WhatsApp: uno tras otro, y si uno falla se detiene ahí. Aquí
+     parar importa todavía más que en el correo, porque Meta cobra por
+     conversación y rechaza el texto libre fuera de la ventana de 24 horas: un
+     fallo suele ser el primero de muchos, y seguir a ciegas cuesta dinero. */
+  const enviarTodoWa = async () => {
+    const cola = pending;
+    setErr(""); setBusy(true);
+    let ok = 0;
+    for (const r of cola) {
+      const res = await mandarWhatsApp(integ, r.props.phone, cuerpoDe(r));
+      if (!res.ok) {
+        setErr(`Se enviaron ${ok} de ${cola.length}. Se detuvo en ${titleOf(kind, r)}: ${res.err}`);
+        break;
+      }
+      marcar(r);
+      ok++;
     }
     setBusy(false);
   };
@@ -3982,7 +5324,9 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const terminado = sendable.length > 0 && pending.length === 0;
 
   const comoSale = !esCorreo
-    ? "Se abre WhatsApp con el mensaje escrito; tú das el último clic."
+    ? (porWa
+        ? "El CRM los manda por WhatsApp uno tras otro, sin abrir nada."
+        : "Se abre WhatsApp con el mensaje escrito; tú das el último clic.")
     : porApi
       ? (gmail.connected
           ? `El CRM envía desde ${gmail.account || "tu cuenta de Gmail"}${conHtml ? ", con el diseño HTML" : ""}.` +
@@ -3999,6 +5343,10 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
     if (porApi) {
       return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
         onClick={enviarTodo}>{busy ? "Enviando…" : `Enviar ${pending.length} por Gmail`}</Btn>;
+    }
+    if (porWa) {
+      return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
+        onClick={enviarTodoWa}>{busy ? "Enviando…" : `Enviar ${pending.length} por WhatsApp`}</Btn>;
     }
     return <Btn variant="solid" Icon={ExternalLink} disabled={sinTexto || !pending.length} onClick={abrirSiguiente}>
       {esCorreo ? "Abrir borrador" : "Abrir WhatsApp"} · {pending.length} sin enviar

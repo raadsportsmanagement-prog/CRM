@@ -104,8 +104,9 @@ export async function traerLeads({ base, clave, meta, google, desde, dias = 30 }
     }
   }
 
-  leads.sort((a, b) => (String(a.at) < String(b.at) ? -1 : 1));
-  return { leads, notas };
+  const limpias = leads.map((l) => ({ ...l, at: aIso(l.at) }));
+  limpias.sort((a, b) => (a.at < b.at ? -1 : 1));
+  return { leads: limpias, notas };
 }
 
 /* Métricas de campaña. Sirven para una sola pregunta —cuánto costó cada lead—
@@ -124,6 +125,22 @@ export async function traerCampanas({ base, clave, meta, google, dias = 30 }) {
   if (google) await pedirDe("/gads/campanas", "google", "Google Ads");
   campanas.sort((a, b) => (b.gasto || 0) - (a.gasto || 0));
   return { campanas, notas };
+}
+
+/* Las tres fuentes fechan distinto: Meta manda "2026-08-25T14:02:00+0000",
+   Google manda "2026-08-26 09:14:00" sin decir en qué zona, y el resto del CRM
+   escribe ISO con Z. Se unifica aquí, y no en cada pantalla, porque el CRM
+   compara fechas como texto en varios sitios —ordenar el historial, decidir si
+   una actividad es más nueva que la última conocida— y ahí dos formatos del
+   mismo instante no se comparan bien.
+
+   Con lo de Google se acepta un desfase: al no venir la zona, se lee como la
+   de este computador. Fingir una exacta sería inventarse una hora que no se
+   sabe, y para lo que sirve la fecha de un lead —ordenarlo y saber de qué día
+   es— unas horas no cambian nada. */
+function aIso(v) {
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? new Date(t).toISOString() : new Date().toISOString();
 }
 
 /* El puente filtra por fecha en milisegundos. Se pide con un minuto de solape
@@ -205,7 +222,7 @@ export function leadATexto(lead) {
   const c = lead.campos || {}, extra = lead.extra || {};
   const lineas = [];
   for (const [clave, valor] of Object.entries(c)) {
-    if (limpio(valor)) lineas.push(`${ETIQUETAS[clave] || clave}: ${valor}`);
+    if (limpio(valor)) lineas.push(`${ETIQUETAS[clave] || clave}: ${limpio(valor)}`);
   }
   for (const [clave, valor] of Object.entries(extra)) {
     /* Meta entrega las preguntas propias con el nombre técnico que les puso
@@ -213,7 +230,7 @@ export function leadATexto(lead) {
        bajos y se le sube la primera letra: no es el texto que vio la persona,
        pero se lee. */
     const bonito = String(clave).replace(/[_-]+/g, " ").replace(/^./, (x) => x.toUpperCase());
-    if (limpio(valor)) lineas.push(`${bonito}: ${valor}`);
+    if (limpio(valor)) lineas.push(`${bonito}: ${limpio(valor)}`);
   }
 
   const pie = [];
