@@ -6,7 +6,7 @@ import {
   Code2, Paperclip, Inbox, RefreshCw, CornerDownLeft, ArrowDownLeft, User,
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
-  Megaphone, UserPlus
+  Megaphone, UserPlus, ArrowUp, ArrowDown
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -1638,10 +1638,42 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [sel, setSel] = useState([]);
-  const [cols, setCols] = useState(schema.filter((f) => f.col).map((f) => f.key));
+  /* El orden de las columnas es el orden de esta lista, y se recuerda en este
+     navegador para no volver a acomodarlas cada vez que se entra. */
+  const colsKey = `crm.cols.${kind}`;
+  const [cols, setCols] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(colsKey) || "null");
+      if (Array.isArray(saved)) return saved.filter((k) => schema.some((f) => f.key === k));
+    } catch {}
+    return schema.filter((f) => f.col).map((f) => f.key);
+  });
+  useEffect(() => { try { localStorage.setItem(colsKey, JSON.stringify(cols)); } catch {} }, [colsKey, cols]);
   const [showCols, setShowCols] = useState(false);
+  const [arrastrada, setArrastrada] = useState(null);
+  const [sobre, setSobre] = useState(null);
+  const moverColumna = (desde, hacia) => {
+    if (!desde || desde === hacia) return;
+    // Hacia la derecha cae después de la columna destino; hacia la izquierda, antes.
+    setCols((c) => {
+      const sin = c.filter((k) => k !== desde);
+      const i = sin.indexOf(hacia);
+      if (i < 0) return c;
+      const en = c.indexOf(desde) < c.indexOf(hacia) ? i + 1 : i;
+      return [...sin.slice(0, en), desde, ...sin.slice(en)];
+    });
+  };
 
-  useEffect(() => { setSel([]); setQ(""); }, [kind]);
+  /* Clic en el título: el texto va de la A a la Z y los números y fechas de
+     mayor a menor; otro clic invierte y un tercero quita el orden. */
+  const [orden, setOrden] = useState(null);
+  const ordenarPor = (f) => {
+    const primero = f.type === "number" || f.type === "datetime" ? "desc" : "asc";
+    setOrden((o) => !o || o.key !== f.key ? { key: f.key, dir: primero }
+      : o.dir === primero ? { key: f.key, dir: primero === "asc" ? "desc" : "asc" } : null);
+  };
+
+  useEffect(() => { setSel([]); setQ(""); setOrden(null); }, [kind]);
   // Las propiedades creadas al importar aparecen de inmediato en la tabla,
   // sin volver a mostrar las columnas que el usuario ocultó.
   const known = useRef(new Set(schema.map((f) => f.key)));
@@ -1661,18 +1693,36 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   const qDiferida = React.useDeferredValue(q);
   const filtered = useMemo(() => {
     const nq = norm(qDiferida);
-    return indice.filter(({ r, hay }) => (!nq || hay.includes(nq)) && (!status || r.props.leadStatus === status)).map((x) => x.r);
-  }, [indice, qDiferida, status]);
+    const lista = indice.filter(({ r, hay }) => (!nq || hay.includes(nq)) && (!status || r.props.leadStatus === status)).map((x) => x.r);
+    const f = orden && schema.find((x) => x.key === orden.key);
+    if (!f) return lista;
+    // Los vacíos quedan siempre al final, en cualquier sentido.
+    const signo = orden.dir === "asc" ? 1 : -1;
+    const valor = f.type === "number" ? (v) => Number(v)
+      : f.type === "datetime" ? (v) => new Date(v).getTime()
+      : null;
+    const col = new Intl.Collator("es", { numeric: true, sensitivity: "base" });
+    return lista.map((r) => ({ r, v: r.props[f.key] })).sort((a, b) => {
+      const va = a.v === undefined || a.v === null || a.v === "", vb = b.v === undefined || b.v === null || b.v === "";
+      if (va || vb) return va === vb ? 0 : va ? 1 : -1;
+      if (valor) {
+        const x = valor(a.v), y = valor(b.v);
+        if (!isNaN(x) && !isNaN(y)) return (x - y) * signo;
+      }
+      return col.compare(String(a.v), String(b.v)) * signo;
+    }).map((x) => x.r);
+  }, [indice, qDiferida, status, orden, schema]);
 
   /* Se pintan de a 100 filas: dibujar miles de una vez es lo que más pesa, y
      una lista larga no se recorre a ojo, se filtra. Seleccionar todos sigue
      marcando la lista completa, no sólo lo pintado. */
   const [limite, setLimite] = useState(100);
-  useEffect(() => { setLimite(100); }, [kind, qDiferida, status]);
+  useEffect(() => { setLimite(100); }, [kind, qDiferida, status, orden]);
   const pintados = filtered.length > limite ? filtered.slice(0, limite) : filtered;
   const marcados = useMemo(() => new Set(sel), [sel]);
 
-  const shown = schema.filter((f) => cols.includes(f.key));
+  const shown = cols.map((k) => schema.find((f) => f.key === k)).filter(Boolean);
+  const claveTitulo = kind === "contact" ? "firstName" : "name";
   const allSel = filtered.length > 0 && sel.length === filtered.length;
 
   /* Borrar no se deshace desde la app, así que se pregunta antes. Con pocos
@@ -1748,9 +1798,26 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
                 <th style={{ padding: "9px 12px 9px 28px", width: 34 }}>
                   <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? [] : filtered.map((r) => r.id))} />
                 </th>
-                {shown.map((f) => (
-                  <th key={f.key} style={{ padding: "9px 12px", textAlign: "left", fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 500, color: C.mute, letterSpacing: ".07em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{f.label}</th>
-                ))}
+                {shown.map((f) => {
+                  const activo = orden?.key === f.key;
+                  return (
+                    <th key={f.key} draggable title="Clic para ordenar · arrastra para mover"
+                      onClick={() => ordenarPor(f)}
+                      onDragStart={(e) => { setArrastrada(f.key); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", f.key); }}
+                      onDragOver={(e) => { if (!arrastrada) return; e.preventDefault(); if (sobre !== f.key) setSobre(f.key); }}
+                      onDragLeave={() => setSobre((s) => s === f.key ? null : s)}
+                      onDrop={(e) => { e.preventDefault(); moverColumna(arrastrada, f.key); setArrastrada(null); setSobre(null); }}
+                      onDragEnd={() => { setArrastrada(null); setSobre(null); }}
+                      style={{ padding: "9px 12px", textAlign: "left", fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 500, color: activo ? C.ink : C.mute, letterSpacing: ".07em", textTransform: "uppercase", whiteSpace: "nowrap", cursor: "pointer", userSelect: "none",
+                        opacity: arrastrada === f.key ? 0.4 : 1,
+                        boxShadow: sobre === f.key && arrastrada !== f.key ? `inset ${cols.indexOf(arrastrada) < cols.indexOf(f.key) ? "-2px" : "2px"} 0 0 ${C.jade}` : "none" }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        {f.label}
+                        {activo && (orden.dir === "asc" ? <ArrowUp size={11} /> : <ArrowDown size={11} />)}
+                      </span>
+                    </th>
+                  );
+                })}
                 <th style={{ width: 40 }} />
               </tr>
             </thead>
@@ -1760,9 +1827,9 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
                   <td style={{ padding: "9px 12px 9px 28px" }}>
                     <input type="checkbox" checked={marcados.has(r.id)} onChange={() => setSel((s) => s.includes(r.id) ? s.filter((x) => x !== r.id) : [...s, r.id])} />
                   </td>
-                  {shown.map((f, i) => (
+                  {shown.map((f) => (
                     <td key={f.key} style={{ padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 13, color: C.ink, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {i === 0 ? (
+                      {f.key === claveTitulo ? (
                         <button onClick={() => setDetail({ kind, id: r.id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>{r.props[f.key] || "Sin nombre"}</button>
                       ) : <CellValue f={f} v={r.props[f.key]} />}
                     </td>
