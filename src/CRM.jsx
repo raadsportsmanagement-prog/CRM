@@ -247,6 +247,11 @@ const emptyDb = () => ({
   /* Propiedades borradas: salen del esquema al instante pero sus datos se
      guardan PAPELERA_DIAS días por si fue un error. */
   papelera: { contact: [], company: [], deal: [] },
+  /* Vistas: cómo se mira una tabla (búsqueda, filtros, columnas, orden).
+     Listas: a quién se le escribe. Una lista activa guarda condiciones y sus
+     miembros cambian solos; una fija guarda personas concretas. */
+  vistas: [],
+  listas: [],
 });
 
 const PAPELERA_DIAS = 15;
@@ -338,6 +343,9 @@ function normalizeDb(raw) {
     autoCola: normalizeCola(d.autoCola),
     autoLog: normalizeLog(d.autoLog),
     autoMarcas: (d.autoMarcas && typeof d.autoMarcas === "object" && d.autoMarcas) || {},
+    vistas: arr(d.vistas).filter((v) => v && v.id && v.kind),
+    listas: arr(d.listas).filter((l) => l && l.id && l.kind)
+      .map((l) => ({ ...l, tipo: l.tipo === "fija" ? "fija" : "activa", ids: arr(l.ids) })),
   };
 }
 
@@ -1407,7 +1415,7 @@ export default function CRM() {
               onLeerBandeja={activarLectura} onLeads={importarLeads} />
           )}
           {(view === "contact" || view === "company") && (
-            <RecordList key={view} kind={view} db={db} setModal={setModal} setDetail={setDetail} onDelete={(ids) => { deleteRecords(view, ids); say(`${ids.length} registro(s) eliminados`); }} />
+            <RecordList key={view} kind={view} db={db} setDb={setDb} say={say} setModal={setModal} setDetail={setDetail} onDelete={(ids) => { deleteRecords(view, ids); say(`${ids.length} registro(s) eliminados`); }} />
           )}
           {view === "deal" && <DealsView db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord("deal", id, { stage, lastActivityAt: nowISO() }); say(`Negocio movido a ${stage}`); }} />}
           {view === "activities" && (
@@ -1495,7 +1503,7 @@ export default function CRM() {
           }} />
       )}
       {modal?.kind === "send" && (
-        <SendModal db={db} channel={modal.channel} kind={modal.objKind} ids={modal.ids}
+        <SendModal db={db} channel={modal.channel} kind={modal.objKind} ids={modal.ids} listaId={modal.listaId}
           onClose={() => setModal(null)}
           onLogOne={(id, payload) => logActivity({
             type: modal.channel, subject: payload.subject, body: payload.body,
@@ -1677,9 +1685,29 @@ const resolveNames = (db, a) => {
 /* ────────────────────────────────────────────────────────────
    Lista de contactos / empresas
    ──────────────────────────────────────────────────────────── */
-function RecordList({ kind, db, setModal, setDetail, onDelete }) {
+/* Una pestaña sobre la tabla: "Todos", cada vista y cada lista. */
+const Pestana = ({ on, onClick, Icon, children, extra }) => (
+  <button type="button" onClick={onClick} className="crm-btn"
+    style={{ display: "inline-flex", alignItems: "center", gap: 6, border: "none", borderBottom: `2px solid ${on ? C.jade : "transparent"}`, background: "transparent", padding: "10px 12px 8px", fontFamily: "var(--ui)", fontSize: 13, fontWeight: on ? 600 : 500, color: on ? C.ink : C.mute, cursor: "pointer", whiteSpace: "nowrap" }}>
+    {Icon && <Icon size={13} />}{children}
+    {extra != null && <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{extra}</span>}
+  </button>
+);
+
+function RecordList({ kind, db, setDb, say, setModal, setDetail, onDelete }) {
   const schema = db.schema[kind];
   const rows = kind === "contact" ? db.contacts : db.companies;
+  const vistas = useMemo(() => (db.vistas || []).filter((v) => v.kind === kind), [db.vistas, kind]);
+  const listas = useMemo(() => (db.listas || []).filter((l) => l.kind === kind), [db.listas, kind]);
+  /* Cuántos hay hoy en cada lista, para la pestaña y para el menú de envío. */
+  const miembros = useMemo(() => Object.fromEntries(listas.map((l) => [l.id, miembrosDeLista(db, l)])),
+    [listas, db.contacts, db.companies, db.schema]);
+  /* Qué pestaña está abierta: null es "Todos". */
+  const [activa, setActiva] = useState(null);
+  const vistaActiva = activa?.tipo === "vista" ? vistas.find((v) => v.id === activa.id) || null : null;
+  const listaActiva = activa?.tipo === "lista" ? listas.find((l) => l.id === activa.id) || null : null;
+  const [dialogo, setDialogo] = useState(null);
+  const [aBorrar, setABorrar] = useState(null);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [filtros, setFiltros] = useState([]);
@@ -1694,7 +1722,12 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
     } catch {}
     return schema.filter((f) => f.col).map((f) => f.key);
   });
-  useEffect(() => { try { localStorage.setItem(colsKey, JSON.stringify(cols)); } catch {} }, [colsKey, cols]);
+  /* Las columnas de "Todos" son las de este navegador; las de una vista viajan
+     con la vista. */
+  useEffect(() => {
+    if (activa) return;
+    try { localStorage.setItem(colsKey, JSON.stringify(cols)); } catch {}
+  }, [colsKey, cols, activa]);
   const [showCols, setShowCols] = useState(false);
   const [arrastrada, setArrastrada] = useState(null);
   const [sobre, setSobre] = useState(null);
@@ -1732,7 +1765,12 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   /* El texto en que se busca se arma una vez por cambio en los registros, no
      una vez por tecla: quitar tildes y símbolos a miles de fichas en cada
      letra es lo que trababa la búsqueda. */
-  const indice = useMemo(() => rows.map((r) => ({ r, hay: norm(Object.values(r.props).join(" ")) })), [rows]);
+  const base = useMemo(() => {
+    if (listaActiva?.tipo !== "fija") return rows;
+    const ids = new Set(listaActiva.ids);
+    return rows.filter((r) => ids.has(r.id));
+  }, [rows, listaActiva]);
+  const indice = useMemo(() => base.map((r) => ({ r, hay: norm(Object.values(r.props).join(" ")) })), [base]);
 
   /* La casilla responde al instante y el filtro va un paso detrás: si la
      lista tarda, React la deja para después en vez de congelar el teclado. */
@@ -1788,6 +1826,100 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   const seleccionarTodos = () => setSel(filtered.map((r) => r.id));
   const quitarSeleccion = () => setSel([]);
 
+  /* ── Vistas y listas ── */
+  const columnasDeTodos = () => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(colsKey) || "null");
+      if (Array.isArray(saved)) return saved.filter((k) => schema.some((f) => f.key === k));
+    } catch {}
+    return schema.filter((f) => f.col).map((f) => f.key);
+  };
+  const aplicar = (c, conColumnas) => {
+    setQ(c.q || ""); setStatus(c.status || ""); setFiltros(c.filtros || []); setOrden(c.orden || null);
+    if (conColumnas) setCols(conColumnas);
+  };
+  const abrirTodos = () => { setActiva(null); aplicar({}, columnasDeTodos()); };
+  const abrirVista = (v) => {
+    setActiva({ tipo: "vista", id: v.id });
+    aplicar(v, Array.isArray(v.cols) ? v.cols.filter((k) => schema.some((f) => f.key === k)) : null);
+  };
+  /* Una lista activa muestra sus condiciones, que se pueden ajustar y guardar.
+     Una fija abre sin filtros: lo que se filtre ahí sólo acota lo que se ve. */
+  const abrirLista = (l) => {
+    setActiva({ tipo: "lista", id: l.id });
+    aplicar(l.tipo === "activa" ? l : {});
+  };
+
+  /* Si la vista o la lista abierta se borró —aquí o desde otra pestaña—, se
+     vuelve a "Todos" en vez de quedar en una pestaña que ya no existe. */
+  useEffect(() => { if (activa && !vistaActiva && !listaActiva) abrirTodos(); }, [activa, vistaActiva, listaActiva]);
+
+  const criterio = { q, status, filtros };
+  const igual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const vistaCambiada = vistaActiva && !igual({ ...criterio, cols, orden },
+    { q: vistaActiva.q || "", status: vistaActiva.status || "", filtros: vistaActiva.filtros || [], cols: vistaActiva.cols, orden: vistaActiva.orden || null });
+  const listaCambiada = listaActiva?.tipo === "activa" && !igual(criterio,
+    { q: listaActiva.q || "", status: listaActiva.status || "", filtros: listaActiva.filtros || [] });
+  const hayCriterio = Boolean(q.trim() || status || filtros.length);
+
+  const plural = OBJ[kind].plural.toLowerCase();
+  const pedirNombre = (titulo, subtitulo, onOk, inicial = "") => setDialogo({ titulo, subtitulo, inicial, onOk });
+
+  const crearVista = (nombre) => {
+    const v = { id: uid(), kind, nombre, ...criterio, cols, orden, creadaEn: nowISO() };
+    setDb((d) => ({ ...d, vistas: [...(d.vistas || []), v] }));
+    setActiva({ tipo: "vista", id: v.id });
+    say(`Vista “${nombre}” guardada`);
+  };
+  const guardarVista = () => {
+    setDb((d) => ({ ...d, vistas: d.vistas.map((v) => (v.id === vistaActiva.id ? { ...v, ...criterio, cols, orden } : v)) }));
+    say("Vista actualizada");
+  };
+  /* La activa se lleva las condiciones; la fija, a las personas que se ven
+     ahora mismo en la tabla. */
+  const crearLista = (nombre, tipo, ids = []) => {
+    const l = tipo === "activa"
+      ? { id: uid(), kind, nombre, tipo, ...criterio, ids: [], creadaEn: nowISO() }
+      : { id: uid(), kind, nombre, tipo, q: "", status: "", filtros: [], ids, creadaEn: nowISO() };
+    setDb((d) => ({ ...d, listas: [...(d.listas || []), l] }));
+    abrirLista(l);
+    say(`Lista “${nombre}” creada${tipo === "fija" ? ` con ${ids.length}` : ""}`);
+  };
+  const guardarCondiciones = () => {
+    setDb((d) => ({ ...d, listas: d.listas.map((l) => (l.id === listaActiva.id ? { ...l, ...criterio } : l)) }));
+    say("Condiciones de la lista guardadas");
+  };
+  const renombrar = (tipo, id, nombre) => {
+    const col = tipo === "vista" ? "vistas" : "listas";
+    setDb((d) => ({ ...d, [col]: d[col].map((x) => (x.id === id ? { ...x, nombre } : x)) }));
+  };
+  const eliminar = ({ tipo, id }) => {
+    const col = tipo === "vista" ? "vistas" : "listas";
+    setDb((d) => ({ ...d, [col]: d[col].filter((x) => x.id !== id) }));
+    setABorrar(null);
+    abrirTodos();
+  };
+  const anadirALista = (id, ids) => {
+    setDb((d) => ({ ...d, listas: d.listas.map((l) => (l.id === id ? { ...l, ids: [...new Set([...(l.ids || []), ...ids])] } : l)) }));
+    const l = listas.find((x) => x.id === id);
+    say(`${ids.length} añadido(s) a “${l ? l.nombre : "la lista"}”`);
+  };
+  const quitarDeLista = (ids) => {
+    const fuera = new Set(ids);
+    setDb((d) => ({ ...d, listas: d.listas.map((l) => (l.id === listaActiva.id ? { ...l, ids: l.ids.filter((x) => !fuera.has(x)) } : l)) }));
+    say(`${ids.length} quitado(s) de la lista`);
+  };
+  const enviarALista = (l, channel) =>
+    setModal({ kind: "send", channel, objKind: kind, ids: (miembros[l.id] || []).map((r) => r.id), listaId: l.id });
+
+  const opcionesComoLista = (nombreBase) => [
+    { titulo: "Usar como lista" },
+    { label: "Crear lista activa con estos filtros", Icon: Zap, disabled: !hayCriterio,
+      onClick: () => pedirNombre("Nueva lista activa", "Se actualiza sola: entra quien cumpla las condiciones y sale quien deje de cumplirlas.", (n) => crearLista(n, "activa"), nombreBase) },
+    { label: `Crear lista fija con los ${filtered.length} que se ven`, Icon: ListChecks, disabled: !filtered.length,
+      onClick: () => pedirNombre("Nueva lista fija", `Guarda a estos ${filtered.length} ${plural}. No cambia aunque cambien sus datos.`, (n) => crearLista(n, "fija", filtered.map((r) => r.id)), nombreBase) },
+  ];
+
   /* Borrar no se deshace desde la app, así que se pregunta antes. Con pocos
      registros basta confirmar; desde 10 hay que escribir ELIMINAR, porque un
      "seleccionar todos" con un filtro equivocado se lleva la base entera de
@@ -1812,6 +1944,38 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
           <Btn variant="solid" Icon={Plus} onClick={() => setModal({ kind: "record", objKind: kind })}>Crear {OBJ[kind].singular.toLowerCase()}</Btn>
         </>} />
 
+      <div style={{ padding: "0 28px", display: "flex", alignItems: "flex-end", gap: 2, borderBottom: `1px solid ${C.line}`, overflowX: "auto" }}>
+        <Pestana on={!activa} onClick={abrirTodos} extra={rows.length}>Todos</Pestana>
+        {vistas.map((v) => (
+          <Pestana key={v.id} on={vistaActiva?.id === v.id} onClick={() => abrirVista(v)} Icon={Eye}>{v.nombre}</Pestana>
+        ))}
+        {listas.length > 0 && <div style={{ width: 1, alignSelf: "stretch", background: C.line, margin: "8px 6px" }} />}
+        {listas.map((l) => (
+          <Pestana key={l.id} on={listaActiva?.id === l.id} onClick={() => abrirLista(l)}
+            Icon={l.tipo === "activa" ? Zap : ListChecks} extra={(miembros[l.id] || []).length}>{l.nombre}</Pestana>
+        ))}
+      </div>
+
+      {listaActiva && (
+        <div style={{ padding: "10px 28px", background: "#F4F6F1", borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <Pill color={listaActiva.tipo === "activa" ? C.blue : C.plum} soft={listaActiva.tipo === "activa" ? C.blueSoft : C.plumSoft}>
+            Lista {listaActiva.tipo}
+          </Pill>
+          <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, flex: "1 1 260px" }}>
+            <b style={{ color: C.ink }}>{(miembros[listaActiva.id] || []).length}</b> {(miembros[listaActiva.id] || []).length === 1 ? OBJ[kind].singular.toLowerCase() : plural} ·{" "}
+            {listaActiva.tipo === "activa"
+              ? (listaCambiada ? "Cambiaste las condiciones: guárdalas para que la lista las use." : "Se actualiza sola con quien cumpla las condiciones de abajo.")
+              : "Las personas guardadas no cambian. Filtrar aquí sólo acota lo que ves."}
+          </span>
+          {listaCambiada && <>
+            <Btn size="sm" onClick={() => abrirLista(listaActiva)}>Descartar</Btn>
+            <Btn size="sm" variant="solid" Icon={Check} onClick={guardarCondiciones}>Guardar condiciones</Btn>
+          </>}
+          <Btn size="sm" variant="outline" Icon={MessageSquare} disabled={!(miembros[listaActiva.id] || []).length} onClick={() => enviarALista(listaActiva, "whatsapp")}>WhatsApp a la lista</Btn>
+          <Btn size="sm" variant="outline" Icon={Mail} disabled={!(miembros[listaActiva.id] || []).length} onClick={() => enviarALista(listaActiva, "email")}>Correo a la lista</Btn>
+        </div>
+      )}
+
       <div style={{ padding: "14px 28px", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", borderBottom: `1px solid ${C.line}` }}>
         <div style={{ position: "relative", flex: "1 1 240px", maxWidth: 340 }}>
           <Search size={14} color={C.faint} style={{ position: "absolute", left: 10, top: 10 }} />
@@ -1834,6 +1998,36 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
             </div>
           )}
         </div>
+        {vistaCambiada && <>
+          <Btn variant="outline" onClick={() => abrirVista(vistaActiva)}>Descartar</Btn>
+          <Btn variant="solid" Icon={Check} onClick={guardarVista}>Guardar cambios</Btn>
+        </>}
+        {!activa && (
+          <Menu size="md" label="Guardar" items={[
+            { label: "Guardar como vista", Icon: Eye, onClick: () => pedirNombre("Guardar vista", "Guarda la búsqueda, los filtros, las columnas y el orden en una pestaña.", crearVista) },
+            ...opcionesComoLista(""),
+          ]} />
+        )}
+        {vistaActiva && (
+          <Menu size="md" label="Vista" items={[
+            { label: "Guardar como vista nueva", Icon: Eye, onClick: () => pedirNombre("Guardar como vista nueva", "", crearVista, `${vistaActiva.nombre} (copia)`) },
+            { label: "Cambiar nombre", Icon: Pencil, onClick: () => pedirNombre("Cambiar nombre de la vista", "", (n) => { renombrar("vista", vistaActiva.id, n); setDialogo(null); }, vistaActiva.nombre) },
+            ...opcionesComoLista(vistaActiva.nombre),
+            { titulo: " " },
+            { label: "Eliminar vista", Icon: Trash2, danger: true, onClick: () => setABorrar({ tipo: "vista", id: vistaActiva.id, nombre: vistaActiva.nombre }) },
+          ]} />
+        )}
+        {listaActiva && (
+          <Menu size="md" label="Lista" items={[
+            { label: "Cambiar nombre", Icon: Pencil, onClick: () => pedirNombre("Cambiar nombre de la lista", "", (n) => { renombrar("lista", listaActiva.id, n); setDialogo(null); }, listaActiva.nombre) },
+            { titulo: "Duplicar" },
+            listaActiva.tipo === "activa" && { label: "Duplicar como lista activa", Icon: Zap, onClick: () => pedirNombre("Nueva lista activa", "Copia estas condiciones en otra lista que se actualiza sola.", (n) => crearLista(n, "activa"), `${listaActiva.nombre} (copia)`) },
+            { label: `Duplicar como lista fija (${filtered.length})`, Icon: ListChecks, disabled: !filtered.length, onClick: () => pedirNombre("Nueva lista fija", `Guarda a los ${filtered.length} ${plural} que se ven ahora.`, (n) => crearLista(n, "fija", filtered.map((r) => r.id)), `${listaActiva.nombre} (fija)`) },
+            { label: "Guardar como vista", Icon: Eye, onClick: () => pedirNombre("Guardar vista", "", crearVista, listaActiva.nombre) },
+            { titulo: " " },
+            { label: "Eliminar lista", Icon: Trash2, danger: true, onClick: () => setABorrar({ tipo: "lista", id: listaActiva.id, nombre: listaActiva.nombre }) },
+          ]} />
+        )}
         <div style={{ flex: 1 }} />
         <Btn variant="ghost" Icon={Plus} size="sm" onClick={() => setModal({ kind: "prop", objKind: kind })}>Nueva propiedad</Btn>
       </div>
@@ -1860,6 +2054,13 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
           <Btn size="sm" variant="outline" Icon={Mail} onClick={() => setModal({ kind: "send", channel: "email", objKind: kind, ids: sel })}>Enviar correo</Btn>
           <Btn size="sm" variant="outline" Icon={Briefcase} onClick={() => setModal({ kind: "deal", contactIds: kind === "contact" ? sel : [], companyId: kind === "company" ? sel[0] : undefined, presets: { source: "Manual" } })}>Crear negocio</Btn>
           <Btn size="sm" variant="outline" Icon={Pencil} onClick={() => setModal({ kind: "bulk", objKind: kind, ids: sel })}>Editar propiedad</Btn>
+          <Menu label="Añadir a lista" Icon={ListChecks} items={[
+            { label: `Nueva lista fija con estos ${sel.length}`, Icon: Plus, onClick: () => pedirNombre("Nueva lista fija", `Guarda a estos ${sel.length} ${plural}.`, (n) => crearLista(n, "fija", sel)) },
+            ...(listas.some((l) => l.tipo === "fija" && l.id !== listaActiva?.id) ? [{ titulo: "Listas fijas" }] : []),
+            ...listas.filter((l) => l.tipo === "fija" && l.id !== listaActiva?.id)
+              .map((l) => ({ label: l.nombre, extra: (miembros[l.id] || []).length, onClick: () => anadirALista(l.id, sel) })),
+          ]} />
+          {listaActiva?.tipo === "fija" && <Btn size="sm" variant="outline" Icon={X} onClick={() => { quitarDeLista(sel); setSel([]); }}>Quitar de la lista</Btn>}
           <div style={{ flex: 1 }} />
           <Btn size="sm" variant="danger" Icon={Trash2} onClick={() => { setPalabra(""); setConfirmar(true); }}>Eliminar</Btn>
         </div>
@@ -1920,6 +2121,17 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
               ))}
             </tbody>
           </table>
+        )}
+        {dialogo && (
+          <NombreModal titulo={dialogo.titulo} subtitulo={dialogo.subtitulo} inicial={dialogo.inicial}
+            onClose={() => setDialogo(null)} onOk={(n) => { dialogo.onOk(n); setDialogo(null); }} />
+        )}
+        {aBorrar && (
+          <Modal title={`¿Eliminar la ${aBorrar.tipo} “${aBorrar.nombre}”?`}
+            subtitle={`Sólo se borra la ${aBorrar.tipo}: los ${plural} siguen intactos en el CRM.`}
+            onClose={() => setABorrar(null)}
+            footer={<><Btn variant="outline" onClick={() => setABorrar(null)}>Cancelar</Btn>
+              <Btn variant="danger" Icon={Trash2} onClick={() => eliminar(aBorrar)}>Eliminar {aBorrar.tipo}</Btn></>} />
         )}
         {confirmar && (
           <Modal title={`¿Eliminar ${sel.length} ${nombreLista}?`}
@@ -5770,6 +5982,76 @@ function cumpleFiltro(r, c, f) {
 const cumpleFiltros = (r, filtros, schema) =>
   filtros.every((c) => cumpleFiltro(r, c, schema.find((f) => f.key === c.key)));
 
+/* El criterio completo de una tabla: buscador, estado de lead y filtros. Es
+   lo que guarda una vista y lo que define a una lista activa. */
+const cumpleCriterio = (r, { q, status, filtros }, schema) => {
+  const nq = norm(q);
+  if (nq && !norm(Object.values(r.props).join(" ")).includes(nq)) return false;
+  if (status && r.props.leadStatus !== status) return false;
+  return !(filtros || []).length || cumpleFiltros(r, filtros, schema);
+};
+
+/* Quién está hoy en una lista. La activa se recalcula con cada cambio en las
+   fichas; la fija sólo pierde a quien se haya borrado del CRM. */
+function miembrosDeLista(db, lista) {
+  const coll = lista.kind === "contact" ? db.contacts : db.companies;
+  if (lista.tipo === "fija") {
+    const ids = new Set(lista.ids || []);
+    return coll.filter((r) => ids.has(r.id));
+  }
+  const schema = db.schema[lista.kind];
+  return coll.filter((r) => cumpleCriterio(r, lista, schema));
+}
+
+/* Un botón que abre opciones debajo. Se cierra al elegir o al pinchar fuera. */
+function Menu({ label, Icon = ChevronDown, items, variant = "outline", size = "sm" }) {
+  const [abierto, setAbierto] = useState(false);
+  const caja = useRef(null);
+  useEffect(() => {
+    if (!abierto) return;
+    const fuera = (e) => { if (caja.current && !caja.current.contains(e.target)) setAbierto(false); };
+    document.addEventListener("mousedown", fuera);
+    return () => document.removeEventListener("mousedown", fuera);
+  }, [abierto]);
+  const visibles = items.filter(Boolean);
+  return (
+    <div ref={caja} style={{ position: "relative" }}>
+      <Btn size={size} variant={variant} Icon={Icon} onClick={() => setAbierto((v) => !v)}>{label}</Btn>
+      {abierto && (
+        <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 4, zIndex: 30, minWidth: 240, boxShadow: "0 12px 30px rgba(19,28,26,.14)" }}>
+          {visibles.map((it, i) => it.titulo ? (
+            <div key={i} style={{ padding: "6px 9px 3px", fontFamily: "var(--ui)", fontSize: 10.5, fontWeight: 600, color: C.faint, letterSpacing: ".05em", textTransform: "uppercase" }}>{it.titulo}</div>
+          ) : (
+            <button key={i} type="button" className="crm-btn" disabled={it.disabled}
+              onClick={() => { setAbierto(false); it.onClick(); }}
+              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left", border: "none", background: "transparent", borderRadius: 5, padding: "7px 9px", fontFamily: "var(--ui)", fontSize: 12.5, color: it.danger ? C.clay : C.ink, cursor: it.disabled ? "not-allowed" : "pointer", opacity: it.disabled ? 0.45 : 1 }}>
+              {it.Icon && <it.Icon size={13} />}<span style={{ flex: 1 }}>{it.label}</span>
+              {it.extra && <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.faint }}>{it.extra}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Pide un nombre antes de guardar algo: una vista, una lista. */
+function NombreModal({ titulo, subtitulo, inicial = "", accion = "Guardar", onClose, onOk }) {
+  const [nombre, setNombre] = useState(inicial);
+  const ok = () => { if (nombre.trim()) onOk(nombre.trim()); };
+  return (
+    <Modal title={titulo} subtitle={subtitulo} onClose={onClose}
+      footer={<><Btn variant="outline" onClick={onClose}>Cancelar</Btn>
+        <Btn variant="solid" Icon={Check} disabled={!nombre.trim()} onClick={ok}>{accion}</Btn></>}>
+      <label style={{ display: "block" }}>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5 }}>Nombre</div>
+        <input className="crm-in" autoFocus value={nombre} onChange={(e) => setNombre(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") ok(); }} style={inputStyle} />
+      </label>
+    </Modal>
+  );
+}
+
 /* `enLinea` los acomoda uno al lado del otro, para la barra de una tabla
    ancha; si no, van apilados, como en la columna del envío. */
 function FiltrosPropiedad({ schema, rows, filtros, setFiltros, enLinea }) {
@@ -5858,7 +6140,7 @@ function FiltrosPropiedad({ schema, rows, filtros, setFiltros, enLinea }) {
   );
 }
 
-function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
+function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne }) {
   const integ = db.integrations;
   const gmail = useGmail();
   const templates = db.templates[channel];
@@ -5882,7 +6164,10 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
 
   /* Quien recibe. La lista llega marcada entera —lo normal es escribirle a
      todos los que se traian seleccionados— y quitar a alguien es un clic. */
-  const [chosen, setChosen] = useState(() => new Set(ids));
+  const [chosen, setChosen] = useState(() => {
+    const l = listaId && (db.listas || []).find((x) => x.id === listaId);
+    return new Set(l ? miembrosDeLista(db, l).map((r) => r.id) : ids);
+  });
   /* Un identificador por apertura del modal: todo lo que salga desde aquí es
      el mismo envío, aunque se mande en dos tandas o uno por uno. */
   const [lote] = useState(() => uid());
@@ -5891,10 +6176,22 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
 
   const coll = kind === "contact" ? db.contacts : db.companies;
   const schema = db.schema[kind];
+  /* A quién se le escribe: lo que se traía marcado o una lista guardada. La
+     lista se lee al momento: una activa trae a quien la cumpla hoy. */
+  const listas = (db.listas || []).filter((l) => l.kind === kind);
+  const [origen, setOrigen] = useState(() => (listaId && listas.some((l) => l.id === listaId) ? listaId : ""));
+  const listaOrigen = origen ? listas.find((l) => l.id === origen) || null : null;
   const candidatos = useMemo(() => {
+    if (listaOrigen) return miembrosDeLista(db, listaOrigen);
     const marcados = new Set(ids);
     return coll.filter((r) => marcados.has(r.id));
-  }, [coll, ids]);
+  }, [coll, ids, listaOrigen, db.schema]);
+  /* Al cambiar de origen se marca a todos los del nuevo grupo. */
+  const primerOrigen = useRef(true);
+  useEffect(() => {
+    if (primerOrigen.current) { primerOrigen.current = false; return; }
+    setChosen(new Set(candidatos.map((r) => r.id)));
+  }, [origen]);
   /* Los filtros acotan; las casillas afinan dentro de lo que queda. Quien no
      cumple no recibe aunque siga marcado, y vuelve a contar en cuanto se
      quita el filtro que lo dejaba fuera. */
@@ -6216,6 +6513,19 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
               )}
             </div>
           </div>
+          {(listas.length > 0 || listaOrigen) && (
+            <label style={{ display: "block", marginTop: 12 }}>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5 }}>ENVIAR A</div>
+              <select className="crm-in" value={origen} disabled={busy} onChange={(e) => setOrigen(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }}>
+                <option value="">
+                  {ids.length === coll.length ? `Todos los ${OBJ[kind].plural.toLowerCase()} (${ids.length})` : `Los ${ids.length} que traías seleccionados`}
+                </option>
+                {listas.map((l) => (
+                  <option key={l.id} value={l.id}>Lista {l.tipo}: {l.nombre} ({miembrosDeLista(db, l).length})</option>
+                ))}
+              </select>
+            </label>
+          )}
           <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute }}>
               DESTINATARIOS · {recipients.length} de {coinciden.length}
