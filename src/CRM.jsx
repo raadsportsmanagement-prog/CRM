@@ -6,7 +6,7 @@ import {
   Code2, Paperclip, Inbox, RefreshCw, CornerDownLeft, ArrowDownLeft, User,
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
-  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw
+  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -1411,7 +1411,7 @@ export default function CRM() {
           )}
           {view === "deal" && <DealsView db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord("deal", id, { stage, lastActivityAt: nowISO() }); say(`Negocio movido a ${stage}`); }} />}
           {view === "activities" && (
-            <ActivitiesView db={db} setModal={setModal} say={say}
+            <ActivitiesView db={db} setModal={setModal} setDetail={setDetail} say={say}
               onImport={importActivities} onBuzon={marcarBuzon} onEventos={aplicarEventos} onRebotes={aplicarRebotes}
               onLeerBandeja={activarLectura} onLeads={importarLeads} />
           )}
@@ -1502,12 +1502,16 @@ export default function CRM() {
             /* Sólo si lo hay: un campo vacío en cada actividad ocuparía sitio en
                el almacenamiento y haría creer que el envío se midió. */
             ...(payload.trk ? { trk: payload.trk } : {}),
+            /* La tanda a la que pertenece y cuántos se habían marcado: con eso
+               Actividades junta el envío y sabe a cuántos se le quiso escribir,
+               no sólo a cuántos salió. */
+            ...(payload.lote ? { lote: payload.lote, loteSel: payload.sel } : {}),
             ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }),
           })}
           onSend={(payload) => {
             /* Se registra sólo en los que quedaron marcados en el modal. */
             const dest = payload.ids || modal.ids;
-            dest.forEach((id) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) }));
+            dest.forEach((id) => logActivity({ type: modal.channel, subject: payload.subject, body: payload.body, ...(payload.lote ? { lote: payload.lote, loteSel: payload.sel } : {}), ...(modal.objKind === "contact" ? { contactIds: [id] } : { companyIds: [id] }) }));
             setModal(null);
             say(`Envío registrado en ${dest.length} registro(s)`);
           }} />
@@ -2066,11 +2070,289 @@ const DetalleEnvio = ({ a }) => {
 
 const porcentaje = (parte, total) => (total ? `${Math.round((parte / total) * 100)}% de ${total}` : "—");
 
+/* ── Envíos masivos ──
+   Un masivo deja una actividad por persona, y en la lista eso se lee como
+   doscientas filas iguales. Aquí se vuelven a juntar en lo que fueron: un
+   envío, con sus cifras arriba y la gente debajo.
+
+   Lo que sale desde ahora lleva `lote`, que lo dice sin adivinar. Lo de antes
+   no lo tiene, y se junta por parecido: mismo canal, mismo asunto y sin más de
+   seis horas de silencio entre uno y el siguiente. Sólo cuentan los que anotó
+   el CRM al enviar —sin `ext`—: las copias que el barrido trae de "Enviados"
+   en Gmail son el mismo correo visto otra vez y lo contarían doble. */
+const HUECO_LOTE = 6 * 3600 * 1000;
+const VENTANA_WA = 7 * 24 * 3600 * 1000;
+const sinPrefijo = (s) => String(s || "").replace(/^(\s*(re|rv|res|fw|fwd|reenviado)\s*:\s*)+/i, "");
+
+function agruparEnvios(db) {
+  const salidas = db.activities
+    .filter((a) => a.dir === "out" && !a.ext && (a.type === "email" || a.type === "whatsapp"))
+    .sort((a, b) => (a.at < b.at ? -1 : 1));
+
+  const grupos = new Map();
+  const abiertos = new Map();
+  for (const a of salidas) {
+    let clave = a.lote ? `lote:${a.lote}` : "";
+    if (!clave) {
+      const tema = `${a.type}:${norm(a.subject)}`;
+      const g = abiertos.get(tema);
+      if (g && Date.parse(a.at) - Date.parse(g.ultimo) <= HUECO_LOTE) clave = g.clave;
+      else { clave = `viejo:${tema}:${a.at}`; abiertos.set(tema, { clave, ultimo: a.at }); }
+      abiertos.get(tema).ultimo = a.at;
+    }
+    if (!grupos.has(clave)) grupos.set(clave, []);
+    grupos.get(clave).push(a);
+  }
+
+  /* Las respuestas, por ficha: lo que llegó por el mismo canal. Los avisos de
+     rebote también entran como recibidos y no son una respuesta de nadie. */
+  const recibidos = new Map();
+  for (const a of db.activities) {
+    if (a.dir !== "in" || (a.type !== "email" && a.type !== "whatsapp")) continue;
+    if (String(a.ext || "").startsWith("rebote:")) continue;
+    [...(a.contactIds || []), ...(a.companyIds || [])].forEach((id) => {
+      if (!recibidos.has(id)) recibidos.set(id, []);
+      recibidos.get(id).push(a);
+    });
+  }
+  /* Una respuesta por correo se reconoce por el asunto —"Re: " más el que
+     salió—: así una conversación aparte con la misma persona no se apunta a
+     esta campaña. Por WhatsApp no hay asunto, y vale lo que conteste en la
+     semana siguiente. */
+  const respuestaA = (a) => {
+    const ids = [...(a.contactIds || []), ...(a.companyIds || [])];
+    const tema = norm(a.subject);
+    let mejor = null;
+    for (const id of ids) for (const r of recibidos.get(id) || []) {
+      if (r.type !== a.type || r.at <= a.at) continue;
+      if (a.type === "email" ? norm(sinPrefijo(r.subject)) !== tema : Date.parse(r.at) - Date.parse(a.at) > VENTANA_WA) continue;
+      if (!mejor || r.at < mejor.at) mejor = r;
+    }
+    return mejor;
+  };
+
+  const porId = { contact: new Map(db.contacts.map((r) => [r.id, r])), company: new Map(db.companies.map((r) => [r.id, r])) };
+  const envios = [];
+  for (const [id, acts] of grupos) {
+    const ultimoSel = [...acts].reverse().find((a) => a.loteSel);
+    /* Uno solo no es un masivo: es el correo que se le mandó a alguien desde
+       su ficha, y ya se ve en la lista de siempre. */
+    if (acts.length < 2 && !(ultimoSel && ultimoSel.loteSel > 1)) continue;
+
+    const filas = acts.map((a) => {
+      const kind = (a.contactIds || []).length ? "contact" : "company";
+      const recId = (kind === "contact" ? a.contactIds : a.companyIds || [])[0];
+      const rec = porId[kind].get(recId);
+      const e = estadoDe(a);
+      return {
+        a, kind, recId, rec,
+        nombre: rec ? titleOf(kind, rec) : "Registro borrado",
+        dest: rec ? (a.type === "email" ? rec.props.email : rec.props.phone) || "" : "",
+        e,
+        rebote: Boolean(e.rebote && e.rebote.permanente),
+        respuesta: respuestaA(a),
+      };
+    });
+    const enviados = filas.length;
+    const rebotes = filas.filter((f) => f.rebote).length;
+    envios.push({
+      id, type: acts[0].type,
+      subject: acts[0].subject,
+      at: acts[0].at, hasta: acts[acts.length - 1].at,
+      filas,
+      sel: ultimoSel ? Math.max(ultimoSel.loteSel, enviados) : null,
+      enviados,
+      recibieron: enviados - rebotes,
+      rebotes,
+      medidos: filas.filter((f) => f.e.medido).length,
+      abiertos: filas.filter((f) => f.e.abiertoAt).length,
+      clics: filas.filter((f) => f.e.clics).length,
+      respuestas: filas.filter((f) => f.respuesta).length,
+    });
+  }
+  return envios.sort((a, b) => (a.at < b.at ? 1 : -1));
+}
+
+const Cifra = ({ label, valor, sub, color, Icon, compacta }) => (
+  <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: compacta ? "8px 12px" : "10px 14px", flex: "1 1 130px", minWidth: compacta ? 110 : 140 }}>
+    <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, fontWeight: 500, display: "flex", alignItems: "center", gap: 5 }}>
+      {Icon && <Icon size={12} color={color || C.mute} />}{label}
+    </div>
+    <div style={{ fontFamily: "var(--display)", fontSize: compacta ? 20 : 24, fontWeight: 600, letterSpacing: "-.02em", marginTop: 2, color: color || C.ink }}>{valor}</div>
+    <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, marginTop: 2, letterSpacing: ".04em" }}>{sub || " "}</div>
+  </div>
+);
+
+/* Las cinco cifras de un envío, en el mismo orden en la lista y en el detalle.
+   Clic y rebote sólo existen en el correo: en WhatsApp se dice que no se mide
+   en vez de poner un cero que parecería un resultado. */
+const CifrasEnvio = ({ v, compacta }) => {
+  const correo = v.type === "email";
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <Cifra compacta={compacta} Icon={Users} label="Seleccionados" valor={v.sel ?? v.enviados}
+        sub={v.sel == null ? "envío anterior al registro" : v.sel > v.enviados ? `${v.enviados} enviados` : "todos enviados"} />
+      <Cifra compacta={compacta} Icon={MailCheck} label="Recibieron" valor={correo ? v.recibieron : v.enviados} color={C.jade}
+        sub={correo ? porcentaje(v.recibieron, v.enviados) : "enviados"} />
+      <Cifra compacta={compacta} Icon={MailX} label="Rebotaron" valor={correo ? v.rebotes : "—"} color={correo && v.rebotes ? C.clay : C.ink}
+        sub={correo ? porcentaje(v.rebotes, v.enviados) : "no aplica"} />
+      <Cifra compacta={compacta} Icon={MousePointerClick} label="Dieron clic" valor={correo && v.medidos ? v.clics : "—"} color={C.plum}
+        sub={!correo ? "no aplica" : v.medidos ? porcentaje(v.clics, v.medidos) : "sin medición"} />
+      <Cifra compacta={compacta} Icon={Reply} label="Respondieron" valor={v.respuestas} color={C.blue}
+        sub={porcentaje(v.respuestas, correo ? v.recibieron : v.enviados)} />
+    </div>
+  );
+};
+
+function EnviosLista({ envios, onAbrir }) {
+  if (!envios.length) {
+    return <Empty title="Todavía no hay envíos masivos"
+      hint="Cuando mandes un correo o un WhatsApp masivo aparecerá aquí, con quién lo recibió, quién pinchó y quién contestó." />;
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {envios.map((v) => {
+        const ch = CHANNEL[v.type];
+        return (
+          <button key={v.id} onClick={() => onAbrir(v.id)} className="crm-btn"
+            style={{ textAlign: "left", background: "#F6F8F4", border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px", cursor: "pointer", display: "block", width: "100%" }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
+              <div style={{ width: 30, height: 30, borderRadius: 7, background: ch.soft, display: "grid", placeItems: "center", flexShrink: 0 }}><ch.Icon size={14} color={ch.color} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontFamily: "var(--ui)", fontSize: 14, fontWeight: 600, color: C.ink }}>{v.subject}</span>
+                  <Pill color={ch.color} soft={ch.soft}>{ch.label} masivo</Pill>
+                </div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.faint, marginTop: 2 }}>{fmt(v.at)}</div>
+              </div>
+              <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.jade, fontWeight: 600, display: "flex", alignItems: "center", gap: 2, whiteSpace: "nowrap" }}>
+                Ver uno a uno <ChevronRight size={14} />
+              </span>
+            </div>
+            <CifrasEnvio v={v} compacta />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EnvioDetalle({ v, onVolver, setDetail }) {
+  const [f, setF] = useState("todos");
+  const correo = v.type === "email";
+  const FILTROS = [
+    ["todos", `Todos · ${v.enviados}`],
+    ...(correo ? [["recibieron", `Recibieron · ${v.recibieron}`], ["rebote", `Rebotaron · ${v.rebotes}`], ["clic", `Con clic · ${v.clics}`]] : []),
+    ["respuesta", `Respondieron · ${v.respuestas}`],
+    ["sin", `Sin respuesta · ${v.enviados - v.respuestas}`],
+  ];
+  const pasa = (x) => f === "todos" ? true
+    : f === "recibieron" ? !x.rebote
+    : f === "rebote" ? x.rebote
+    : f === "clic" ? x.e.clics > 0
+    : f === "respuesta" ? Boolean(x.respuesta)
+    : !x.respuesta;
+  const filas = [...v.filas].sort((a, b) => a.nombre.localeCompare(b.nombre, "es")).filter(pasa);
+  const th = { textAlign: "left", fontFamily: "var(--mono)", fontSize: 10, letterSpacing: ".06em", textTransform: "uppercase", color: C.faint, fontWeight: 500, padding: "8px 10px", borderBottom: `1px solid ${C.line}`, whiteSpace: "nowrap" };
+  const td = { fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, padding: "10px", borderBottom: "1px solid #EEF1EC", verticalAlign: "top" };
+
+  const estado = (x) => {
+    if (x.e.rebote) return <Pill color={C.clay} soft={C.claySoft}>{x.rebote ? "Rebotó" : "Demorado"}</Pill>;
+    return <Pill color={C.jade} soft={C.jadeSoft}>{correo ? "Recibido" : "Enviado"}</Pill>;
+  };
+
+  return (
+    <div>
+      <button onClick={onVolver} className="crm-btn"
+        style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, marginBottom: 12 }}>
+        <ArrowLeft size={14} /> Todos los envíos
+      </button>
+      <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, color: C.ink, letterSpacing: "-.01em" }}>{v.subject}</div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.faint, margin: "4px 0 14px" }}>
+        {CHANNEL[v.type].label} masivo · {fmt(v.at)}{v.hasta.slice(0, 10) !== v.at.slice(0, 10) ? ` → ${fmt(v.hasta)}` : ""}
+      </div>
+      <CifrasEnvio v={v} />
+      {correo && (
+        <div style={{ marginTop: 8, fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, lineHeight: 1.6, maxWidth: 900 }}>
+          <b>Recibieron</b> son los que salieron y no rebotaron: el servidor del otro lado no lo devolvió. <b>Respondieron</b> cuenta
+          los correos que llegaron con el mismo asunto después del envío; aparecen al pulsar <b>Actualizar estados</b>.
+        </div>
+      )}
+
+      <div style={{ padding: "16px 0 10px", display: "flex", gap: 7, flexWrap: "wrap" }}>
+        {FILTROS.map(([k, l]) => (
+          <button key={k} onClick={() => setF(k)} className="crm-btn"
+            style={{ border: `1px solid ${f === k ? C.jade : C.line}`, background: f === k ? C.jade : C.panel, color: f === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>{l}</button>
+        ))}
+      </div>
+
+      <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+          <thead>
+            <tr>
+              <th style={th}>Contacto</th>
+              <th style={th}>{correo ? "Correo" : "Teléfono"}</th>
+              <th style={th}>Entrega</th>
+              {correo && <th style={th}>Apertura</th>}
+              {correo && <th style={th}>Clics</th>}
+              <th style={th}>Respuesta</th>
+              <th style={th}>Enviado</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filas.map((x) => (
+              <tr key={x.a.id}>
+                <td style={td}>
+                  {x.rec
+                    ? <button onClick={() => setDetail({ kind: x.kind, id: x.recId })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, textAlign: "left" }}>{x.nombre}</button>
+                    : <span style={{ color: C.faint }}>{x.nombre}</span>}
+                </td>
+                <td style={{ ...td, overflowWrap: "anywhere" }}>{x.dest || "—"}</td>
+                <td style={td}>
+                  {estado(x)}
+                  {x.e.rebote && <div style={{ fontSize: 11, color: C.clay, marginTop: 4, maxWidth: 220 }}>{String(x.e.rebote.motivo || "").split("\n")[0]}</div>}
+                </td>
+                {correo && (
+                  <td style={td}>
+                    {x.e.abiertoAt ? fmt(x.e.abiertoAt) : x.e.soloPrecarga ? "Dudosa" : x.e.medido ? "Sin abrir" : "—"}
+                  </td>
+                )}
+                {correo && (
+                  <td style={td}>
+                    {x.e.clics ? <span style={{ color: C.plum, fontWeight: 600 }}>{x.e.clics}</span> : x.e.medido ? "0" : "—"}
+                    {x.e.enlaces.slice(0, 2).map((u) => <div key={u} style={{ fontSize: 11, color: C.plum, overflowWrap: "anywhere", maxWidth: 220 }}>{u}</div>)}
+                  </td>
+                )}
+                <td style={td}>
+                  {x.respuesta
+                    ? <>
+                        <div style={{ color: C.blue, fontWeight: 600 }}>{fmt(x.respuesta.at)}</div>
+                        {x.respuesta.body && <div style={{ fontSize: 11.5, marginTop: 3, maxWidth: 280, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{x.respuesta.body}</div>}
+                      </>
+                    : "—"}
+                </td>
+                <td style={{ ...td, fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "nowrap" }}>{fmt(x.a.at)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {filas.length === 0 && <Empty title="Nadie en este filtro" hint="Prueba con otro, o pulsa “Actualizar estados” para traer lo último." />}
+      </div>
+    </div>
+  );
+}
+
 /* ────────────────────────────────────────────────────────────
    Actividades
    ──────────────────────────────────────────────────────────── */
-function ActivitiesView({ db, setModal, say, onImport, onBuzon, onEventos, onRebotes, onLeerBandeja, onLeads }) {
+function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEventos, onRebotes, onLeerBandeja, onLeads }) {
   const [f, setF] = useState("all");
+  /* Se abre en los envíos: lo primero que se quiere saber de un masivo es cómo
+     le fue, no repasar doscientas filas iguales. */
+  const [modo, setModo] = useState("envios");
+  const [envioAbierto, setEnvioAbierto] = useState(null);
+  const envios = useMemo(() => agruparEnvios(db), [db.activities, db.contacts, db.companies]);
+  const envio = envioAbierto ? envios.find((v) => v.id === envioAbierto) : null;
   const [sync, setSync] = useState({ busy: false, nota: "", err: "" });
   const mide = midiendo(db.integrations.medicion);
 
@@ -2113,16 +2395,6 @@ function ActivitiesView({ db, setModal, say, onImport, onBuzon, onEventos, onReb
   };
   const list = db.activities.filter(pasa);
 
-  const Cifra = ({ label, valor, sub, color, Icon }) => (
-    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 14px", flex: "1 1 150px", minWidth: 140 }}>
-      <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, fontWeight: 500, display: "flex", alignItems: "center", gap: 5 }}>
-        {Icon && <Icon size={12} color={color || C.mute} />}{label}
-      </div>
-      <div style={{ fontFamily: "var(--display)", fontSize: 24, fontWeight: 600, letterSpacing: "-.02em", marginTop: 2, color: color || C.ink }}>{valor}</div>
-      <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, marginTop: 2, letterSpacing: ".04em" }}>{sub || " "}</div>
-    </div>
-  );
-
   return (
     <div>
       <Header eyebrow={`${db.activities.length} registradas`} title="Actividades"
@@ -2140,6 +2412,22 @@ function ActivitiesView({ db, setModal, say, onImport, onBuzon, onEventos, onReb
         </div>
       )}
 
+      <div style={{ padding: "12px 28px 0", display: "flex", gap: 22, borderBottom: `1px solid ${C.line}` }}>
+        {[["envios", `Envíos masivos · ${envios.length}`], ["todas", "Todas las actividades"]].map(([k, l]) => (
+          <button key={k} onClick={() => { setModo(k); setEnvioAbierto(null); }} className="crm-btn"
+            style={{ background: "none", border: "none", borderBottom: `2px solid ${modo === k ? C.jade : "transparent"}`, padding: "6px 0 9px", marginBottom: -1, cursor: "pointer", fontFamily: "var(--ui)", fontSize: 13, fontWeight: modo === k ? 600 : 500, color: modo === k ? C.ink : C.mute }}>{l}</button>
+        ))}
+      </div>
+
+      {modo === "envios" && (
+        <div style={{ padding: "18px 28px 40px" }}>
+          {envio
+            ? <EnvioDetalle key={envio.id} v={envio} onVolver={() => setEnvioAbierto(null)} setDetail={setDetail} />
+            : <EnviosLista envios={envios} onAbrir={setEnvioAbierto} />}
+        </div>
+      )}
+
+      {modo === "todas" && <>
       {hayCifras && (
         <div style={{ padding: "16px 28px 4px", display: "flex", gap: 10, flexWrap: "wrap" }}>
           <Cifra Icon={Mail} label="Correos enviados" valor={enviados.length} sub={medidos.length < enviados.length ? `${medidos.length} con medición` : "todos medidos"} />
@@ -2197,6 +2485,7 @@ function ActivitiesView({ db, setModal, say, onImport, onBuzon, onEventos, onReb
                 : "Envía una plantilla o registra una llamada desde un contacto."} />
         )}
       </div>
+      </>}
     </div>
   );
 }
@@ -5403,6 +5692,9 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   /* Quien recibe. La lista llega marcada entera —lo normal es escribirle a
      todos los que se traian seleccionados— y quitar a alguien es un clic. */
   const [chosen, setChosen] = useState(() => new Set(ids));
+  /* Un identificador por apertura del modal: todo lo que salga desde aquí es
+     el mismo envío, aunque se mande en dos tandas o uno por uno. */
+  const [lote] = useState(() => uid());
   const [buscar, setBuscar] = useState("");
 
   const coll = kind === "contact" ? db.contacts : db.companies;
@@ -5479,7 +5771,7 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   };
 
   const marcar = (r, trk) => {
-    onLogOne(r.id, { subject: asuntoLog(r), body: cuerpoDe(r), trk });
+    onLogOne(r.id, { subject: asuntoLog(r), body: cuerpoDe(r), trk, lote, sel: recipients.length });
     setDone((s) => new Set(s).add(r.id));
   };
 
@@ -5650,7 +5942,7 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
       footer={<><Btn variant="outline" onClick={onClose}>{done.size ? "Cerrar" : "Cancelar"}</Btn>
         <Btn variant="outline" Icon={Copy} disabled={sinTexto} onClick={copyAll}>{copied || "Copiar textos"}</Btn>
         <Btn variant="outline" Icon={Check} disabled={sinTexto}
-          onClick={() => onSend({ subject: t ? `Plantilla: ${t.name}` : esCorreo ? subject || "Correo de marketing" : "Mensaje de WhatsApp", body: body.trim() || (conHtml ? htmlToText(html) : body), ids: recipients.map((r) => r.id) })}>
+          onClick={() => onSend({ subject: t ? `Plantilla: ${t.name}` : esCorreo ? subject || "Correo de marketing" : "Mensaje de WhatsApp", body: body.trim() || (conHtml ? htmlToText(html) : body), ids: recipients.map((r) => r.id), lote, sel: recipients.length })}>
           Registrar sin enviar</Btn>
         {principal()}</>}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
