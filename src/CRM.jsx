@@ -4782,6 +4782,20 @@ function SettingsView({ db, setDb, setModal, say }) {
     setDb((d) => ({ ...d, schema: { ...d.schema, [objKind]: d.schema[objKind].filter((f) => f.key !== key) } }));
     say("Propiedad eliminada");
   };
+  /* Renombrar sólo cambia el nombre que se ve: la clave interna sigue igual,
+     así que los datos ya guardados en esa propiedad no se tocan. */
+  const [editando, setEditando] = useState(null);
+  const [nombre, setNombre] = useState("");
+  const renombrar = () => {
+    if (!editando) return;
+    const nuevo = nombre.trim();
+    const { objKind, key } = editando;
+    setEditando(null);
+    const antes = db.schema[objKind].find((f) => f.key === key);
+    if (!nuevo || !antes || nuevo === antes.label) return;
+    setDb((d) => ({ ...d, schema: { ...d.schema, [objKind]: d.schema[objKind].map((f) => f.key === key ? { ...f, label: nuevo } : f) } }));
+    say("Propiedad renombrada");
+  };
   return (
     <div>
       <Header eyebrow="Ajustes" title="Propiedades y datos" />
@@ -4796,9 +4810,17 @@ function SettingsView({ db, setDb, setModal, say }) {
               {db.schema[k].map((f) => (
                 <div key={f.key} style={{ border: `1px solid ${C.line}`, borderRadius: 7, padding: "8px 11px", display: "flex", alignItems: "center", gap: 9, background: f.system ? "#F7F9F5" : C.jadeSoft }}>
                   <div>
-                    <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600 }}>{f.label}</div>
+                    {editando?.objKind === k && editando.key === f.key ? (
+                      <input className="crm-in" autoFocus value={nombre} onChange={(e) => setNombre(e.target.value)}
+                        onBlur={renombrar}
+                        onKeyDown={(e) => { if (e.key === "Enter") renombrar(); if (e.key === "Escape") setEditando(null); }}
+                        style={{ ...inputStyle, padding: "3px 6px", fontSize: 12.5, fontWeight: 600, minWidth: 180 }} />
+                    ) : (
+                      <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600 }}>{f.label}</div>
+                    )}
                     <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{f.key} · {f.type}{f.system ? " · sistema" : ""}</div>
                   </div>
+                  <button title="Cambiar nombre" onMouseDown={(e) => e.preventDefault()} onClick={() => { setEditando({ objKind: k, key: f.key }); setNombre(f.label); }} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.mute, padding: 2 }}><Pencil size={13} /></button>
                   {!f.system && <button onClick={() => removeProp(k, f.key)} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.clay, padding: 2 }}><Trash2 size={13} /></button>}
                 </div>
               ))}
