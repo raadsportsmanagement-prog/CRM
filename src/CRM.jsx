@@ -6,7 +6,7 @@ import {
   Code2, Paperclip, Inbox, RefreshCw, CornerDownLeft, ArrowDownLeft, User,
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
-  Megaphone, UserPlus, ArrowUp, ArrowDown
+  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -244,7 +244,40 @@ const emptyDb = () => ({
   autoCola: [],
   autoLog: [],
   autoMarcas: {},
+  /* Propiedades borradas: salen del esquema al instante pero sus datos se
+     guardan PAPELERA_DIAS días por si fue un error. */
+  papelera: { contact: [], company: [], deal: [] },
 });
+
+const PAPELERA_DIAS = 15;
+const COLECCION = { contact: "contacts", company: "companies", deal: "deals" };
+
+/* Vencido el plazo, la propiedad se borra de verdad: sale de la papelera y su
+   valor se quita de cada registro. Antes de eso no se toca ningún dato. */
+function vaciarPapelera(db, ahora = Date.now()) {
+  const plazo = PAPELERA_DIAS * 864e5;
+  let n = 0;
+  let out = db;
+  for (const k of Object.keys(COLECCION)) {
+    const lista = db.papelera[k] || [];
+    const vencidas = lista.filter((f) => ahora - Date.parse(f.borradaEn) >= plazo);
+    if (!vencidas.length) continue;
+    n += vencidas.length;
+    const claves = new Set(vencidas.map((f) => f.key));
+    const col = COLECCION[k];
+    out = {
+      ...out,
+      papelera: { ...out.papelera, [k]: lista.filter((f) => !claves.has(f.key)) },
+      [col]: out[col].map((r) => {
+        if (!r.props || !Object.keys(r.props).some((x) => claves.has(x))) return r;
+        const props = { ...r.props };
+        claves.forEach((x) => { delete props[x]; });
+        return { ...r, props };
+      }),
+    };
+  }
+  return { db: out, n };
+}
 
 /* Completa las claves que falten sin descartar nada de lo guardado: si el
    archivo llega incompleto se rellena, en vez de arrancar de cero encima. */
@@ -295,6 +328,11 @@ function normalizeDb(raw) {
          "nunca", y entonces se piden los 90 días que Meta todavía conserva. */
       leadsAl: String((d.buzon && d.buzon.leadsAl) || ""),
       vistoEn: (d.buzon && typeof d.buzon.vistoEn === "object" && d.buzon.vistoEn) || {},
+    },
+    papelera: {
+      contact: arr(d.papelera && d.papelera.contact),
+      company: arr(d.papelera && d.papelera.company),
+      deal: arr(d.papelera && d.papelera.deal),
     },
     automations: normalizeAutomations(d.automations),
     autoCola: normalizeCola(d.autoCola),
@@ -562,9 +600,12 @@ export default function CRM() {
         if (cleaned > 0 && raw) { try { await window.storage.set(BACKUP_KEY, raw); } catch (_) {} }
         next = { ...res.db, demoPurgedAt: nowISO() };
       }
+      const vencidas = vaciarPapelera(next);
+      next = vencidas.db;
       if (!live) return;
       dbRef.current = next;
       setDb(next);
+      if (vencidas.n > 0) say(`Se borraron definitivamente ${vencidas.n} propiedad(es) que llevaban ${PAPELERA_DIAS} días en la papelera`);
       if (cleaned > 0) say(`Se eliminaron ${cleaned} elementos de demostración`);
     })();
     return () => { live = false; };
@@ -4778,10 +4819,43 @@ function SettingsView({ db, setDb, setModal, say }) {
     }
   };
 
-  const removeProp = (objKind, key) => {
-    setDb((d) => ({ ...d, schema: { ...d.schema, [objKind]: d.schema[objKind].filter((f) => f.key !== key) } }));
-    say("Propiedad eliminada");
+  /* Borrar pide confirmación y no destruye nada: la propiedad pasa a la
+     papelera con sus datos intactos, y se puede devolver a su lugar durante
+     PAPELERA_DIAS días. */
+  const [borrando, setBorrando] = useState(null);
+  const conDatos = useMemo(() => {
+    if (!borrando) return 0;
+    return db[COLECCION[borrando.objKind]].filter((r) => String(r.props?.[borrando.f.key] ?? "").trim()).length;
+  }, [borrando, db]);
+  const removeProp = () => {
+    const { objKind, f } = borrando;
+    setBorrando(null);
+    setDb((d) => {
+      const pos = d.schema[objKind].findIndex((x) => x.key === f.key);
+      if (pos < 0) return d;
+      return {
+        ...d,
+        schema: { ...d.schema, [objKind]: d.schema[objKind].filter((x) => x.key !== f.key) },
+        papelera: { ...d.papelera, [objKind]: [...d.papelera[objKind], { ...f, pos, borradaEn: nowISO() }] },
+      };
+    });
+    say(`"${f.label}" se movió a la papelera`);
   };
+  const restaurar = (objKind, f) => {
+    const { pos, borradaEn, ...def } = f;
+    setDb((d) => {
+      const sch = d.schema[objKind].filter((x) => x.key !== def.key);
+      const en = Math.min(pos ?? sch.length, sch.length);
+      return {
+        ...d,
+        schema: { ...d.schema, [objKind]: [...sch.slice(0, en), def, ...sch.slice(en)] },
+        papelera: { ...d.papelera, [objKind]: d.papelera[objKind].filter((x) => x.key !== def.key) },
+      };
+    });
+    say(`"${def.label}" restaurada`);
+  };
+  const enPapelera = Object.keys(OBJ).flatMap((k) => (db.papelera[k] || []).map((f) => ({ k, f })));
+  const diasRestantes = (f) => Math.max(0, Math.ceil((Date.parse(f.borradaEn) + PAPELERA_DIAS * 864e5 - Date.now()) / 864e5));
   /* Renombrar sólo cambia el nombre que se ve: la clave interna sigue igual,
      así que los datos ya guardados en esa propiedad no se tocan. */
   const [editando, setEditando] = useState(null);
@@ -4821,12 +4895,54 @@ function SettingsView({ db, setDb, setModal, say }) {
                     <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{f.key} · {f.type}{f.system ? " · sistema" : ""}</div>
                   </div>
                   <button title="Cambiar nombre" onMouseDown={(e) => e.preventDefault()} onClick={() => { setEditando({ objKind: k, key: f.key }); setNombre(f.label); }} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.mute, padding: 2 }}><Pencil size={13} /></button>
-                  {!f.system && <button onClick={() => removeProp(k, f.key)} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.clay, padding: 2 }}><Trash2 size={13} /></button>}
+                  {!f.system && <button title="Eliminar" onClick={() => setBorrando({ objKind: k, f })} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.clay, padding: 2 }}><Trash2 size={13} /></button>}
                 </div>
               ))}
             </div>
           </div>
         ))}
+
+        {enPapelera.length > 0 && (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
+            <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Papelera de propiedades</div>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginBottom: 12 }}>
+              Sus datos siguen guardados. Pasados {PAPELERA_DIAS} días desde que se eliminaron, se borran para siempre junto con lo que tenían los registros.
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {enPapelera.map(({ k, f }) => (
+                <div key={k + f.key} style={{ border: `1px dashed ${C.line}`, borderRadius: 7, padding: "8px 11px", display: "flex", alignItems: "center", gap: 12 }}>
+                  <div>
+                    <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, color: C.mute, textDecoration: "line-through" }}>{f.label}</div>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{OBJ[k].plural} · se borra en {diasRestantes(f)} día(s)</div>
+                  </div>
+                  <Btn size="sm" variant="outline" Icon={RotateCcw} onClick={() => restaurar(k, f)}>Restaurar</Btn>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {borrando && (
+          <Modal title={`¿Eliminar la propiedad "${borrando.f.label}"?`}
+            subtitle={`Propiedad de ${OBJ[borrando.objKind].plural.toLowerCase()}`}
+            onClose={() => setBorrando(null)}
+            footer={<>
+              <Btn variant="outline" onClick={() => setBorrando(null)}>Cancelar</Btn>
+              <Btn variant="danger" Icon={Trash2} onClick={removeProp}
+                style={{ background: C.clay, color: "#fff", borderColor: C.clay }}>Sí, eliminar</Btn>
+            </>}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.6 }}>
+              {conDatos > 0
+                ? <>{conDatos} {conDatos === 1 ? "registro tiene" : "registros tienen"} información en esta propiedad.</>
+                : <>Ningún registro tiene información en esta propiedad.</>}
+              <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: C.mute }}>
+                <li>Deja de verse en la tabla, las fichas y los formularios desde ya.</li>
+                <li>Los datos se conservan {PAPELERA_DIAS} días en la papelera y puedes restaurarla en ese tiempo.</li>
+                <li>Pasados los {PAPELERA_DIAS} días se borra para siempre, con todo lo que guardaba.</li>
+              </ul>
+            </div>
+          </Modal>
+        )}
 
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
           <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Datos y respaldo</div>
