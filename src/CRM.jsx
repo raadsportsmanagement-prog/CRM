@@ -6,7 +6,7 @@ import {
   Code2, Paperclip, Inbox, RefreshCw, CornerDownLeft, ArrowDownLeft, User,
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
-  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck
+  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -1682,6 +1682,7 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   const rows = kind === "contact" ? db.contacts : db.companies;
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
+  const [filtros, setFiltros] = useState([]);
   const [sel, setSel] = useState([]);
   /* El orden de las columnas es el orden de esta lista, y se recuerda en este
      navegador para no volver a acomodarlas cada vez que se entra. */
@@ -1718,7 +1719,7 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
       : o.dir === primero ? { key: f.key, dir: primero === "asc" ? "desc" : "asc" } : null);
   };
 
-  useEffect(() => { setSel([]); setQ(""); setOrden(null); }, [kind]);
+  useEffect(() => { setSel([]); setQ(""); setOrden(null); setFiltros([]); }, [kind]);
   // Las propiedades creadas al importar aparecen de inmediato en la tabla,
   // sin volver a mostrar las columnas que el usuario ocultó.
   const known = useRef(new Set(schema.map((f) => f.key)));
@@ -1738,7 +1739,8 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
   const qDiferida = React.useDeferredValue(q);
   const filtered = useMemo(() => {
     const nq = norm(qDiferida);
-    const lista = indice.filter(({ r, hay }) => (!nq || hay.includes(nq)) && (!status || r.props.leadStatus === status)).map((x) => x.r);
+    const lista = indice.filter(({ r, hay }) => (!nq || hay.includes(nq)) && (!status || r.props.leadStatus === status)
+      && (!filtros.length || cumpleFiltros(r, filtros, schema))).map((x) => x.r);
     const f = orden && schema.find((x) => x.key === orden.key);
     if (!f) return lista;
     // Los vacíos quedan siempre al final, en cualquier sentido.
@@ -1756,19 +1758,35 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
       }
       return col.compare(String(a.v), String(b.v)) * signo;
     }).map((x) => x.r);
-  }, [indice, qDiferida, status, orden, schema]);
+  }, [indice, qDiferida, status, filtros, orden, schema]);
 
   /* Se pintan de a 100 filas: dibujar miles de una vez es lo que más pesa, y
      una lista larga no se recorre a ojo, se filtra. Seleccionar todos sigue
      marcando la lista completa, no sólo lo pintado. */
   const [limite, setLimite] = useState(100);
-  useEffect(() => { setLimite(100); }, [kind, qDiferida, status, orden]);
+  useEffect(() => { setLimite(100); }, [kind, qDiferida, status, filtros, orden]);
   const pintados = filtered.length > limite ? filtered.slice(0, limite) : filtered;
   const marcados = useMemo(() => new Set(sel), [sel]);
 
   const shown = cols.map((k) => schema.find((f) => f.key === k)).filter(Boolean);
   const claveTitulo = kind === "contact" ? "firstName" : "name";
-  const allSel = filtered.length > 0 && sel.length === filtered.length;
+  /* La selección vive dentro de lo que se ve: al filtrar o buscar, quien
+     queda fuera deja de estar marcado. Así "Enviar correo" nunca se lleva a
+     alguien que ya no aparece en pantalla. */
+  useEffect(() => {
+    setSel((s) => {
+      if (!s.length) return s;
+      const visibles = new Set(filtered.map((r) => r.id));
+      const quedan = s.filter((id) => visibles.has(id));
+      return quedan.length === s.length ? s : quedan;
+    });
+  }, [filtered]);
+  const allSel = filtered.length > 0 && filtered.every((r) => marcados.has(r.id));
+  const algunos = sel.length > 0 && !allSel;
+  const casillaTodos = useRef(null);
+  useEffect(() => { if (casillaTodos.current) casillaTodos.current.indeterminate = algunos; }, [algunos]);
+  const seleccionarTodos = () => setSel(filtered.map((r) => r.id));
+  const quitarSeleccion = () => setSel([]);
 
   /* Borrar no se deshace desde la app, así que se pregunta antes. Con pocos
      registros basta confirmar; desde 10 hay que escribir ELIMINAR, porque un
@@ -1820,9 +1838,24 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
         <Btn variant="ghost" Icon={Plus} size="sm" onClick={() => setModal({ kind: "prop", objKind: kind })}>Nueva propiedad</Btn>
       </div>
 
+      <div style={{ padding: "10px 28px", borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <FiltrosPropiedad schema={schema} rows={rows} filtros={filtros} setFiltros={setFiltros} enLinea />
+        </div>
+        {filtros.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "var(--ui)", fontSize: 12, color: C.mute, paddingTop: 5 }}>
+            {filtered.length} de {rows.length} cumplen
+            {filtered.length > 0 && !allSel && <Btn size="sm" variant="outline" Icon={Check} onClick={seleccionarTodos}>Seleccionar los {filtered.length}</Btn>}
+            <Btn size="sm" onClick={() => setFiltros([])}>Quitar filtros</Btn>
+          </div>
+        )}
+      </div>
+
       {sel.length > 0 && (
         <div style={{ padding: "10px 28px", background: C.jadeSoft, borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <span style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.jade }}>{sel.length} seleccionados</span>
+          <span style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.jade }}>{sel.length} de {filtered.length} seleccionados</span>
+          {!allSel && <Btn size="sm" onClick={seleccionarTodos}>Seleccionar los {filtered.length}</Btn>}
+          <Btn size="sm" onClick={quitarSeleccion}>Quitar selección</Btn>
           <Btn size="sm" variant="outline" Icon={MessageSquare} onClick={() => setModal({ kind: "send", channel: "whatsapp", objKind: kind, ids: sel })}>Enviar WhatsApp</Btn>
           <Btn size="sm" variant="outline" Icon={Mail} onClick={() => setModal({ kind: "send", channel: "email", objKind: kind, ids: sel })}>Enviar correo</Btn>
           <Btn size="sm" variant="outline" Icon={Briefcase} onClick={() => setModal({ kind: "deal", contactIds: kind === "contact" ? sel : [], companyId: kind === "company" ? sel[0] : undefined, presets: { source: "Manual" } })}>Crear negocio</Btn>
@@ -1841,7 +1874,8 @@ function RecordList({ kind, db, setModal, setDetail, onDelete }) {
             <thead>
               <tr style={{ background: "#F4F6F1", borderBottom: `1px solid ${C.line}` }}>
                 <th style={{ padding: "9px 12px 9px 28px", width: 34 }}>
-                  <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? [] : filtered.map((r) => r.id))} />
+                  <input ref={casillaTodos} type="checkbox" checked={allSel} onChange={() => (allSel ? quitarSeleccion() : seleccionarTodos())}
+                    title={allSel ? "Quitar la selección" : `Seleccionar los ${filtered.length}`} />
                 </th>
                 {shown.map((f) => {
                   const activo = orden?.key === f.key;
@@ -5667,6 +5701,163 @@ function BulkEditModal({ db, objKind, ids, onClose, onApply }) {
 const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
 const PAUSA_ENVIO = 500;
 
+/* ── Filtros por propiedad ──
+   A quién le llega un masivo se decide por lo que dice la ficha: "Tipo es
+   Acudiente", "Institución contiene San José", "creados en los últimos 30
+   días". Todas las condiciones deben cumplirse a la vez; para decir "esto o
+   aquello" en una lista se marcan varios valores en la misma condición. Una
+   condición a medio llenar no filtra: mientras se escribe, la lista no se
+   vacía de golpe. */
+const VACIO_OPS = [["lleno", "tiene valor"], ["vacio", "está vacío"]];
+const OPS_FILTRO = {
+  select: [["en", "es"], ["noen", "no es"], ...VACIO_OPS],
+  numero: [["igual", "es igual a"], ["min", "es al menos"], ["max", "es como máximo"], ...VACIO_OPS],
+  fecha: [["ultimos", "en los últimos… días"], ["desde", "desde el día"], ["hasta", "hasta el día"], ...VACIO_OPS],
+  texto: [["contiene", "contiene"], ["nocontiene", "no contiene"], ["igual", "es exactamente"], ...VACIO_OPS],
+};
+const grupoFiltro = (f) => (f.type === "select" ? "select" : f.type === "number" ? "numero"
+  : f.type === "date" || f.type === "datetime" ? "fecha" : "texto");
+const estaVacio = (v) => v === undefined || v === null || String(v).trim() === "";
+
+/* Una fecha se compara por día en la hora local: una ficha creada a las 9 de
+   la noche del 5 sigue siendo del 5 aunque en UTC ya sea el 6. */
+const diaLocal = (v) => {
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  if (isNaN(d)) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+function cumpleFiltro(r, c, f) {
+  if (!f) return true;
+  const v = r.props[c.key];
+  if (c.op === "lleno") return !estaVacio(v);
+  if (c.op === "vacio") return estaVacio(v);
+  const grupo = grupoFiltro(f);
+  if (grupo === "select") {
+    const vals = c.values || [];
+    if (!vals.length) return true;
+    const esta = vals.includes(estaVacio(v) ? "" : String(v));
+    return c.op === "noen" ? !esta : esta;
+  }
+  const q = String(c.value ?? "").trim();
+  if (!q) return true;
+  if (grupo === "numero") {
+    const n = Number(v), m = Number(q);
+    if (isNaN(m)) return true;
+    if (estaVacio(v) || isNaN(n)) return false;
+    return c.op === "min" ? n >= m : c.op === "max" ? n <= m : n === m;
+  }
+  if (grupo === "fecha") {
+    if (estaVacio(v)) return false;
+    if (c.op === "ultimos") {
+      const dias = Number(q);
+      if (isNaN(dias)) return true;
+      const t = new Date(/^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? `${v}T00:00` : v).getTime();
+      return !isNaN(t) && Date.now() - t <= dias * 86400000;
+    }
+    const dia = diaLocal(v);
+    if (!dia) return false;
+    return c.op === "desde" ? dia >= q : dia <= q;
+  }
+  const hay = norm(v), aguja = norm(q);
+  if (c.op === "igual") return hay === aguja;
+  if (c.op === "nocontiene") return !hay.includes(aguja);
+  return hay.includes(aguja);
+}
+
+const cumpleFiltros = (r, filtros, schema) =>
+  filtros.every((c) => cumpleFiltro(r, c, schema.find((f) => f.key === c.key)));
+
+/* `enLinea` los acomoda uno al lado del otro, para la barra de una tabla
+   ancha; si no, van apilados, como en la columna del envío. */
+function FiltrosPropiedad({ schema, rows, filtros, setFiltros, enLinea }) {
+  /* Los valores que de verdad hay en las fichas, para elegir en vez de
+     adivinar cómo se escribió: en una lista, además de sus opciones, los que
+     llegaron por importación con otra grafía. */
+  const valoresDe = (key) => {
+    const vistos = new Set();
+    for (const r of rows) if (!estaVacio(r.props[key])) vistos.add(String(r.props[key]).trim());
+    return [...vistos].sort((a, b) => a.localeCompare(b, "es"));
+  };
+  const cambiar = (i, parche) => setFiltros((fs) => fs.map((c, j) => (j === i ? { ...c, ...parche } : c)));
+  const quitar = (i) => setFiltros((fs) => fs.filter((_, j) => j !== i));
+  const elegirPropiedad = (i, key) => {
+    const f = schema.find((x) => x.key === key);
+    cambiar(i, { key, op: f ? OPS_FILTRO[grupoFiltro(f)][0][0] : "", value: "", values: [] });
+  };
+  const chico = { ...inputStyle, padding: "5px 8px", fontSize: 12 };
+
+  return (
+    <div style={enLinea
+      ? { display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-start" }
+      : { display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
+      {filtros.map((c, i) => {
+        const f = schema.find((x) => x.key === c.key);
+        const grupo = f && grupoFiltro(f);
+        const pideValor = f && c.op !== "lleno" && c.op !== "vacio";
+        const opciones = grupo === "select" ? [...new Set([...(f.options || []), ...valoresDe(f.key)])] : [];
+        const sugerencias = grupo === "texto" && pideValor ? valoresDe(f.key) : [];
+        const listId = `filtro-${i}-${c.key}`;
+        return (
+          <div key={i} style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: 8, background: "#F8FAF6", display: "flex", flexDirection: "column", gap: 6, ...(enLinea ? { width: 300, maxWidth: "100%" } : {}) }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <select className="crm-in" value={c.key} onChange={(e) => elegirPropiedad(i, e.target.value)} style={{ ...chico, flex: 1 }}>
+                <option value="">Elige una propiedad…</option>
+                {schema.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
+              </select>
+              <button type="button" className="crm-btn" onClick={() => quitar(i)} title="Quitar filtro"
+                style={{ border: "none", background: "transparent", color: C.mute, cursor: "pointer", padding: 4, display: "inline-flex" }}>
+                <X size={14} />
+              </button>
+            </div>
+            {f && (
+              <div style={{ display: "flex", gap: 6 }}>
+                <select className="crm-in" value={c.op} onChange={(e) => cambiar(i, { op: e.target.value })} style={{ ...chico, flex: pideValor && grupo !== "select" ? "0 0 46%" : 1 }}>
+                  {OPS_FILTRO[grupo].map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+                {pideValor && grupo !== "select" && (
+                  <>
+                    <input className="crm-in" value={c.value || ""} onChange={(e) => cambiar(i, { value: e.target.value })}
+                      type={grupo === "numero" || c.op === "ultimos" ? "number" : grupo === "fecha" ? "date" : "text"}
+                      placeholder={c.op === "ultimos" ? "Días" : "Valor"} list={sugerencias.length && sugerencias.length <= 80 ? listId : undefined}
+                      style={{ ...chico, flex: 1, minWidth: 0 }} />
+                    {sugerencias.length > 0 && sugerencias.length <= 80 && (
+                      <datalist id={listId}>{sugerencias.map((s) => <option key={s} value={s} />)}</datalist>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+            {pideValor && grupo === "select" && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {opciones.map((o) => {
+                  const on = (c.values || []).includes(o);
+                  return (
+                    <button key={o} type="button" className="crm-btn"
+                      onClick={() => cambiar(i, { values: on ? c.values.filter((x) => x !== o) : [...(c.values || []), o] })}
+                      style={{ border: `1px solid ${on ? C.jade : C.line}`, background: on ? C.jadeSoft : C.panel, color: on ? C.jade : C.mute, borderRadius: 999, padding: "2px 9px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer" }}>
+                      {o}
+                    </button>
+                  );
+                })}
+                {opciones.length === 0 && <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Nadie tiene un valor en esta propiedad.</span>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div>
+        <Btn size="sm" variant="outline" Icon={ListFilter}
+          onClick={() => setFiltros((fs) => [...fs, { key: "", op: "", value: "", values: [] }])}>
+          {filtros.length ? "Añadir otra condición" : "Filtrar por propiedad"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const integ = db.integrations;
   const gmail = useGmail();
@@ -5696,10 +5887,21 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
      el mismo envío, aunque se mande en dos tandas o uno por uno. */
   const [lote] = useState(() => uid());
   const [buscar, setBuscar] = useState("");
+  const [filtros, setFiltros] = useState([]);
 
   const coll = kind === "contact" ? db.contacts : db.companies;
-  const candidatos = coll.filter((r) => ids.includes(r.id));
-  const recipients = candidatos.filter((r) => chosen.has(r.id));
+  const schema = db.schema[kind];
+  const candidatos = useMemo(() => {
+    const marcados = new Set(ids);
+    return coll.filter((r) => marcados.has(r.id));
+  }, [coll, ids]);
+  /* Los filtros acotan; las casillas afinan dentro de lo que queda. Quien no
+     cumple no recibe aunque siga marcado, y vuelve a contar en cuanto se
+     quita el filtro que lo dejaba fuera. */
+  const coinciden = useMemo(
+    () => (filtros.length ? candidatos.filter((r) => cumpleFiltros(r, filtros, schema)) : candidatos),
+    [candidatos, filtros, schema]);
+  const recipients = coinciden.filter((r) => chosen.has(r.id));
   const first = recipients[0];
   const ch = CHANNEL[channel];
   const cc = integ.whatsapp.countryCode;
@@ -5716,11 +5918,11 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
   const missingChannel = recipients.length - sendable.length;
   const pending = sendable.filter((r) => !done.has(r.id));
 
-  const conDato = candidatos.filter((r) => destOf(r));
+  const conDato = coinciden.filter((r) => destOf(r));
   const filtro = buscar.trim().toLowerCase();
   const visibles = filtro
-    ? candidatos.filter((r) => `${titleOf(kind, r)} ${destOf(r)}`.toLowerCase().includes(filtro))
-    : candidatos;
+    ? coinciden.filter((r) => `${titleOf(kind, r)} ${destOf(r)}`.toLowerCase().includes(filtro))
+    : coinciden;
   /* Se pintan hasta 100 filas: una lista masiva no se recorre a ojo, se filtra.
      Los botones de arriba siguen actuando sobre la lista completa. */
   const listados = visibles.slice(0, 100);
@@ -5938,7 +6140,7 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
 
   return (
     <Modal wide title={esCorreo ? "Enviar correo" : "Enviar por WhatsApp"}
-      subtitle={`${recipients.length} de ${candidatos.length} destinatario(s) · ${comoSale}`} onClose={onClose}
+      subtitle={`${recipients.length} de ${coinciden.length} destinatario(s) · ${comoSale}`} onClose={onClose}
       footer={<><Btn variant="outline" onClick={onClose}>{done.size ? "Cerrar" : "Cancelar"}</Btn>
         <Btn variant="outline" Icon={Copy} disabled={sinTexto} onClick={copyAll}>{copied || "Copiar textos"}</Btn>
         <Btn variant="outline" Icon={Check} disabled={sinTexto}
@@ -6016,7 +6218,8 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
           </div>
           <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute }}>
-              DESTINATARIOS · {recipients.length} de {candidatos.length}
+              DESTINATARIOS · {recipients.length} de {coinciden.length}
+              {filtros.length > 0 && <span style={{ fontWeight: 400, color: C.faint }}> · {coinciden.length} de {candidatos.length} cumplen los filtros</span>}
             </div>
             <div style={{ display: "flex", gap: 2 }}>
               <Btn size="sm" onClick={() => setChosen(new Set(candidatos.map((r) => r.id)))}>Todos</Btn>
@@ -6024,8 +6227,9 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
               <Btn size="sm" onClick={() => setChosen(new Set())}>Ninguno</Btn>
             </div>
           </div>
-          {candidatos.length > 8 && (
-            <input className="crm-in" placeholder="Filtrar por nombre o dato…" value={buscar} onChange={(e) => setBuscar(e.target.value)}
+          <FiltrosPropiedad schema={schema} rows={candidatos} filtros={filtros} setFiltros={setFiltros} />
+          {coinciden.length > 8 && (
+            <input className="crm-in" placeholder="Buscar por nombre o dato…" value={buscar} onChange={(e) => setBuscar(e.target.value)}
               style={{ ...inputStyle, marginTop: 6, padding: "6px 9px", fontSize: 12 }} />
           )}
           <div style={{ marginTop: 6, maxHeight: 186, overflowY: "auto", border: `1px solid ${C.line}`, borderRadius: 8 }}>
@@ -6046,7 +6250,8 @@ function SendModal({ db, channel, kind, ids, onClose, onSend, onLogOne }) {
             })}
             {listados.length === 0 && (
               <div style={{ padding: "10px 9px", fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>
-                {candidatos.length ? "Nadie coincide con el filtro." : "No hay registros para enviar."}
+                {!candidatos.length ? "No hay registros para enviar."
+                  : !coinciden.length ? "Nadie cumple los filtros. Quita o ajusta alguna condición." : "Nadie coincide con la búsqueda."}
               </div>
             )}
           </div>
