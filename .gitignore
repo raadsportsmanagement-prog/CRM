@@ -4,3 +4,6 @@ dist
 *.local
 .dev.vars
 .wrangler
+
+# Ajustes personales de Claude Code
+.claude/settings.local.json
