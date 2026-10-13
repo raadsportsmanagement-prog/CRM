@@ -21,6 +21,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { atenderMcp } from "./mcp.js";
 import { atenderClaude } from "./claude.js";
+import { atenderEstudio } from "./estudio.js";
 import { atenderDrafts } from "./drafts.js";
 
 /* Las claves que guarda la app empiezan todas así; cualquier otra cosa se
@@ -275,6 +276,10 @@ export default {
     if (url.pathname === "/api/claude") {
       if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
       return atenderClaude(req, env);
+    }
+    if (url.pathname === "/api/estudio") {
+      if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
+      return atenderEstudio(req, env);
     }
     if (url.pathname === "/api/drafts") {
       if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);

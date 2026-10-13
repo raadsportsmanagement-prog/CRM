@@ -7,7 +7,7 @@ import {
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
   Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
-  Trophy
+  Trophy, Palette, Newspaper, Lightbulb, ImagePlus
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -1601,6 +1601,7 @@ export default function CRM() {
     { key: "drafts", label: "Drafts", Icon: Trophy },
     { key: "activities", label: "Actividades", Icon: Activity },
     { key: "templates", label: "Plantillas", Icon: MessageSquare },
+    { key: "studio", label: "Estudio", Icon: Palette },
     { key: "automations", label: "Automatizaciones", Icon: Zap },
     { key: "connections", label: "Conexiones", Icon: Plug },
     { key: "settings", label: "Configuración", Icon: Settings },
@@ -1673,6 +1674,7 @@ export default function CRM() {
               onImport={importActivities} onBuzon={marcarBuzon} onEventos={aplicarEventos} onRebotes={aplicarRebotes}
               onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
           )}
+          {view === "studio" && <EstudioView db={db} setDb={setDb} say={say} onListo={() => setView("templates")} />}
           {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say}
             onEnviar={(plantillaId) => setModal({ kind: "send", channel: "whatsapp", objKind: "contact", ids: db.contacts.map((c) => c.id), plantillaId })} />}
           {view === "automations" && (
@@ -4266,11 +4268,324 @@ function SubirImagenWa({ pu, valor, onCambio }) {
   );
 }
 
+/* ────────────────────────────────────────────────────────────
+   Estudio de contenido
+   ────────────────────────────────────────────────────────────
+   De la idea a la plantilla sin salir del CRM: Claude propone el mensaje
+   —a partir de lo que escribas o de noticias que busca—, diseña la imagen
+   del encabezado con la identidad de Catch, y la pieza pasa al mismo
+   "Enviar a Meta" de Plantillas. Nada sale sin que lo elijas.
+
+   La imagen la escribe Claude como SVG y aquí se convierte en JPG. Un SVG
+   que se pinta dentro de <img> no ejecuta nada ni carga nada de fuera, así
+   que el logo, la foto y las tipografías se le incrustan antes de pintarlo.
+   ──────────────────────────────────────────────────────────── */
+
+const ESTUDIO_LOGO = "/catch-logo.png";
+
+const aDataUrl = (blob) => new Promise((ok, mal) => {
+  const r = new FileReader();
+  r.onload = () => ok(r.result);
+  r.onerror = () => mal(new Error("No se pudo leer el archivo."));
+  r.readAsDataURL(blob);
+});
+
+/* Las dos familias que se le permiten a Claude, bajadas una vez por sesión.
+   Sólo el subconjunto latino: es el que trae tildes y eñes. */
+let fuentesSvg = null;
+const cargarFuentesSvg = () => {
+  if (!fuentesSvg) {
+    fuentesSvg = (async () => {
+      const css = await (await fetch("https://fonts.googleapis.com/css2?family=Anton&family=Montserrat:wght@600;800&display=swap")).text();
+      const bloques = css.split("/* ").filter((b) => b.startsWith("latin */"));
+      const caras = await Promise.all(bloques.map(async (b) => {
+        const fam = (b.match(/font-family:\s*'([^']+)'/) || [])[1];
+        const peso = (b.match(/font-weight:\s*(\d+)/) || [])[1] || "400";
+        const url = (b.match(/url\(([^)]+)\)/) || [])[1];
+        if (!fam || !url) return "";
+        const datos = await aDataUrl(await (await fetch(url)).blob());
+        return `@font-face{font-family:'${fam}';font-weight:${peso};src:url(${datos}) format('woff2');}`;
+      }));
+      return caras.join("");
+    })().catch((e) => { fuentesSvg = null; throw e; });
+  }
+  return fuentesSvg;
+};
+
+let logoSvg = null;
+const cargarLogoSvg = () => {
+  if (!logoSvg) logoSvg = fetch(ESTUDIO_LOGO).then((r) => r.blob()).then(aDataUrl).catch((e) => { logoSvg = null; throw e; });
+  return logoSvg;
+};
+
+/* SVG de Claude → JPG de 1200×628 listo para el encabezado. */
+async function svgAJpg(svg, foto) {
+  const [fuentes, logo] = await Promise.all([cargarFuentesSvg().catch(() => ""), cargarLogoSvg()]);
+  let doc = String(svg)
+    .replace(/(xlink:)?href="LOGO"/g, `href="${logo}"`)
+    .replace(/(xlink:)?href="FOTO"/g, foto ? `href="${foto}"` : 'href=""');
+  doc = doc.replace(/<svg\b[^>]*>/, (m) => `${m}<style>${fuentes}</style>`);
+  const url = URL.createObjectURL(new Blob([doc], { type: "image/svg+xml" }));
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const lienzo = document.createElement("canvas");
+    lienzo.width = 1200; lienzo.height = 628;
+    const ctx = lienzo.getContext("2d");
+    ctx.fillStyle = "#002B3D";
+    ctx.fillRect(0, 0, 1200, 628);
+    ctx.drawImage(img, 0, 0, 1200, 628);
+    const blob = await new Promise((ok) => lienzo.toBlob(ok, "image/jpeg", 0.9));
+    if (!blob) throw new Error("No se pudo convertir el diseño en imagen.");
+    return new File([blob], "encabezado.jpg", { type: "image/jpeg" });
+  } catch (e) {
+    throw new Error("El diseño que devolvió Claude no se pudo pintar. Pide otro.");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function pedirEstudio(cuerpo) {
+  const r = await fetch("/api/estudio", {
+    method: "POST", redirect: "manual", credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Origen": "estudio" },
+    body: JSON.stringify(cuerpo),
+  });
+  if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+  if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("El estudio sólo funciona en la versión publicada del CRM.");
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+  return data;
+}
+
+/* Lo que llevas armado sobrevive a cambiar de pestaña; al recargar se pierde,
+   y está bien: lo que importa queda en Plantillas al mandarlo. */
+let memoriaEstudio = null;
+
+function EstudioView({ db, setDb, say, onListo }) {
+  const pu = db.integrations.puente;
+  const marca = (db.estudio && db.estudio.marca) || "";
+  const m = memoriaEstudio || {};
+  const [fuente, setFuente] = useState(m.fuente || "idea");
+  const [brief, setBrief] = useState(m.brief || "");
+  const [propuestas, setPropuestas] = useState(m.propuestas || []);
+  const [elegida, setElegida] = useState(m.elegida ?? -1);
+  const [foto, setFoto] = useState(m.foto || "");
+  const [disenos, setDisenos] = useState(m.disenos || []);
+  const [diseno, setDiseno] = useState(m.diseno ?? -1);
+  const [ajuste, setAjuste] = useState("");
+  const [draft, setDraft] = useState(m.draft || null);
+  const [subida, setSubida] = useState(m.subida || null);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [verMarca, setVerMarca] = useState(!marca);
+
+  useEffect(() => {
+    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida };
+  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida]);
+
+  const p = elegida >= 0 ? propuestas[elegida] : null;
+  const ponerMarca = (v) => setDb((d) => ({ ...d, estudio: { ...(d.estudio || {}), marca: v } }));
+
+  const proponer = async () => {
+    setBusy("proponer"); setErr("");
+    try {
+      const r = await pedirEstudio({ accion: "proponer", fuente, brief, marca });
+      setPropuestas(r.propuestas); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const elegir = (i) => {
+    setElegida(i); setDisenos([]); setDiseno(-1); setSubida(null);
+    setDraft({ id: uid(), name: propuestas[i].titulo, subject: "", body: propuestas[i].mensaje, html: "", meta: null });
+  };
+
+  const disenar = async (variante, previo) => {
+    const r = await pedirEstudio({
+      accion: "imagen", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje }, marca, conFoto: Boolean(foto), variante,
+      ...(previo ? { ajuste, anterior: previo.svg } : {}),
+    });
+    const archivo = await svgAJpg(r.svg, foto);
+    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo) };
+  };
+
+  const disenarDos = async () => {
+    setBusy("disenar"); setErr(""); setSubida(null);
+    try {
+      const hechos = await Promise.allSettled([disenar(0), disenar(1)]);
+      const buenos = hechos.filter((h) => h.status === "fulfilled").map((h) => h.value);
+      if (!buenos.length) throw hechos[0].reason;
+      setDisenos(buenos); setDiseno(0);
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const ajustar = async () => {
+    setBusy("ajustar"); setErr(""); setSubida(null);
+    try {
+      const nuevo = await disenar(diseno, disenos[diseno]);
+      setDisenos((ds) => ds.map((d, i) => (i === diseno ? nuevo : d)));
+      setAjuste("");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const usarDiseno = async () => {
+    setBusy("subir"); setErr("");
+    try { setSubida(await subirImagenWa({ base: pu.base, clave: pu.clave, archivo: disenos[diseno].archivo })); }
+    catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const elegirFoto = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    if (!f.type.startsWith("image/")) { setErr("Tiene que ser una imagen."); return; }
+    setFoto(await aDataUrl(f));
+  };
+
+  const paso = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18, marginBottom: 16 };
+  const tituloPaso = (n, t) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 12 }}>
+      <span style={{ background: C.jade, color: "#fff", borderRadius: 99, width: 22, height: 22, display: "inline-flex", alignItems: "center", justifyContent: "center", fontFamily: "var(--mono)", fontSize: 11.5, fontWeight: 600 }}>{n}</span>
+      <span style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>{t}</span>
+    </div>
+  );
+  const nota = { fontFamily: "var(--ui)", fontSize: 12, color: C.faint, lineHeight: 1.5 };
+  const espera = (t) => <div style={{ ...nota, marginTop: 8 }}>{t}</div>;
+
+  return (
+    <div>
+      <Header eyebrow="Mensajería" title="Estudio de contenido" />
+      <div style={{ padding: 28, maxWidth: 1080 }}>
+
+        <div style={paso}>
+          {tituloPaso(1, "La idea")}
+          <div style={{ display: "flex", gap: 7, marginBottom: 10 }}>
+            {[["idea", "Mi idea", Lightbulb], ["noticias", "Noticias", Newspaper]].map(([k, l, I]) => (
+              <button key={k} onClick={() => setFuente(k)} className="crm-btn" style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${fuente === k ? C.jade : C.line}`, background: fuente === k ? C.jade : C.panel, color: fuente === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>
+                <I size={13} />{l}
+              </button>
+            ))}
+          </div>
+          <textarea className="crm-in" value={brief} onChange={(e) => setBrief(e.target.value)} rows={3}
+            placeholder={fuente === "noticias"
+              ? "Sobre qué buscar, p. ej. becas deportivas universitarias en EE. UU. para fútbol, esta semana"
+              : "Qué quieres comunicar, p. ej. abrimos inscripciones para el showcase de diciembre, cupos limitados"}
+            style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: 13, resize: "vertical" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+            <Btn variant="solid" Icon={Sparkles} disabled={Boolean(busy) || !brief.trim()} onClick={proponer}>
+              {busy === "proponer" ? (fuente === "noticias" ? "Buscando noticias…" : "Pensando…") : "Proponer 3 mensajes"}
+            </Btn>
+            <Btn size="sm" variant="ghost" onClick={() => setVerMarca((v) => !v)}>{verMarca ? "Ocultar" : "Editar"} lo que Claude sabe de la marca</Btn>
+          </div>
+          {busy === "proponer" && espera(fuente === "noticias" ? "Claude está buscando y leyendo noticias; suele tardar entre 30 segundos y un par de minutos." : "Suele tardar unos segundos.")}
+          {verMarca && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5 }}>SOBRE LA MARCA</div>
+              <textarea className="crm-in" value={marca} onChange={(e) => ponerMarca(e.target.value)} rows={5}
+                placeholder="Qué es Catch, para quién es, qué ofrece la app, el enlace de registro, cómo hablamos, qué nunca decimos…"
+                style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: 12.5, resize: "vertical" }} />
+              <div style={nota}>Se guarda solo y Claude lo lee en cada pieza. Colores y logo ya los conoce.</div>
+            </div>
+          )}
+        </div>
+
+        {propuestas.length > 0 && (
+          <div style={paso}>
+            {tituloPaso(2, "Elige un mensaje")}
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              {propuestas.map((x, i) => (
+                <div key={i} style={{ flex: "1 1 280px", border: `1.5px solid ${elegida === i ? C.jade : C.line}`, borderRadius: 8, padding: 13, background: elegida === i ? "#F7FAF8" : C.panel, display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ fontFamily: "var(--display)", fontSize: 13.5, fontWeight: 600 }}>{x.titulo}</div>
+                  {x.imagen && x.imagen.titular && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.blue }}>IMAGEN: {x.imagen.titular}</div>}
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, whiteSpace: "pre-wrap", lineHeight: 1.55, flex: 1 }}>{x.mensaje}</div>
+                  {Array.isArray(x.fuentes) && x.fuentes.length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      {x.fuentes.map((f, j) => (
+                        <a key={j} href={f.url} target="_blank" rel="noopener noreferrer" style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.blue, textDecoration: "none" }}>↗ {f.titulo || f.url}</a>
+                      ))}
+                    </div>
+                  )}
+                  <Btn size="sm" variant={elegida === i ? "solid" : "outline"} Icon={Check} disabled={Boolean(busy)} onClick={() => elegir(i)}>{elegida === i ? "Elegido" : "Usar este"}</Btn>
+                </div>
+              ))}
+            </div>
+            {propuestas.some((x) => x.fuentes && x.fuentes.length) && <div style={{ ...nota, marginTop: 10 }}>Abre las fuentes y confirma los datos antes de mandarlo: Claude resume, pero el que publica eres tú.</div>}
+          </div>
+        )}
+
+        {p && draft && (
+          <div style={paso}>
+            {tituloPaso(3, "La imagen")}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+              <label className="crm-btn" style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${C.line}`, background: C.panel, borderRadius: 6, padding: "5px 11px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>
+                <ImagePlus size={13} />{foto ? "Cambiar foto de fondo" : "Usar una foto de fondo (opcional)"}
+                <input type="file" accept="image/*" onChange={elegirFoto} style={{ display: "none" }} />
+              </label>
+              {foto && <><img src={foto} alt="" style={{ height: 34, borderRadius: 4 }} /><Btn size="sm" variant="ghost" Icon={X} onClick={() => setFoto("")}>Quitar</Btn></>}
+              <Btn variant="solid" Icon={Palette} disabled={Boolean(busy)} onClick={disenarDos}>
+                {busy === "disenar" ? "Diseñando…" : disenos.length ? "Diseñar otras 2" : "Diseñar 2 opciones"}
+              </Btn>
+            </div>
+            {busy === "disenar" && espera("Claude está diseñando dos composiciones; tarda alrededor de un minuto.")}
+            {disenos.length > 0 && (
+              <>
+                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                  {disenos.map((d, i) => (
+                    <button key={i} onClick={() => { setDiseno(i); setSubida(null); }} style={{ padding: 0, border: `3px solid ${diseno === i ? C.jade : "transparent"}`, borderRadius: 8, background: "none", cursor: "pointer", flex: "1 1 320px", maxWidth: 500 }}>
+                      <img src={d.vista} alt={`Opción ${i + 1}`} style={{ display: "block", width: "100%", borderRadius: 5 }} />
+                    </button>
+                  ))}
+                </div>
+                {diseno >= 0 && (
+                  <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                    <input className="crm-in" value={ajuste} onChange={(e) => setAjuste(e.target.value)} placeholder="Ajustar esta opción, p. ej. titular más grande, sin la etiqueta, fondo más claro"
+                      style={{ ...inputStyle, flex: 1, minWidth: 240, padding: "6px 9px", fontSize: 12.5 }} />
+                    <Btn variant="outline" Icon={RefreshCw} disabled={Boolean(busy) || !ajuste.trim()} onClick={ajustar}>{busy === "ajustar" ? "Ajustando…" : "Ajustar"}</Btn>
+                    <Btn variant="solid" Icon={Check} disabled={Boolean(busy) || !pu.base || !pu.clave || Boolean(subida)} onClick={usarDiseno}>
+                      {busy === "subir" ? "Preparando…" : subida ? "Imagen lista" : "Usar esta imagen"}
+                    </Btn>
+                  </div>
+                )}
+                {(!pu.base || !pu.clave) && <div style={{ ...nota, marginTop: 6 }}>Falta configurar el puente en Conexiones para poder usar la imagen.</div>}
+              </>
+            )}
+          </div>
+        )}
+
+        {p && draft && (
+          <div style={paso}>
+            {tituloPaso(4, "La plantilla")}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <Field def={{ label: "Nombre de la plantilla", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
+              <Field def={{ label: "Mensaje", type: "textarea" }} value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+              <RevisionMetaWa key={subida ? subida.id : "sin-imagen"} db={db} draft={draft} setDraft={setDraft} sinRedactar
+                imagenInicial={subida}
+                onEnviada={(revision) => {
+                  setDb((d) => ({ ...d, templates: { ...d.templates, whatsapp: [...d.templates.whatsapp, { ...draft, name: draft.name.trim() || revision.nombre, revision }] } }));
+                  memoriaEstudio = null;
+                  say("Enviada a Meta. Te aviso en Plantillas cuando la aprueben.");
+                  onListo();
+                }} />
+            </div>
+          </div>
+        )}
+
+        {err && <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.5 }}>{err}</div>}
+      </div>
+    </div>
+  );
+}
+
 /* Crear la plantilla en Meta sin salir del CRM: Claude la redacta si se le
    pide, se revisa aquí contra las reglas que Meta aplica de entrada, y se
    manda. La aprobación llega sola —el CRM pregunta cada cinco minutos— y el
    envío lo das tú cuando te avise. */
-function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
+function RevisionMetaWa({ db, draft, setDraft, onEnviada, imagenInicial = null, sinRedactar = false }) {
   const pu = db.integrations.puente;
   const rv = draft.revision;
   const sufijo = rv && rv.estado === "REJECTED" ? "_v2" : "";
@@ -4278,7 +4593,7 @@ function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
   const [categoria, setCategoria] = useState("MARKETING");
   const [cabecera, setCabecera] = useState("IMAGE");
   const [encabezado, setEncabezado] = useState("");
-  const [imagen, setImagen] = useState(null);
+  const [imagen, setImagen] = useState(imagenInicial);
   const [pie, setPie] = useState("");
   const [botones, setBotones] = useState([{ tipo: "URL", texto: "", url: "" }]);
   const [idea, setIdea] = useState("");
@@ -4361,13 +4676,13 @@ function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
         <div style={nota}>Falta configurar el puente en Conexiones.</div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-          <div style={{ display: "flex", gap: 7 }}>
+          {!sinRedactar && <div style={{ display: "flex", gap: 7 }}>
             <input className="crm-in" value={idea} placeholder="De qué se trata, p. ej. 20% en inscripciones hasta el viernes"
               onChange={(e) => setIdea(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5, flex: 1 }} />
             <Btn size="sm" variant="outline" Icon={Sparkles} disabled={Boolean(busy) || !idea.trim()} onClick={redactar}>
               {busy === "redactar" ? "Redactando…" : "Redactar con Claude"}
             </Btn>
-          </div>
+          </div>}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
             <input className="crm-in" value={nombreFinal} placeholder="nombre_para_meta" onChange={(e) => setNombreMeta(nombreParaMeta(e.target.value) || "")}
               style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5, fontFamily: "var(--mono)" }} title="Nombre con el que queda en Meta" />
