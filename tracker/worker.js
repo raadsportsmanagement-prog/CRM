@@ -435,13 +435,19 @@ async function whatsappEnviar(env, cuerpo) {
       ? Object.entries(vars).map(([k, v]) => ({ type: "text", parameter_name: k, text: String(v) }))
       : [];
 
+  /* Una plantilla con imagen en el encabezado la pide en cada envío: lo que
+     se mostró al aprobarla era sólo un ejemplo. */
+  const componentes = [
+    ...(cuerpo.imagen ? [{ type: "header", parameters: [{ type: "image", image: { link: String(cuerpo.imagen) } }] }] : []),
+    ...(parametros.length ? [{ type: "body", parameters: parametros }] : []),
+  ];
   const mensaje = cuerpo.plantilla
     ? {
         messaging_product: "whatsapp", to: a, type: "template",
         template: {
           name: String(cuerpo.plantilla),
           language: { code: String(cuerpo.idioma || "es") },
-          ...(parametros.length ? { components: [{ type: "body", parameters: parametros }] } : {}),
+          ...(componentes.length ? { components: componentes } : {}),
         },
       }
     : {
@@ -525,7 +531,9 @@ function resumirPlantilla(t) {
 
   let motivo = "";
   const cabeza = comps.find((c) => c.type === "HEADER");
-  if (cabeza && cabeza.format && cabeza.format !== "TEXT") motivo = "lleva un encabezado con archivo";
+  /* Una imagen sí se puede: el CRM guarda cuál va y la manda en cada envío.
+     Video y documento no, porque no hay dónde elegirlos. */
+  if (cabeza && cabeza.format && cabeza.format !== "TEXT" && cabeza.format !== "IMAGE") motivo = "lleva un encabezado con video o documento";
   else if (cabeza && /\{\{/.test(String(cabeza.text || ""))) motivo = "lleva una variable en el encabezado";
   const botones = (comps.find((c) => c.type === "BUTTONS") || {}).buttons || [];
   if (!motivo && botones.some((b) => /\{\{/.test(String(b.url || "")))) motivo = "lleva un botón con enlace variable";
@@ -540,6 +548,10 @@ function resumirPlantilla(t) {
     cuerpo,
     vars,
     formato: nombradas ? "nombrado" : "posicional",
+    cabecera: cabeza ? String(cabeza.format || "TEXT") : "",
+    encabezado: cabeza && cabeza.format === "TEXT" ? String(cabeza.text || "") : "",
+    pie: String((comps.find((c) => c.type === "FOOTER") || {}).text || ""),
+    botones: botones.map((b) => ({ tipo: b.type === "URL" ? "URL" : "RESPUESTA", texto: String(b.text || ""), url: String(b.url || "") })),
     motivo,
   };
 }
@@ -553,6 +565,59 @@ function resumirPlantilla(t) {
    así son las mismas palabras que usa el CRM y el enlace sale hecho. Meta pide
    un ejemplo por variable para revisarla; los pone el CRM, que sabe qué dato
    va en cada una. */
+/* ── Imágenes para el encabezado ──
+   Meta pide la imagen dos veces y de dos formas: al revisar la plantilla,
+   subida a la app (un "handle"); y en cada envío, como un enlace que pueda
+   descargar. Aquí se guarda una vez y sirve para las dos: el CRM la sube,
+   queda en el KV, y /wa/imagen/<id> la entrega sin clave porque quien la pide
+   es Meta. El id es aleatorio y lo que hay detrás es publicidad. */
+const IMG = "img:";
+const TIPOS_IMAGEN = ["image/jpeg", "image/png"];
+
+async function guardarImagen(req, env, url) {
+  const tipo = (req.headers.get("Content-Type") || "").split(";")[0].trim();
+  if (!TIPOS_IMAGEN.includes(tipo)) throw new Aviso("La imagen tiene que ser JPG o PNG.");
+  const bytes = await req.arrayBuffer();
+  if (!bytes.byteLength) throw new Aviso("La imagen llegó vacía.");
+  if (bytes.byteLength > 5 * 1024 * 1024) throw new Aviso("Meta acepta imágenes de hasta 5 MB.");
+  const id = crypto.randomUUID().replace(/-/g, "");
+  await env.EVENTOS.put(IMG + id, bytes, { metadata: { tipo } });
+  return { id, url: `${url.origin}/wa/imagen/${id}` };
+}
+
+async function servirImagen(env, id) {
+  if (!/^[a-f0-9]{32}$/.test(id)) return new Response("", { status: 404 });
+  const r = await env.EVENTOS.getWithMetadata(IMG + id, { type: "arrayBuffer" });
+  if (!r.value) return new Response("", { status: 404 });
+  return new Response(r.value, {
+    headers: { "Content-Type": (r.metadata && r.metadata.tipo) || "image/jpeg", "Cache-Control": "public, max-age=31536000, immutable" },
+  });
+}
+
+/* La subida "reanudable" de Meta: se abre una sesión en la app y se le
+   entrega el archivo entero de una vez. Devuelve el handle que pide la
+   plantilla como ejemplo. */
+async function subirEjemploMeta(env, id) {
+  if (!env.META_APP_ID) throw falta("el identificador de la app de Meta", { vars: ["META_APP_ID"] });
+  const r = await env.EVENTOS.getWithMetadata(IMG + id, { type: "arrayBuffer" });
+  if (!r.value) throw new Aviso("No encuentro la imagen en el puente. Vuelve a subirla.");
+  const tipo = (r.metadata && r.metadata.tipo) || "image/jpeg";
+  const sesion = await pedirJson(
+    `https://graph.facebook.com/${META_V}/${env.META_APP_ID}/uploads?${new URLSearchParams({
+      file_name: `encabezado.${tipo === "image/png" ? "png" : "jpg"}`, file_length: String(r.value.byteLength), file_type: tipo, access_token: env.WA_TOKEN,
+    })}`,
+    { method: "POST" },
+    "Meta",
+  );
+  const subida = await pedirJson(
+    `https://graph.facebook.com/${META_V}/${sesion.id}`,
+    { method: "POST", headers: { Authorization: `OAuth ${env.WA_TOKEN}`, file_offset: "0" }, body: r.value },
+    "Meta",
+  );
+  if (!subida.h) throw new Aviso("Meta no devolvió la imagen subida. Prueba otra vez.");
+  return subida.h;
+}
+
 const NOMBRE_PLANTILLA = /^[a-z0-9_]{1,512}$/;
 const VAR_NOMBRADA = /\{\{\s*([a-z0-9_]+)\s*\}\}/g;
 
@@ -576,9 +641,23 @@ async function whatsappCrearPlantilla(env, c) {
   const sinEjemplo = vars.find((k) => !String(ejemplos[k] || "").trim());
   if (sinEjemplo) throw new Aviso(`Falta un ejemplo para {{${sinEjemplo}}}: Meta lo pide para revisar la plantilla.`);
 
+  const botones = (Array.isArray(c.botones) ? c.botones : []).map((b) => ({
+    tipo: b && b.tipo === "URL" ? "URL" : "RESPUESTA",
+    texto: String((b && b.texto) || "").trim(),
+    url: String((b && b.url) || "").trim(),
+  })).filter((b) => b.texto);
+  if (botones.length > 3) throw new Aviso("Como mucho tres botones.");
+  if (botones.filter((b) => b.tipo === "URL").length > 2) throw new Aviso("Meta acepta como mucho dos botones con enlace.");
+  const largo = botones.find((b) => b.texto.length > 25);
+  if (largo) throw new Aviso(`El botón «${largo.texto}» pasa de 25 caracteres.`);
+  const sinUrl = botones.find((b) => b.tipo === "URL" && !/^https:\/\/\S+$/.test(b.url));
+  if (sinUrl) throw new Aviso(`El botón «${sinUrl.texto}» necesita un enlace que empiece por https://.`);
+
   const componentes = [];
   const encabezado = String(c.encabezado || "").trim();
-  if (encabezado) componentes.push({ type: "HEADER", format: "TEXT", text: encabezado });
+  if (c.imagen) {
+    componentes.push({ type: "HEADER", format: "IMAGE", example: { header_handle: [await subirEjemploMeta(env, String(c.imagen))] } });
+  } else if (encabezado) componentes.push({ type: "HEADER", format: "TEXT", text: encabezado });
   componentes.push({
     type: "BODY",
     text: cuerpo,
@@ -586,6 +665,12 @@ async function whatsappCrearPlantilla(env, c) {
   });
   const pie = String(c.pie || "").trim();
   if (pie) componentes.push({ type: "FOOTER", text: pie });
+  if (botones.length) {
+    componentes.push({
+      type: "BUTTONS",
+      buttons: botones.map((b) => (b.tipo === "URL" ? { type: "URL", text: b.texto, url: b.url } : { type: "QUICK_REPLY", text: b.texto })),
+    });
+  }
 
   const r = await pedirJson(
     `https://graph.facebook.com/${META_V}/${env.WA_WABA_ID}/message_templates`,
@@ -1307,6 +1392,11 @@ export default {
       if (req.method !== "GET" && req.method !== "POST") return new Response("", { status: 405 });
       return whatsappWebhook(req, env, ctx);
     }
+    /* Las imágenes de los encabezados las descarga Meta en cada envío: van
+       sin clave, como el webhook. */
+    const img = ruta.match(/^\/wa\/imagen\/([a-f0-9]{32})$/);
+    if (img && (req.method === "GET" || req.method === "HEAD")) return servirImagen(env, img[1]);
+
     /* Lo mismo para Twilio, que se protege con su propia firma. */
     if (ruta === "/wa/twilio") {
       if (req.method !== "POST") return new Response("", { status: 405 });
@@ -1315,7 +1405,7 @@ export default {
 
     /* Todo aquí se pide con GET menos una cosa: mandar un WhatsApp lleva
        texto de por medio y eso no cabe con dignidad en una dirección. */
-    const esEnvio = ruta === "/wa/enviar" || ruta === "/wa/plantillas/crear";
+    const esEnvio = ruta === "/wa/enviar" || ruta === "/wa/plantillas/crear" || ruta === "/wa/imagen";
     if (req.method === "POST" ? !esEnvio : req.method !== "GET" && req.method !== "HEAD") {
       return json({ error: "Método no permitido en esta dirección." }, 405);
     }
@@ -1399,6 +1489,7 @@ export default {
           return json(await (conTwilio(env) ? twilioEnviar : whatsappEnviar)(env, cuerpo));
         }
         if (ruta === "/wa/plantillas") return json(await (conTwilio(env) ? twilioPlantillas : whatsappPlantillas)(env));
+        if (ruta === "/wa/imagen") return json(await guardarImagen(req, env, url));
         if (ruta === "/wa/plantillas/crear") {
           let cuerpo = {};
           try { cuerpo = await req.json(); } catch (_) { return json({ error: "El cuerpo no es JSON." }, 400); }

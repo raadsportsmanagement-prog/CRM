@@ -64,11 +64,20 @@ export const probarPuente = ({ base, clave }) => pedir(base, clave, "/puente/sal
 /* ── Enviar un WhatsApp de verdad ──
    Va por POST porque el mensaje lleva texto de por medio y eso no cabe con
    dignidad en una dirección. */
-export const enviarWhatsApp = ({ base, clave, a, texto, plantilla, idioma, variables }) =>
+export const enviarWhatsApp = ({ base, clave, a, texto, plantilla, idioma, variables, imagen }) =>
   pedir(base, clave, "/wa/enviar", {}, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ a, texto, plantilla, idioma, variables }),
+    body: JSON.stringify({ a, texto, plantilla, idioma, variables, imagen }),
+  });
+
+/* La imagen del encabezado de una plantilla. Queda guardada en el puente, que
+   la entrega a Meta al revisarla y en cada envío. Devuelve {id, url}. */
+export const subirImagenWa = ({ base, clave, archivo }) =>
+  pedir(base, clave, "/wa/imagen", {}, {
+    method: "POST",
+    headers: { "Content-Type": archivo.type },
+    body: archivo,
   });
 
 /* Las plantillas que Meta ya aprobó, para enlazarlas a una del CRM. */

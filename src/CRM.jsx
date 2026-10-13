@@ -20,7 +20,7 @@ import {
   midiendo, nuevoTrk, marcarHtml, textoAHtml, traerEventos, estadoDe,
 } from "./tracking.js";
 import {
-  traerLeads, traerCampanas, enviarWhatsApp, probarPuente, traerPlantillasWa, crearPlantillaWa, traerWhatsApp,
+  traerLeads, traerCampanas, enviarWhatsApp, probarPuente, traerPlantillasWa, crearPlantillaWa, subirImagenWa, traerWhatsApp,
   leadAProps, leadATexto, leadAAsunto, nombrePlataforma, partirNombre,
 } from "./anuncios.js";
 import {
@@ -224,6 +224,13 @@ const metaWa = (m) => (m && typeof m === "object" && m.nombre ? {
   formato: m.formato === "nombrado" ? "nombrado" : "posicional",
   cuerpo: String(m.cuerpo || ""),
   vars: (Array.isArray(m.vars) ? m.vars : []).map((v) => ({ clave: String((v && v.clave) || ""), valor: String((v && v.valor) || "") })),
+  /* Cómo se ve en WhatsApp. `imagen` es la que sale en cada envío cuando el
+     encabezado es una imagen: Meta la pide cada vez. */
+  cabecera: String(m.cabecera || ""),
+  encabezado: String(m.encabezado || ""),
+  pie: String(m.pie || ""),
+  botones: botonesWa(m.botones),
+  imagen: String(m.imagen || ""),
 } : null);
 
 /* ── Plantillas creadas desde el CRM y mandadas a revisión ──
@@ -231,6 +238,12 @@ const metaWa = (m) => (m && typeof m === "object" && m.nombre ? {
    se mandó y en qué va, para preguntar por ella hasta que la decidan. `nueva`
    marca una decisión que todavía no viste: aprobada o rechazada, se avisa una
    vez y el envío lo das tú. */
+const botonesWa = (b) => (Array.isArray(b) ? b : []).map((x) => ({
+  tipo: x && x.tipo === "URL" ? "URL" : "RESPUESTA",
+  texto: String((x && x.texto) || ""),
+  url: String((x && x.url) || ""),
+}));
+
 const revisionWa = (r) => (r && typeof r === "object" && r.nombre ? {
   id: String(r.id || ""),
   nombre: String(r.nombre),
@@ -239,6 +252,7 @@ const revisionWa = (r) => (r && typeof r === "object" && r.nombre ? {
   estado: String(r.estado || "PENDING"),
   rechazo: String(r.rechazo || ""),
   enviadaEn: String(r.enviadaEn || ""),
+  imagen: String(r.imagen || ""),
   nueva: Boolean(r.nueva),
 } : null);
 
@@ -261,7 +275,7 @@ const nombreParaMeta = (txt) => String(txt || "").normalize("NFD").replace(/[\u0
 
 /* Lo que Meta rechazaría de entrada, dicho antes de mandarlo. Las reglas de
    contenido (qué se considera engañoso, la categoría) las decide su revisión. */
-const problemasParaMeta = ({ nombreMeta, cuerpo, encabezado, pie }) => {
+const problemasParaMeta = ({ nombreMeta, cuerpo, encabezado, pie, botones = [] }) => {
   const out = [];
   const txt = String(cuerpo || "").trim();
   if (!/^[a-z0-9_]{1,512}$/.test(nombreMeta || "")) out.push("El nombre para Meta sólo admite minúsculas, números y guion bajo.");
@@ -274,6 +288,13 @@ const problemasParaMeta = ({ nombreMeta, cuerpo, encabezado, pie }) => {
   if (/\}\}\s*\{\{/.test(txt)) out.push("Meta no deja dos variables seguidas.");
   if (encabezado && (encabezado.length > 60 || /\{\{|\n/.test(encabezado))) out.push("El encabezado va en una línea, sin variables y con 60 caracteres como mucho.");
   if (pie && (pie.length > 60 || /\{\{|\n/.test(pie))) out.push("El pie va en una línea, sin variables y con 60 caracteres como mucho.");
+  const llenos = botones.filter((b) => b.texto.trim() || b.url.trim());
+  if (llenos.filter((b) => b.tipo === "URL").length > 2) out.push("Meta acepta como mucho dos botones con enlace.");
+  llenos.forEach((b, i) => {
+    if (!b.texto.trim()) out.push(`Al botón ${i + 1} le falta el texto.`);
+    else if (b.texto.trim().length > 25) out.push(`El botón «${b.texto.trim()}» pasa de 25 caracteres.`);
+    if (b.tipo === "URL" && !/^https:\/\/\S+$/.test(b.url.trim())) out.push(`El botón «${b.texto.trim() || i + 1}» necesita un enlace que empiece por https://.`);
+  });
   return out;
 };
 
@@ -292,7 +313,11 @@ const aplicarRevisiones = (d, lista) => {
       return {
         ...t,
         body: p.cuerpo,
-        meta: { nombre: p.nombre, idioma: p.idioma, formato: p.formato, cuerpo: p.cuerpo, vars: p.vars.map((k) => ({ clave: k, valor: VARS_META.includes(k) ? `{{${k}}}` : "" })) },
+        meta: metaWa({
+          nombre: p.nombre, idioma: p.idioma, formato: p.formato, cuerpo: p.cuerpo,
+          vars: p.vars.map((k) => ({ clave: k, valor: VARS_META.includes(k) ? `{{${k}}}` : "" })),
+          cabecera: p.cabecera, encabezado: p.encabezado, pie: p.pie, botones: p.botones, imagen: rv.imagen,
+        }),
         revision: { ...rv, estado: "APPROVED", nueva: true },
       };
     }
@@ -324,8 +349,12 @@ const plantillaWaPara = (meta, rec, kind) => {
   if (vacia >= 0) {
     return { err: `La variable {{${meta.vars[vacia].clave}}} de «${meta.nombre}» queda vacía para ${titleOf(kind, rec)} (${meta.vars[vacia].valor || "sin dato"}).` };
   }
+  if (meta.cabecera === "IMAGE" && !meta.imagen) {
+    return { err: `«${meta.nombre}» lleva una imagen en el encabezado y no está elegida. Súbela en Plantillas.` };
+  }
   const porClave = new Map(meta.vars.map((v, i) => [v.clave, valores[i]]));
   return {
+    imagen: meta.cabecera === "IMAGE" ? meta.imagen : "",
     plantilla: meta.nombre,
     idioma: meta.idioma,
     variables: meta.formato === "nombrado" ? Object.fromEntries(porClave) : valores,
@@ -3146,7 +3175,7 @@ async function mandarWhatsApp(integ, telefono, texto, plantilla) {
   try {
     const r = await enviarWhatsApp({
       base: integ.puente.base, clave: integ.puente.clave, a: numero, texto,
-      ...(plantilla ? { plantilla: plantilla.plantilla, idioma: plantilla.idioma, variables: plantilla.variables } : {}),
+      ...(plantilla ? { plantilla: plantilla.plantilla, idioma: plantilla.idioma, variables: plantilla.variables, ...(plantilla.imagen ? { imagen: plantilla.imagen } : {}) } : {}),
     });
     return { ok: true, solo: true, id: (r && r.id) || "" };
   } catch (e) {
@@ -4115,10 +4144,11 @@ function EnlaceMetaWa({ db, draft, setDraft }) {
     if (!p) return;
     /* La primera variable casi siempre es el nombre de quien recibe; las
        demás se dejan para que se elijan a conciencia. */
-    poner({
+    poner(metaWa({
       nombre: p.nombre, idioma: p.idioma, formato: p.formato, cuerpo: p.cuerpo,
-      vars: p.vars.map((k, i) => ({ clave: k, valor: i === 0 ? "{{nombre}}" : "" })),
-    });
+      vars: p.vars.map((k, i) => ({ clave: k, valor: VARS_META.includes(k) ? `{{${k}}}` : i === 0 ? "{{nombre}}" : "" })),
+      cabecera: p.cabecera, encabezado: p.encabezado, pie: p.pie, botones: p.botones,
+    }));
     if (!draft.name.trim()) setDraft((d) => ({ ...d, name: p.nombre }));
   };
 
@@ -4132,7 +4162,13 @@ function EnlaceMetaWa({ db, draft, setDraft }) {
           <div style={{ ...titulo, marginBottom: 0, flex: 1 }}>PLANTILLA APROBADA · {meta.nombre} · {meta.idioma}</div>
           <Btn size="sm" variant="ghost" Icon={X} onClick={() => poner(null)}>Quitar enlace</Btn>
         </div>
-        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.55, background: "#DCF8C6", padding: "9px 11px", borderRadius: 8 }}>{cuerpoConVars(meta)}</div>
+        {meta.cabecera === "IMAGE" && (
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ ...titulo, marginBottom: 4 }}>IMAGEN DEL ENCABEZADO (SALE EN CADA ENVÍO)</div>
+            <SubirImagenWa pu={pu} valor={meta.imagen} onCambio={(img) => poner({ ...meta, imagen: img.url })} />
+          </div>
+        )}
+        <VistaWa imagen={meta.imagen} encabezado={meta.encabezado} cuerpo={cuerpoConVars(meta)} pie={meta.pie} botones={meta.botones} />
         {meta.vars.length > 0 && (
           <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "7px 10px", alignItems: "center", marginTop: 10 }}>
             {meta.vars.map((v, i) => (
@@ -4179,6 +4215,57 @@ function EnlaceMetaWa({ db, draft, setDraft }) {
   );
 }
 
+/* Cómo le va a llegar: la burbuja de WhatsApp con su imagen, el texto y los
+   botones debajo. Lo que va en las variables se ve como {{nombre}}. */
+function VistaWa({ imagen, encabezado, cuerpo, pie, botones = [] }) {
+  const llenos = botones.filter((b) => b.texto.trim());
+  return (
+    <div style={{ background: "#E5DDD5", borderRadius: 8, padding: 10 }}>
+      <div style={{ background: "#fff", borderRadius: 8, overflow: "hidden", maxWidth: 320, boxShadow: "0 1px 1px rgba(0,0,0,.12)" }}>
+        {imagen && <img src={imagen} alt="" style={{ display: "block", width: "100%", maxHeight: 220, objectFit: "cover" }} />}
+        <div style={{ padding: "8px 10px 6px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.5, color: "#111" }}>
+          {encabezado && <div style={{ fontWeight: 700, marginBottom: 4 }}>{encabezado}</div>}
+          <div style={{ whiteSpace: "pre-wrap" }}>{cuerpo || "…"}</div>
+          {pie && <div style={{ fontSize: 11, color: "#8696A0", marginTop: 4 }}>{pie}</div>}
+        </div>
+        {llenos.map((b, i) => (
+          <div key={i} style={{ borderTop: "1px solid #E9EDEF", padding: "8px 10px", textAlign: "center", fontFamily: "var(--ui)", fontSize: 12.5, color: "#027EB5", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            {b.tipo === "URL" ? <ExternalLink size={13} /> : <MessageSquare size={13} />}{b.texto}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* Sube la imagen del encabezado al puente y devuelve {id, url}. Se sube al
+   elegirla, no al mandar: así la vista previa ya es la que va a ver Meta. */
+function SubirImagenWa({ pu, valor, onCambio }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const elegir = async (e) => {
+    const archivo = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!archivo) return;
+    if (!["image/jpeg", "image/png"].includes(archivo.type)) { setErr("Tiene que ser JPG o PNG."); return; }
+    if (archivo.size > 5 * 1024 * 1024) { setErr("Meta acepta imágenes de hasta 5 MB."); return; }
+    setBusy(true); setErr("");
+    try { onCambio(await subirImagenWa({ base: pu.base, clave: pu.clave, archivo })); }
+    catch (x) { setErr((x && x.message) || String(x)); }
+    setBusy(false);
+  };
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <label className="crm-btn" style={{ border: `1px solid ${C.line}`, background: C.panel, borderRadius: 6, padding: "5px 11px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: busy ? "default" : "pointer" }}>
+        {busy ? "Subiendo…" : valor ? "Cambiar imagen" : "Subir imagen (JPG o PNG)"}
+        <input type="file" accept="image/jpeg,image/png" onChange={elegir} disabled={busy} style={{ display: "none" }} />
+      </label>
+      {valor && <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Lista. Recomendado: 1200×628 px.</span>}
+      {err && <span style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>{err}</span>}
+    </div>
+  );
+}
+
 /* Crear la plantilla en Meta sin salir del CRM: Claude la redacta si se le
    pide, se revisa aquí contra las reglas que Meta aplica de entrada, y se
    manda. La aprobación llega sola —el CRM pregunta cada cinco minutos— y el
@@ -4189,14 +4276,21 @@ function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
   const sufijo = rv && rv.estado === "REJECTED" ? "_v2" : "";
   const [nombreMeta, setNombreMeta] = useState(() => (rv && rv.estado === "REJECTED" ? `${rv.nombre}${sufijo}` : ""));
   const [categoria, setCategoria] = useState("MARKETING");
+  const [cabecera, setCabecera] = useState("IMAGE");
   const [encabezado, setEncabezado] = useState("");
+  const [imagen, setImagen] = useState(null);
   const [pie, setPie] = useState("");
+  const [botones, setBotones] = useState([{ tipo: "URL", texto: "", url: "" }]);
   const [idea, setIdea] = useState("");
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
 
   const nombreFinal = nombreMeta || nombreParaMeta(draft.name);
-  const problemas = problemasParaMeta({ nombreMeta: nombreFinal, cuerpo: draft.body, encabezado: encabezado.trim(), pie: pie.trim() });
+  const problemas = [
+    ...problemasParaMeta({ nombreMeta: nombreFinal, cuerpo: draft.body, encabezado: cabecera === "TEXT" ? encabezado.trim() : "", pie: pie.trim(), botones }),
+    ...(cabecera === "IMAGE" && !imagen ? ["Sube la imagen del encabezado, o elige otro tipo de encabezado."] : []),
+  ];
+  const ponerBoton = (i, cambio) => setBotones((bs) => bs.map((b, j) => (j === i ? { ...b, ...cambio } : b)));
 
   const redactar = async () => {
     setBusy("redactar"); setErr("");
@@ -4224,11 +4318,17 @@ function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
         base: pu.base, clave: pu.clave,
         plantilla: {
           nombre: nombreFinal, idioma: "es", categoria, cuerpo,
-          encabezado: encabezado.trim(), pie: pie.trim(),
+          encabezado: cabecera === "TEXT" ? encabezado.trim() : "",
+          imagen: cabecera === "IMAGE" && imagen ? imagen.id : "",
+          pie: pie.trim(),
+          botones: botones.filter((b) => b.texto.trim()).map((b) => ({ tipo: b.tipo, texto: b.texto.trim(), url: b.url.trim() })),
           ejemplos: Object.fromEntries(vars.map((k) => [k, EJEMPLOS_META[k]])),
         },
       });
-      onEnviada({ id: r.id, nombre: r.nombre, idioma: r.idioma, categoria: r.categoria, estado: r.estado, rechazo: "", enviadaEn: nowISO(), nueva: false });
+      onEnviada({
+        id: r.id, nombre: r.nombre, idioma: r.idioma, categoria: r.categoria, estado: r.estado, rechazo: "", enviadaEn: nowISO(), nueva: false,
+        imagen: cabecera === "IMAGE" && imagen ? imagen.url : "",
+      });
     } catch (e) { setErr((e && e.message) || String(e)); }
     setBusy("");
   };
@@ -4275,11 +4375,40 @@ function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
               <option value="MARKETING">Marketing (promociones, novedades)</option>
               <option value="UTILITY">Utilidad (avisos de algo ya en curso)</option>
             </select>
-            <input className="crm-in" value={encabezado} placeholder="Encabezado (opcional)" maxLength={60}
-              onChange={(e) => setEncabezado(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+            <select className="crm-in" value={cabecera} onChange={(e) => setCabecera(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }}>
+              <option value="IMAGE">Encabezado: imagen</option>
+              <option value="TEXT">Encabezado: texto</option>
+              <option value="">Sin encabezado</option>
+            </select>
             <input className="crm-in" value={pie} placeholder="Pie (opcional), p. ej. Responde SALIR para no recibir más" maxLength={60}
               onChange={(e) => setPie(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
           </div>
+          {cabecera === "IMAGE" && <SubirImagenWa pu={pu} valor={imagen} onCambio={setImagen} />}
+          {cabecera === "TEXT" && (
+            <input className="crm-in" value={encabezado} placeholder="Texto del encabezado (una línea)" maxLength={60}
+              onChange={(e) => setEncabezado(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {botones.map((b, i) => (
+              <div key={i} style={{ display: "grid", gridTemplateColumns: "130px 1fr 1.4fr auto", gap: 6, alignItems: "center" }}>
+                <select className="crm-in" value={b.tipo} onChange={(e) => ponerBoton(i, { tipo: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }}>
+                  <option value="URL">Botón con enlace</option>
+                  <option value="RESPUESTA">Respuesta rápida</option>
+                </select>
+                <input className="crm-in" value={b.texto} maxLength={25} placeholder="Texto, p. ej. Registrarme"
+                  onChange={(e) => ponerBoton(i, { texto: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                {b.tipo === "URL"
+                  ? <input className="crm-in" value={b.url} placeholder="https://…" onChange={(e) => ponerBoton(i, { url: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                  : <span style={nota}>Abre la conversación con ese texto.</span>}
+                <Btn size="sm" variant="ghost" Icon={X} onClick={() => setBotones((bs) => bs.filter((_, j) => j !== i))} />
+              </div>
+            ))}
+            {botones.length < 3 && (
+              <div><Btn size="sm" variant="ghost" Icon={Plus} onClick={() => setBotones((bs) => [...bs, { tipo: bs.filter((x) => x.tipo === "URL").length >= 2 ? "RESPUESTA" : "URL", texto: "", url: "" }])}>Agregar botón</Btn></div>
+            )}
+          </div>
+          <VistaWa imagen={cabecera === "IMAGE" && imagen ? imagen.url : ""} encabezado={cabecera === "TEXT" ? encabezado : ""}
+            cuerpo={draft.body} pie={pie} botones={botones} />
           {problemas.length > 0 && draft.body.trim() && (
             <ul style={{ margin: 0, paddingLeft: 18, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>
               {problemas.map((x) => <li key={x}>{x}</li>)}
@@ -4356,6 +4485,7 @@ function TemplatesView({ db, setDb, say, onEnviar }) {
             </div>
             {t.subject && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.blue, marginTop: 6 }}>Asunto: {t.subject}</div>}
             {t.html && <div style={{ marginTop: 7 }}><Pill color={C.blue} soft={C.blueSoft}>HTML anexo · {pesoKb(t.html)} KB</Pill></div>}
+            {t.meta && t.meta.imagen && <img src={t.meta.imagen} alt="" style={{ display: "block", width: "100%", maxHeight: 140, objectFit: "cover", borderRadius: 6, marginTop: 8 }} />}
             {t.meta && (
               <div style={{ marginTop: 7, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <Pill color={C.jade} soft={C.jadeSoft}>Aprobada en Meta · {t.meta.nombre}</Pill>

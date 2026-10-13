@@ -44,6 +44,10 @@ META_AD_ACCOUNT = "act_281487689280491"
 # de la API, como "Identificador del número de teléfono".
 WA_PHONE_ID = "1339016502634465"
 
+# Meta — el identificador de la app (developers.facebook.com → Mis apps). Hace
+# falta para subir la imagen de ejemplo al crear una plantilla con imagen.
+META_APP_ID = "1768965847650468"
+
 # WhatsApp — el identificador de la cuenta de WhatsApp Business, para leer las
 # plantillas aprobadas. Está en business.facebook.com → Cuentas → Cuentas de
 # WhatsApp, debajo del nombre de la cuenta.
