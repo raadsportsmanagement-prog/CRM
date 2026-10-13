@@ -1,5 +1,6 @@
 name = "crm-medidor"
 main = "worker.js"
+account_id = "37a4f1c5346b8417a7e4d73114b5b281" # cuenta ivan@raadsports.com, la misma del CRM
 compatibility_date = "2025-01-01"
 
 # Donde se anotan los eventos. Crea el espacio con:
@@ -10,7 +11,7 @@ compatibility_date = "2025-01-01"
 # una vez y renueva solo. Por eso hace falta aunque no midas correos.
 [[kv_namespaces]]
 binding = "EVENTOS"
-id = "d0e635cc8b7140feb25259c02d505de6"
+id = "c7e35f61a51d49aeab9eed36a352dac4"
 
 # La clave NO va en este archivo: este archivo entra al repositorio.
 # Se guarda cifrada en Cloudflare con:
@@ -41,7 +42,22 @@ META_AD_ACCOUNT = "act_281487689280491"
 # WhatsApp — el identificador del número remitente. NO es el número de
 # teléfono: está en developers.facebook.com → tu app → WhatsApp → Configuración
 # de la API, como "Identificador del número de teléfono".
-WA_PHONE_ID = ""
+WA_PHONE_ID = "1339016502634465"
+
+# WhatsApp — el identificador de la cuenta de WhatsApp Business, para leer las
+# plantillas aprobadas. Está en business.facebook.com → Cuentas → Cuentas de
+# WhatsApp, debajo del nombre de la cuenta.
+WA_WABA_ID = "1435679215133577"
+
+# WhatsApp por Twilio — en vez de Meta. Con TWILIO_ACCOUNT_SID puesto, todo
+# WhatsApp sale y entra por Twilio y lo de WA_* de arriba se ignora; vacío,
+# sigue por Meta. Los dos están en console.twilio.com:
+#   · el Account SID, en la portada (empieza por "AC"). No es secreto: el
+#     secreto es el Auth Token, que va con `wrangler secret put TWILIO_AUTH_TOKEN`.
+#   · el número virtual ya aprobado para WhatsApp, con su indicativo, p. ej.
+#     "+15551234567". Está en Messaging → Senders → WhatsApp senders.
+TWILIO_ACCOUNT_SID = ""
+TWILIO_WA_FROM = ""
 
 # Google Ads — el ID de cliente de OAuth (termina en .apps.googleusercontent.com).
 # Identifica la aplicación, no a ti; el secreto sí va aparte.

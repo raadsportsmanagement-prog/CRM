@@ -19,6 +19,14 @@ const TAREAS = {
   correo: "Redacta el próximo correo para esta persona. Primera línea: «Asunto: …». Después el cuerpo, sin firma (la firma la agrega el CRM).",
   siguiente: "Propón el siguiente paso concreto con esta ficha (llamar, escribir, mover el negocio de etapa, esperar…) y por qué, en no más de cinco líneas.",
   pregunta: "Responde la pregunta del usuario sobre esta ficha.",
+  plantilla: `Redacta el texto de una plantilla de WhatsApp de marketing para mandarla a aprobación de Meta, a partir de las indicaciones del usuario. No hay ficha: el mismo texto le llegará a muchas personas.
+Reglas de Meta que tiene que cumplir:
+- Máximo 550 caracteres. Tono cercano y claro, con una sola llamada a la acción.
+- Para personalizar, usa sólo estas variables, escritas tal cual: {{nombre}}, {{apellido}}, {{institucion}}, {{empresa}}. Úsalas con moderación: con {{nombre}} suele bastar.
+- El mensaje no puede empezar ni terminar con una variable, ni llevar dos variables seguidas.
+- Nada de enlaces acortados, promesas engañosas ni texto todo en mayúsculas. Como mucho dos o tres emojis.
+- No incluyas encabezado, pie ni botones: sólo el cuerpo.
+Devuelve sólo el texto del mensaje.`,
 };
 
 const SISTEMA = `Eres el asistente comercial dentro del CRM de Raad Sports. Trabajas con la ficha que te pasan (propiedades, empresa, negocios e historial de correos, WhatsApp, llamadas y notas).
@@ -47,9 +55,10 @@ export async function atenderClaude(req, env) {
   if (ficha.length > MAX_CONTEXTO) return json({ error: "La ficha es demasiado larga para mandarla completa." }, 413);
   const pregunta = String(cuerpo.pregunta || "").slice(0, 4000);
   if (tarea === "pregunta" && !pregunta.trim()) return json({ error: "Escribe la pregunta." }, 400);
+  if (tarea === "plantilla" && !pregunta.trim()) return json({ error: "Cuenta de qué se trata el mensaje." }, 400);
 
   const pedido = [
-    `<ficha>\n${ficha}\n</ficha>`,
+    ...(tarea === "plantilla" ? [] : [`<ficha>\n${ficha}\n</ficha>`]),
     TAREAS[tarea],
     ...(pregunta.trim() ? [`Indicaciones del usuario: ${pregunta}`] : []),
   ].join("\n\n");

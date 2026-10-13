@@ -71,6 +71,25 @@ export const enviarWhatsApp = ({ base, clave, a, texto, plantilla, idioma, varia
     body: JSON.stringify({ a, texto, plantilla, idioma, variables }),
   });
 
+/* Las plantillas que Meta ya aprobó, para enlazarlas a una del CRM. */
+export const traerPlantillasWa = ({ base, clave }) => pedir(base, clave, "/wa/plantillas");
+
+/* Crea una plantilla en Meta y la deja en revisión. Lo que contesta es su
+   estado de salida —casi siempre PENDING—; la aprobación llega después y se
+   lee con traerPlantillasWa. */
+export const crearPlantillaWa = ({ base, clave, plantilla }) =>
+  pedir(base, clave, "/wa/plantillas/crear", {}, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plantilla),
+  });
+
+/* Lo que te escribieron por WhatsApp desde una marca. La marca es la hora del
+   puente, no la de este computador: así un reloj atrasado aquí no hace perder
+   ni repetir nada. */
+export const traerWhatsApp = ({ base, clave, desde }) =>
+  pedir(base, clave, "/wa/mensajes", { desde: String(Number(desde) || 0) });
+
 /* ────────────────────────────────────────────────────────────
    Traer los leads
    ──────────────────────────────────────────────────────────── */

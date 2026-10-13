@@ -23,6 +23,19 @@ META_PAGE_TOKEN=
 # de arriba, pero con el permiso whatsapp_business_messaging añadido.
 WA_TOKEN=
 
+# Para recibir lo que te escriben (el webhook). El secreto de la app está en
+# developers.facebook.com → tu app → Configuración de la app → Básica →
+# "Clave secreta de la app". El token de verificación lo inventas tú y lo
+# escribes igual en Meta al configurar el webhook.
+WA_APP_SECRET=
+WA_VERIFY_TOKEN=
+
+# ── WhatsApp por Twilio ──
+# Sólo si mandas WhatsApp por Twilio en vez de por Meta. Es el "Auth Token" de
+# console.twilio.com, en la portada, debajo del Account SID. Sirve también para
+# comprobar la firma de los mensajes que llegan.
+TWILIO_AUTH_TOKEN=
+
 # ── Google Ads ──
 # El secreto del ID de cliente de OAuth. El ID va en wrangler.toml; esto no.
 GADS_CLIENT_SECRET=

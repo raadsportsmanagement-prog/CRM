@@ -6,7 +6,8 @@ import {
   Code2, Paperclip, Inbox, RefreshCw, CornerDownLeft, ArrowDownLeft, User,
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
-  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter
+  Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
+  Trophy
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -19,8 +20,8 @@ import {
   midiendo, nuevoTrk, marcarHtml, textoAHtml, traerEventos, estadoDe,
 } from "./tracking.js";
 import {
-  traerLeads, traerCampanas, enviarWhatsApp, probarPuente,
-  leadAProps, leadATexto, leadAAsunto, nombrePlataforma,
+  traerLeads, traerCampanas, enviarWhatsApp, probarPuente, traerPlantillasWa, crearPlantillaWa, traerWhatsApp,
+  leadAProps, leadATexto, leadAAsunto, nombrePlataforma, partirNombre,
 } from "./anuncios.js";
 import {
   EVENTOS, ACCIONES, OPERADORES, EJEMPLOS, eventoDe, accionDe, esSaliente, necesitaMano,
@@ -29,6 +30,7 @@ import {
   textoAccion, avisosDe, cumple, disparar, barrerFrios, podarMarcas, esperaEnTexto,
   coleccionDe, buscarFicha,
 } from "./automations.js";
+import { ANOS, GRUPOS, DIVISIONES, analizarRoster } from "./drafts.js";
 
 /* ────────────────────────────────────────────────────────────
    Paleta y tipografía
@@ -209,6 +211,128 @@ const applyTemplate = (text, rec, kind, enHtml) => {
   });
 };
 
+/* ── Plantillas de WhatsApp aprobadas en Meta ──
+   Una plantilla del CRM puede ir enlazada a una que Meta ya aprobó. Por la
+   API eso es lo único que deja escribirle a alguien que no te ha escrito en
+   las últimas 24 horas, y Meta exige que salga tal cual la aprobó: lo único
+   que cambia de una persona a otra son sus variables. Por eso el enlace
+   guarda, por cada variable, qué dato del CRM va ahí ({{nombre}},
+   {{institucion}}…), y el texto de la plantilla no se edita desde aquí. */
+const metaWa = (m) => (m && typeof m === "object" && m.nombre ? {
+  nombre: String(m.nombre),
+  idioma: String(m.idioma || "es"),
+  formato: m.formato === "nombrado" ? "nombrado" : "posicional",
+  cuerpo: String(m.cuerpo || ""),
+  vars: (Array.isArray(m.vars) ? m.vars : []).map((v) => ({ clave: String((v && v.clave) || ""), valor: String((v && v.valor) || "") })),
+} : null);
+
+/* ── Plantillas creadas desde el CRM y mandadas a revisión ──
+   La revisión es de Meta y tarda lo que tarde; aquí se guarda con qué nombre
+   se mandó y en qué va, para preguntar por ella hasta que la decidan. `nueva`
+   marca una decisión que todavía no viste: aprobada o rechazada, se avisa una
+   vez y el envío lo das tú. */
+const revisionWa = (r) => (r && typeof r === "object" && r.nombre ? {
+  id: String(r.id || ""),
+  nombre: String(r.nombre),
+  idioma: String(r.idioma || "es"),
+  categoria: r.categoria === "UTILITY" ? "UTILITY" : "MARKETING",
+  estado: String(r.estado || "PENDING"),
+  rechazo: String(r.rechazo || ""),
+  enviadaEn: String(r.enviadaEn || ""),
+  nueva: Boolean(r.nueva),
+} : null);
+
+const revisionAbierta = (r) => Boolean(r) && r.estado !== "APPROVED" && r.estado !== "REJECTED";
+
+/* Las variables que el CRM sabe llenar —las de applyTemplate—. Una plantilla
+   que pida otra cosa saldría con el {{hueco}} a la vista, así que no se manda. */
+const VARS_META = ["nombre", "apellido", "institucion", "empresa", "correo", "telefono"];
+
+/* Meta pide un ejemplo por variable para revisarla. Van inventados a
+   propósito: lo que se le manda a revisión no tiene por qué llevar datos de
+   personas reales. */
+const EJEMPLOS_META = {
+  nombre: "Ana", apellido: "Gómez", institucion: "Club Deportivo Los Andes",
+  empresa: "Club Deportivo Los Andes", correo: "ana@ejemplo.com", telefono: "3001234567",
+};
+
+const nombreParaMeta = (txt) => String(txt || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60);
+
+/* Lo que Meta rechazaría de entrada, dicho antes de mandarlo. Las reglas de
+   contenido (qué se considera engañoso, la categoría) las decide su revisión. */
+const problemasParaMeta = ({ nombreMeta, cuerpo, encabezado, pie }) => {
+  const out = [];
+  const txt = String(cuerpo || "").trim();
+  if (!/^[a-z0-9_]{1,512}$/.test(nombreMeta || "")) out.push("El nombre para Meta sólo admite minúsculas, números y guion bajo.");
+  if (!txt) out.push("Escribe el mensaje.");
+  if (txt.length > 1024) out.push(`El mensaje tiene ${txt.length} caracteres; Meta acepta hasta 1.024.`);
+  const vars = [...txt.matchAll(/\{\{\s*([^}]*?)\s*\}\}/g)].map((m) => m[1]);
+  const raras = [...new Set(vars.filter((k) => !VARS_META.includes(k)))];
+  if (raras.length) out.push(`El CRM no sabe qué poner en ${raras.map((k) => `{{${k}}}`).join(", ")}. Usa ${VARS_META.slice(0, 4).map((k) => `{{${k}}}`).join(", ")}.`);
+  if (/^\{\{/.test(txt) || /\}\}$/.test(txt)) out.push("Meta no deja que el mensaje empiece o termine con una variable.");
+  if (/\}\}\s*\{\{/.test(txt)) out.push("Meta no deja dos variables seguidas.");
+  if (encabezado && (encabezado.length > 60 || /\{\{|\n/.test(encabezado))) out.push("El encabezado va en una línea, sin variables y con 60 caracteres como mucho.");
+  if (pie && (pie.length > 60 || /\{\{|\n/.test(pie))) out.push("El pie va en una línea, sin variables y con 60 caracteres como mucho.");
+  return out;
+};
+
+/* Pasa lo que contestó Meta a las plantillas del CRM. Una aprobada queda
+   enlazada con cada variable apuntando al dato del mismo nombre, que es como
+   se escribió; lista para enviar sin tocar nada. Devuelve qué avisar. */
+const aplicarRevisiones = (d, lista) => {
+  const avisos = [];
+  const whatsapp = d.templates.whatsapp.map((t) => {
+    const rv = t.revision;
+    if (!revisionAbierta(rv)) return t;
+    const p = lista.find((x) => (rv.id && x.id === rv.id) || (x.nombre === rv.nombre && x.idioma === rv.idioma));
+    if (!p || p.estado === rv.estado) return t;
+    if (p.estado === "APPROVED") {
+      avisos.push(`Meta aprobó «${t.name}». Ya la puedes enviar desde Plantillas.`);
+      return {
+        ...t,
+        body: p.cuerpo,
+        meta: { nombre: p.nombre, idioma: p.idioma, formato: p.formato, cuerpo: p.cuerpo, vars: p.vars.map((k) => ({ clave: k, valor: VARS_META.includes(k) ? `{{${k}}}` : "" })) },
+        revision: { ...rv, estado: "APPROVED", nueva: true },
+      };
+    }
+    if (p.estado === "REJECTED") {
+      avisos.push(`Meta rechazó «${t.name}». Mira el motivo en Plantillas.`);
+      return { ...t, revision: { ...rv, estado: "REJECTED", rechazo: p.rechazo || "", nueva: true } };
+    }
+    return { ...t, revision: { ...rv, estado: p.estado } };
+  });
+  return { d: avisos.length || whatsapp.some((t, i) => t !== d.templates.whatsapp[i]) ? { ...d, templates: { ...d.templates, whatsapp } } : d, avisos };
+};
+
+/* Por qué la rechazó, en palabras. Meta contesta con una clave en inglés. */
+const MOTIVO_RECHAZO = {
+  ABUSIVE_CONTENT: "contenido que Meta considera abusivo",
+  INCORRECT_CATEGORY: "la categoría no corresponde al contenido",
+  INVALID_FORMAT: "formato inválido (variables, longitud o caracteres)",
+  SCAM: "Meta lo consideró posible fraude",
+  PROMOTIONAL: "es promocional y se mandó como utilidad",
+  TAG_CONTENT_MISMATCH: "el contenido no coincide con la categoría",
+};
+
+/* Lo que se le pide a Meta para una ficha: cada variable con su valor, y el
+   texto ya armado para el historial. Meta rechaza una variable vacía o con
+   saltos de línea, así que eso se ataja aquí con un mensaje que se entienda. */
+const plantillaWaPara = (meta, rec, kind) => {
+  const valores = meta.vars.map((v) => applyTemplate(v.valor, rec, kind).replace(/\s+/g, " ").trim());
+  const vacia = meta.vars.findIndex((_, i) => !valores[i]);
+  if (vacia >= 0) {
+    return { err: `La variable {{${meta.vars[vacia].clave}}} de «${meta.nombre}» queda vacía para ${titleOf(kind, rec)} (${meta.vars[vacia].valor || "sin dato"}).` };
+  }
+  const porClave = new Map(meta.vars.map((v, i) => [v.clave, valores[i]]));
+  return {
+    plantilla: meta.nombre,
+    idioma: meta.idioma,
+    variables: meta.formato === "nombrado" ? Object.fromEntries(porClave) : valores,
+    texto: meta.cuerpo.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, k) => (porClave.has(k) ? porClave.get(k) : m)),
+  };
+};
+
 const titleOf = (kind, rec) => {
   const p = rec.props || {};
   if (kind === "contact") return [p.firstName, p.lastName].filter(Boolean).join(" ") || "Sin nombre";
@@ -237,7 +361,7 @@ const emptyDb = () => ({
   /* Mensajes: hasta dónde llegó el último barrido del correo y cuándo se abrió
      cada conversación por última vez, que es lo que decide qué sale marcado
      como nuevo. */
-  buzon: { correoAl: "", rebotesAl: "", eventosAl: "", leadsAl: "", vistoEn: {} },
+  buzon: { correoAl: "", rebotesAl: "", eventosAl: "", leadsAl: "", whatsappAl: "", vistoEn: {} },
   /* Automatizaciones: las reglas, lo que quedó esperando la hora o el visto
      bueno, el rastro de lo que hicieron y a qué fichas frías ya se les avisó. */
   automations: [],
@@ -252,6 +376,8 @@ const emptyDb = () => ({
      miembros cambian solos; una fija guarda personas concretas. */
   vistas: [],
   listas: [],
+  /* Drafts: cada roster analizado con sus jugadores (ver src/drafts.js). */
+  drafts: [],
 });
 
 const PAPELERA_DIAS = 15;
@@ -317,7 +443,7 @@ function normalizeDb(raw) {
     /* Las plantillas guardadas antes del diseño HTML no traen ese campo: se
        completa vacío para que la pantalla no tenga que adivinarlo. */
     templates: {
-      whatsapp: arr(d.templates && d.templates.whatsapp).map((t) => ({ ...t, html: "" })),
+      whatsapp: arr(d.templates && d.templates.whatsapp).map((t) => ({ ...t, html: "", meta: metaWa(t && t.meta), revision: revisionWa(t && t.revision) })),
       email: arr(d.templates && d.templates.email).map((t) => ({ ...t, html: String((t && t.html) || "") })),
     },
     integrations: normalizeIntegrations(d.integrations),
@@ -332,6 +458,9 @@ function normalizeDb(raw) {
       /* Hasta dónde se trajeron los leads de los anuncios. Vacío quiere decir
          "nunca", y entonces se piden los 90 días que Meta todavía conserva. */
       leadsAl: String((d.buzon && d.buzon.leadsAl) || ""),
+      /* Hasta dónde se recogió lo que llegó por WhatsApp. Es la hora del
+         puente en milisegundos, no una fecha de este computador. */
+      whatsappAl: String((d.buzon && d.buzon.whatsappAl) || ""),
       vistoEn: (d.buzon && typeof d.buzon.vistoEn === "object" && d.buzon.vistoEn) || {},
     },
     papelera: {
@@ -346,6 +475,7 @@ function normalizeDb(raw) {
     vistas: arr(d.vistas).filter((v) => v && v.id && v.kind),
     listas: arr(d.listas).filter((l) => l && l.id && l.kind)
       .map((l) => ({ ...l, tipo: l.tipo === "fija" ? "fija" : "activa", ids: arr(l.ids) })),
+    drafts: arr(d.drafts).filter((x) => x && x.id).map((x) => ({ ...x, jugadores: arr(x.jugadores) })),
   };
 }
 
@@ -873,6 +1003,63 @@ export default function CRM() {
     return { fichas: fichas.length, leads: importActivities(acts) };
   };
 
+  /* ── Lo que te escribieron por WhatsApp ──
+     Cada mensaje se pega a la ficha con ese teléfono, buscada entre contactos
+     y empresas con el número ya normalizado. Si nadie lo tiene, se crea un
+     contacto: alguien que te escribe a tu número de empresa es un lead, y un
+     mensaje sin ficha no aparecería en ningún hilo. El identificador de Meta
+     viaja en `ext`, y con eso importActivities descarta lo que ya entró. */
+  const importarWhatsApp = (mensajes) => {
+    const actual = dbRef.current || db;
+    const vistos = new Set((actual.activities || []).map((a) => a.ext).filter(Boolean));
+    const entran = (mensajes || []).filter((m) => m && m.ext && m.de && !vistos.has(m.ext));
+    if (!entran.length) return { mensajes: 0, fichas: 0 };
+
+    const cc = actual.integrations.whatsapp.countryCode;
+    const porTel = new Map();
+    for (const kind of ["contact", "company"]) {
+      (actual[collKey(kind)] || []).forEach((r) => {
+        const t = toE164(r.props.phone, cc);
+        if (t && !porTel.has(t)) porTel.set(t, { kind, id: r.id });
+      });
+    }
+
+    const fichas = [], acts = [];
+    for (const m of entran) {
+      const tel = String(m.de).replace(/\D/g, "");
+      let f = porTel.get(tel);
+      if (!f) {
+        const { nombre, apellido } = partirNombre({ nombre_completo: m.nombre || "" });
+        const id = uid();
+        fichas.push({
+          id,
+          props: {
+            firstName: nombre || `+${tel}`, lastName: apellido, phone: `+${tel}`,
+            leadSource: "WhatsApp", leadStatus: "Nuevo", createdAt: m.at, lastActivityAt: m.at,
+          },
+        });
+        f = { kind: "contact", id };
+        porTel.set(tel, f);
+      }
+      acts.push({
+        ext: m.ext, type: "whatsapp", dir: "in", at: m.at,
+        subject: "Mensaje de WhatsApp", body: m.texto || "",
+        contactIds: f.kind === "contact" ? [f.id] : [],
+        companyIds: f.kind === "company" ? [f.id] : [],
+      });
+    }
+    if (fichas.length) {
+      /* Por addRecords, para que despierte "entra un contacto nuevo". Y se
+         adelanta al cuaderno en memoria: el mensaje que entra justo después
+         dispara "contestan un mensaje", y esa regla busca la ficha ahí antes
+         de que React haya terminado de guardarla. */
+      addRecords("contact", fichas);
+      const base = dbRef.current || db;
+      dbRef.current = { ...base, contacts: [...fichas, ...(base.contacts || [])] };
+    }
+    return { mensajes: importActivities(acts), fichas: fichas.length };
+  };
+
   /* ── Lo que anotó el medidor ──
      Los eventos llegan sueltos —"el envío ab12ef abrió a tal hora"— y aquí se
      pegan a la actividad que los espera. El identificador es lo único que los
@@ -1180,9 +1367,12 @@ export default function CRM() {
     const enlaces = enlacesDe(p.kind, p.recId);
 
     if (!esCorreo) {
-      const r = await mandarWhatsApp(integ, rec.props.phone, cuerpo);
+      const pw = t.meta ? plantillaWaPara(t.meta, rec, kindT) : null;
+      if (pw && pw.err) return { ok: false, err: pw.err };
+      const texto = pw ? pw.texto : cuerpo;
+      const r = await mandarWhatsApp(integ, rec.props.phone, texto, pw);
       if (!r.ok) return r;
-      logActivity({ type: "whatsapp", subject: asunto, body: cuerpo, auto: p.autoId, ...enlaces });
+      logActivity({ type: "whatsapp", subject: asunto, body: texto, auto: p.autoId, ...enlaces });
       return { ok: true, texto: `${r.solo ? "WhatsApp enviado a" : "WhatsApp abierto para"} ${titleOf(ent, rec)}` };
     }
 
@@ -1258,6 +1448,8 @@ export default function CRM() {
      anterior se quedaba media hora quieto en la pantalla —el tiempo hasta el
      siguiente latido— con la hora de salida ya pasada a la vista. */
   const datosListos = Boolean(db);
+  const waPregunta = useRef(0);
+  const revPregunta = useRef(0);
   useEffect(() => {
     if (!datosListos) return undefined;
     let vivo = true;
@@ -1265,6 +1457,28 @@ export default function CRM() {
       const d = dbRef.current;
       if (!d || !vivo) return;
       const ahora = Date.now();
+
+      /* 0. Lo que llegó por WhatsApp, cada minuto. Un mensaje que espera a que
+            alguien pulse Actualizar es una respuesta que se enfría; y la regla
+            de "cuando me contesten" tiene que despertar sola. */
+      if (ahora - waPregunta.current >= 55000) {
+        waPregunta.current = ahora;
+        try { await recogerWhatsApp(d, importarWhatsApp, marcarBuzon); } catch (_) { /* se reintenta en el siguiente latido */ }
+      }
+
+      /* 0b. Las plantillas que esperan la revisión de Meta, cada cinco
+             minutos. Meta suele decidir en minutos, pero no avisa a nadie que
+             no tenga el webhook publicado: hay que ir a preguntar. */
+      const pu = d.integrations.puente;
+      if (pu.base && pu.clave && d.templates.whatsapp.some((t) => revisionAbierta(t.revision)) && ahora - revPregunta.current >= 290000) {
+        revPregunta.current = ahora;
+        try {
+          const lista = (await traerPlantillasWa({ base: pu.base, clave: pu.clave })).plantillas || [];
+          const avisos = aplicarRevisiones(dbRef.current, lista).avisos;
+          setDb((db2) => aplicarRevisiones(db2, lista).d);
+          if (avisos.length) say(avisos.join(" "));
+        } catch (_) { /* se reintenta en cinco minutos */ }
+      }
 
       /* 1. Lo programado que ya llegó a su hora. */
       const maduros = (d.autoCola || []).filter((x) => x.estado === "espera" && Date.parse(x.listaEn) <= ahora);
@@ -1299,13 +1513,17 @@ export default function CRM() {
         frios.forEach((e) => emitir(e));
       }
 
-      /* 3. Los correos de las reglas en modo automático, que sólo pueden salir
-            solos con Gmail conectado. */
+      /* 3. Los envíos de las reglas en modo automático. Un correo sólo sale
+            solo con Gmail conectado, y un WhatsApp sólo por la API: por enlace
+            alguien tiene que dar el último clic. */
       const solas = new Set((d.automations || []).filter((a) => a.modo === "auto").map((a) => a.id));
+      const correoSolo = d.integrations.email.mode === EMAIL_MODES.gmailApi && gmailStatus().connected;
+      const waSolo = d.integrations.whatsapp.modo === "api" && Boolean(d.integrations.puente.base && d.integrations.puente.clave);
       const auto = (d.autoCola || []).filter((x) => (
-        x.estado === "listo" && x.accion.tipo === "correo" && solas.has(x.autoId) && !enviando.current.has(x.id)
+        x.estado === "listo" && solas.has(x.autoId) && !enviando.current.has(x.id) &&
+        ((x.accion.tipo === "correo" && correoSolo) || (x.accion.tipo === "whatsapp" && waSolo))
       ));
-      if (auto.length && d.integrations.email.mode === EMAIL_MODES.gmailApi && gmailStatus().connected) {
+      if (auto.length) {
         for (const x of auto.slice(0, 10)) {
           if (!vivo) break;
           await atenderPendiente(x);
@@ -1343,6 +1561,7 @@ export default function CRM() {
 
   const sinLeer = contarSinLeer(db);
   const porAtender = (db.autoCola || []).filter((x) => x.estado === "listo").length;
+  const plantillasNuevas = db.templates.whatsapp.filter((t) => t.revision && t.revision.nueva).length;
 
   const NAV = [
     { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
@@ -1350,6 +1569,7 @@ export default function CRM() {
     { key: "contact", label: "Contactos", Icon: Users },
     { key: "company", label: "Empresas", Icon: Building2 },
     { key: "deal", label: "Negocios", Icon: Briefcase },
+    { key: "drafts", label: "Drafts", Icon: Trophy },
     { key: "activities", label: "Actividades", Icon: Activity },
     { key: "templates", label: "Plantillas", Icon: MessageSquare },
     { key: "automations", label: "Automatizaciones", Icon: Zap },
@@ -1382,7 +1602,7 @@ export default function CRM() {
           </div>
           {NAV.map(({ key, label, Icon }) => {
             const on = view === key;
-            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : 0;
+            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : 0;
             return (
               <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
                 style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
@@ -1412,18 +1632,20 @@ export default function CRM() {
             <MessagesView db={db} say={say} setDetail={setDetail} setView={setView}
               onLog={logActivity} onImport={importActivities} onBuzon={marcarBuzon} onVisto={marcarVisto}
               onEventos={aplicarEventos} onRebotes={aplicarRebotes}
-              onLeerBandeja={activarLectura} onLeads={importarLeads} />
+              onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
           )}
           {(view === "contact" || view === "company") && (
             <RecordList key={view} kind={view} db={db} setDb={setDb} say={say} setModal={setModal} setDetail={setDetail} onDelete={(ids) => { deleteRecords(view, ids); say(`${ids.length} registro(s) eliminados`); }} />
           )}
           {view === "deal" && <DealsView db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord("deal", id, { stage, lastActivityAt: nowISO() }); say(`Negocio movido a ${stage}`); }} />}
+          {view === "drafts" && <DraftsView db={db} setDb={setDb} say={say} />}
           {view === "activities" && (
             <ActivitiesView db={db} setModal={setModal} setDetail={setDetail} say={say}
               onImport={importActivities} onBuzon={marcarBuzon} onEventos={aplicarEventos} onRebotes={aplicarRebotes}
-              onLeerBandeja={activarLectura} onLeads={importarLeads} />
+              onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
           )}
-          {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say} />}
+          {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say}
+            onEnviar={(plantillaId) => setModal({ kind: "send", channel: "whatsapp", objKind: "contact", ids: db.contacts.map((c) => c.id), plantillaId })} />}
           {view === "automations" && (
             <AutomationsView db={db} setDb={setDb} say={say} setDetail={setDetail}
               onAtender={atenderPendiente} onCerrar={cerrarPendiente} />
@@ -1503,7 +1725,7 @@ export default function CRM() {
           }} />
       )}
       {modal?.kind === "send" && (
-        <SendModal db={db} channel={modal.channel} kind={modal.objKind} ids={modal.ids} listaId={modal.listaId}
+        <SendModal db={db} channel={modal.channel} kind={modal.objKind} ids={modal.ids} listaId={modal.listaId} plantillaId={modal.plantillaId}
           onClose={() => setModal(null)}
           onLogOne={(id, payload) => logActivity({
             type: modal.channel, subject: payload.subject, body: payload.body,
@@ -2591,7 +2813,7 @@ function EnvioDetalle({ v, onVolver, setDetail }) {
 /* ────────────────────────────────────────────────────────────
    Actividades
    ──────────────────────────────────────────────────────────── */
-function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEventos, onRebotes, onLeerBandeja, onLeads }) {
+function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEventos, onRebotes, onLeerBandeja, onLeads, onWhatsApp }) {
   const [f, setF] = useState("all");
   /* Se abre en los envíos: lo primero que se quiere saber de un masivo es cómo
      le fue, no repasar doscientas filas iguales. */
@@ -2608,7 +2830,7 @@ function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEve
       const r = await correrBarrido({
         db,
         progreso: (nota) => setSync({ busy: true, nota, err: "" }),
-        onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads,
+        onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp,
       });
       setSync({ busy: false, nota: r.notas.join(" · "), err: "" });
       say(resumenBarrido(r));
@@ -2898,10 +3120,15 @@ const resumen = (a) => {
    necesita una persona delante, así que una automatización de WhatsApp deja el
    mensaje preparado y espera. Por API sale sola.
 
+   `plantilla` es lo que arma plantillaWaPara cuando la plantilla del CRM está
+   enlazada a una aprobada en Meta. Por la API sale esa plantilla, que es lo
+   que deja escribirle a alguien fuera de la ventana de 24 horas; por enlace no
+   hay plantillas que valgan y se abre el chat con su texto ya armado.
+
    Devuelve qué pasó en vez de avisar por su cuenta, porque quien llama sabe si
    toca pintar un error o anotarlo en el historial.
    ──────────────────────────────────────────────────────────── */
-async function mandarWhatsApp(integ, telefono, texto) {
+async function mandarWhatsApp(integ, telefono, texto, plantilla) {
   const cc = integ.whatsapp.countryCode;
   const numero = toE164(telefono, cc);
   if (!numero) return { ok: false, err: "No tiene un teléfono que WhatsApp pueda marcar." };
@@ -2917,20 +3144,55 @@ async function mandarWhatsApp(integ, telefono, texto) {
     return { ok: false, err: "WhatsApp está puesto en “envía solo”, pero falta el puente. Configúralo en Conexiones." };
   }
   try {
-    await enviarWhatsApp({ base: integ.puente.base, clave: integ.puente.clave, a: numero, texto });
-    return { ok: true, solo: true };
+    const r = await enviarWhatsApp({
+      base: integ.puente.base, clave: integ.puente.clave, a: numero, texto,
+      ...(plantilla ? { plantilla: plantilla.plantilla, idioma: plantilla.idioma, variables: plantilla.variables } : {}),
+    });
+    return { ok: true, solo: true, id: (r && r.id) || "" };
   } catch (e) {
     return { ok: false, err: (e && e.message) || String(e) };
   }
 }
 
-async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads }) {
+/* Pregunta al puente por lo recibido desde la última marca y lo entrega a
+   `onWhatsApp`. Si el puente tenía más de lo que cabe en una respuesta,
+   vuelve a pedir desde el último: son pocos viajes, y dejar mensajes
+   esperando al siguiente minuto los mostraría desordenados en el hilo. */
+let waEnCurso = null;
+function recogerWhatsApp(db, onWhatsApp, onBuzon) {
+  /* El latido de cada minuto y el botón Actualizar pueden coincidir. Dos
+     pasadas a la vez crearían dos fichas para el mismo número desconocido,
+     así que la segunda espera a la primera en vez de repetirla. */
+  if (!waEnCurso) waEnCurso = recogerWhatsAppYa(db, onWhatsApp, onBuzon).finally(() => { waEnCurso = null; });
+  return waEnCurso;
+}
+
+async function recogerWhatsAppYa(db, onWhatsApp, onBuzon) {
+  const integ = db.integrations;
+  if (integ.whatsapp.modo !== "api" || !integ.puente.base || !integ.puente.clave) return null;
+  let desde = Number(db.buzon.whatsappAl) || 0;
+  let mensajes = 0, fichas = 0;
+  for (let vuelta = 0; vuelta < 5; vuelta++) {
+    const r = await traerWhatsApp({ base: integ.puente.base, clave: integ.puente.clave, desde });
+    const lote = r.mensajes || [];
+    if (!lote.length) break;
+    const hecho = onWhatsApp(lote);
+    mensajes += hecho.mensajes; fichas += hecho.fichas;
+    desde = Math.max(desde, ...lote.map((m) => Number(m.recibido) || 0));
+    onBuzon({ whatsappAl: String(desde) });
+    if (!r.truncado) break;
+  }
+  return { mensajes, fichas };
+}
+
+async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
   const integ = db.integrations;
   const mide = midiendo(integ.medicion);
   /* Los anuncios sólo entran si hay puente y alguna plataforma encendida.
      Media configuración no se intenta: daría un error por cada barrido. */
   const anun = integ.anuncios;
   const trayendoLeads = Boolean(onLeads && integ.puente.base && integ.puente.clave && (anun.meta || anun.google));
+  const conWa = Boolean(onWhatsApp && integ.whatsapp.modo === "api" && integ.puente.base && integ.puente.clave);
 
   /* Índice dirección → fichas. Dos personas pueden compartir el correo de la
      empresa, así que una dirección puede apuntar a varias. */
@@ -2955,14 +3217,24 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
 
   /* Si no hay nada que barrer por ningún lado, se dice cuál es el estorbo en
      vez de devolver un "0 correos nuevos" que parecería una respuesta. */
-  if (!conGmail && !mide && !trayendoLeads) {
+  if (!conGmail && !mide && !trayendoLeads && !conWa) {
     if (!integ.email.clientId) throw new Error("Falta el ID de cliente de Google. Pégalo en Conexiones.");
     throw new Error("Ningún contacto ni empresa tiene correo guardado: no hay con quién cruzar la bandeja.");
   }
 
   const notas = [];
   const marca = {};
-  let nuevos = 0, revisados = 0, rebotados = 0, movidos = 0, leads = 0, fichas = 0;
+  let nuevos = 0, revisados = 0, rebotados = 0, movidos = 0, leads = 0, fichas = 0, wa = 0;
+
+  if (conWa) {
+    progreso("Preguntando por WhatsApp…");
+    try {
+      const r = await recogerWhatsApp(db, onWhatsApp, onBuzon);
+      if (r) { wa = r.mensajes; fichas += r.fichas; }
+    } catch (e) {
+      notas.push(`WhatsApp: ${(e && e.message) || String(e)}`);
+    }
+  }
 
   if (conGmail) {
     progreso("Pidiendo permiso…");
@@ -3063,7 +3335,7 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
       });
       const hecho = onLeads(r.leads, anun.destino);
       leads = hecho.leads;
-      fichas = hecho.fichas;
+      fichas += hecho.fichas;
       notas.push(...r.notas);
       /* La marca se mueve aunque una de las dos plataformas haya fallado, y es
          a propósito: la que sí respondió ya entregó lo suyo, y volver a pedirle
@@ -3077,12 +3349,13 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
   }
 
   if (Object.keys(marca).length) onBuzon(marca);
-  return { nuevos, revisados, rebotados, movidos, leads, fichas, notas, mide, conGmail, trayendoLeads };
+  return { nuevos, revisados, rebotados, movidos, leads, fichas, wa, notas, mide, conGmail, trayendoLeads, conWa };
 }
 
 /* Resumen de una pasada, en una línea. */
-function resumenBarrido({ nuevos, revisados, rebotados, movidos, leads, fichas, conGmail, trayendoLeads }) {
+function resumenBarrido({ nuevos, revisados, rebotados, movidos, leads, fichas, wa, conGmail, trayendoLeads, conWa }) {
   const trozos = [];
+  if (conWa) trozos.push(wa ? `${wa} WhatsApp nuevo(s)` : "Sin WhatsApp nuevos");
   if (conGmail) trozos.push(nuevos ? `${nuevos} correo(s) nuevos` : "Sin correos nuevos");
   if (rebotados) trozos.push(`${rebotados} rebote(s)`);
   if (movidos) trozos.push(`${movidos} envío(s) con novedad`);
@@ -3094,7 +3367,7 @@ function resumenBarrido({ nuevos, revisados, rebotados, movidos, leads, fichas, 
   return trozos.length ? trozos.join(" · ") : "Sin novedades";
 }
 
-function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads }) {
+function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
   const integ = db.integrations;
   const conversaciones = useMemo(() => construirConversaciones(db), [db]);
 
@@ -3144,7 +3417,7 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
       const r = await correrBarrido({
         db,
         progreso: (nota) => setSync({ busy: true, nota, err: "" }),
-        onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads,
+        onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp,
       });
       setSync({ busy: false, nota: r.notas.join(" · "), err: "" });
       say(resumenBarrido(r));
@@ -3808,25 +4081,264 @@ function HtmlAttach({ value, onChange }) {
 /* ────────────────────────────────────────────────────────────
    Plantillas
    ──────────────────────────────────────────────────────────── */
-function TemplatesView({ db, setDb, say }) {
+/* El texto de una plantilla de Meta con lo que va en cada variable, para
+   verla en el CRM como la leería alguien: "Hola {{nombre}}" en vez de
+   "Hola {{1}}". Lo que no tenga dato se deja como estaba. */
+const cuerpoConVars = (meta) => meta.cuerpo.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, k) => {
+  const v = meta.vars.find((x) => x.clave === k);
+  return v && v.valor ? v.valor : m;
+});
+
+const DATOS_PLANTILLA = ["{{nombre}}", "{{apellido}}", "{{institucion}}", "{{empresa}}", "{{correo}}", "{{telefono}}"];
+
+/* El enlace de una plantilla del CRM con una aprobada en Meta. Las de Meta se
+   piden al puente cuando se abre esto, no antes: cambian poco y pedirlas en
+   cada visita a Plantillas sería preguntar por nada. */
+function EnlaceMetaWa({ db, draft, setDraft }) {
+  const pu = db.integrations.puente;
+  const [lista, setLista] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const meta = draft.meta;
+
+  const traer = async () => {
+    setBusy(true); setErr("");
+    try { setLista((await traerPlantillasWa({ base: pu.base, clave: pu.clave })).plantillas || []); }
+    catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy(false);
+  };
+
+  const poner = (m) => setDraft({ ...draft, meta: m, body: m ? cuerpoConVars(m) : draft.body });
+
+  const elegir = (clave) => {
+    const p = (lista || []).find((x) => `${x.nombre}|${x.idioma}` === clave);
+    if (!p) return;
+    /* La primera variable casi siempre es el nombre de quien recibe; las
+       demás se dejan para que se elijan a conciencia. */
+    poner({
+      nombre: p.nombre, idioma: p.idioma, formato: p.formato, cuerpo: p.cuerpo,
+      vars: p.vars.map((k, i) => ({ clave: k, valor: i === 0 ? "{{nombre}}" : "" })),
+    });
+    if (!draft.name.trim()) setDraft((d) => ({ ...d, name: p.nombre }));
+  };
+
+  const cajita = { background: "#F4F7F2", border: `1px solid ${C.line}`, borderRadius: 7, padding: "11px 12px" };
+  const titulo = { fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em", marginBottom: 6 };
+
+  if (meta) {
+    return (
+      <div style={cajita}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <div style={{ ...titulo, marginBottom: 0, flex: 1 }}>PLANTILLA APROBADA · {meta.nombre} · {meta.idioma}</div>
+          <Btn size="sm" variant="ghost" Icon={X} onClick={() => poner(null)}>Quitar enlace</Btn>
+        </div>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.55, background: "#DCF8C6", padding: "9px 11px", borderRadius: 8 }}>{cuerpoConVars(meta)}</div>
+        {meta.vars.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "7px 10px", alignItems: "center", marginTop: 10 }}>
+            {meta.vars.map((v, i) => (
+              <React.Fragment key={v.clave}>
+                <Mono>{`{{${v.clave}}}`}</Mono>
+                <input className="crm-in" list="datos-plantilla" value={v.valor} placeholder="Qué dato va aquí, p. ej. {{nombre}}"
+                  onChange={(e) => poner({ ...meta, vars: meta.vars.map((x, j) => (j === i ? { ...x, valor: e.target.value } : x)) })}
+                  style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+              </React.Fragment>
+            ))}
+            <datalist id="datos-plantilla">{DATOS_PLANTILLA.map((d) => <option key={d} value={d} />)}</datalist>
+          </div>
+        )}
+        <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 8, lineHeight: 1.5 }}>
+          Cada variable puede ser un dato de la ficha o un texto fijo. Si a alguien le falta el dato, el envío se detiene en esa persona en vez de mandarle un hueco.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={cajita}>
+      <div style={titulo}>PLANTILLA APROBADA DE WHATSAPP</div>
+      <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, lineHeight: 1.55, marginBottom: 8 }}>
+        Con WhatsApp conectado, el texto libre sólo le llega a quien te escribió en las últimas 24 horas. Para el
+        primer mensaje, enlaza esta plantilla a una que WhatsApp ya aprobó.
+      </div>
+      {!pu.base || !pu.clave ? (
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.faint }}>Falta configurar el puente en Conexiones.</div>
+      ) : lista === null ? (
+        <Btn size="sm" variant="outline" Icon={RefreshCw} disabled={busy} onClick={traer}>{busy ? "Preguntando al puente…" : "Ver mis plantillas aprobadas"}</Btn>
+      ) : (
+        <select className="crm-in" value="" onChange={(e) => elegir(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }}>
+          <option value="">{lista.length ? "Elige una plantilla…" : "No tienes plantillas aprobadas todavía"}</option>
+          {lista.map((p) => {
+            const lista_ = p.estado === "APPROVED" && !p.motivo;
+            const porque = p.estado !== "APPROVED" ? ` — ${p.estado === "PENDING" ? "en revisión" : p.estado.toLowerCase()}` : p.motivo ? ` — ${p.motivo}` : "";
+            return <option key={`${p.nombre}|${p.idioma}`} value={`${p.nombre}|${p.idioma}`} disabled={!lista_}>{p.nombre} · {p.idioma}{porque}</option>;
+          })}
+        </select>
+      )}
+      {err && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 7, lineHeight: 1.5 }}>{err}</div>}
+    </div>
+  );
+}
+
+/* Crear la plantilla en Meta sin salir del CRM: Claude la redacta si se le
+   pide, se revisa aquí contra las reglas que Meta aplica de entrada, y se
+   manda. La aprobación llega sola —el CRM pregunta cada cinco minutos— y el
+   envío lo das tú cuando te avise. */
+function RevisionMetaWa({ db, draft, setDraft, onEnviada }) {
+  const pu = db.integrations.puente;
+  const rv = draft.revision;
+  const sufijo = rv && rv.estado === "REJECTED" ? "_v2" : "";
+  const [nombreMeta, setNombreMeta] = useState(() => (rv && rv.estado === "REJECTED" ? `${rv.nombre}${sufijo}` : ""));
+  const [categoria, setCategoria] = useState("MARKETING");
+  const [encabezado, setEncabezado] = useState("");
+  const [pie, setPie] = useState("");
+  const [idea, setIdea] = useState("");
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+
+  const nombreFinal = nombreMeta || nombreParaMeta(draft.name);
+  const problemas = problemasParaMeta({ nombreMeta: nombreFinal, cuerpo: draft.body, encabezado: encabezado.trim(), pie: pie.trim() });
+
+  const redactar = async () => {
+    setBusy("redactar"); setErr("");
+    try {
+      const r = await fetch("/api/claude", {
+        method: "POST", redirect: "manual", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Origen": "plantillas" },
+        body: JSON.stringify({ tarea: "plantilla", pregunta: idea }),
+      });
+      if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+      if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("Redactar con Claude sólo funciona en la versión publicada del CRM.");
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+      setDraft((d) => ({ ...d, body: data.texto }));
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const mandar = async () => {
+    setBusy("mandar"); setErr("");
+    const cuerpo = draft.body.trim();
+    const vars = [...new Set([...cuerpo.matchAll(/\{\{\s*([a-z0-9_]+)\s*\}\}/g)].map((m) => m[1]))];
+    try {
+      const r = await crearPlantillaWa({
+        base: pu.base, clave: pu.clave,
+        plantilla: {
+          nombre: nombreFinal, idioma: "es", categoria, cuerpo,
+          encabezado: encabezado.trim(), pie: pie.trim(),
+          ejemplos: Object.fromEntries(vars.map((k) => [k, EJEMPLOS_META[k]])),
+        },
+      });
+      onEnviada({ id: r.id, nombre: r.nombre, idioma: r.idioma, categoria: r.categoria, estado: r.estado, rechazo: "", enviadaEn: nowISO(), nueva: false });
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const cajita = { background: "#F4F7F2", border: `1px solid ${C.line}`, borderRadius: 7, padding: "11px 12px" };
+  const titulo = { fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em", marginBottom: 6 };
+  const nota = { fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, lineHeight: 1.5 };
+
+  if (revisionAbierta(rv)) {
+    return (
+      <div style={cajita}>
+        <div style={titulo}>EN REVISIÓN EN META · {rv.nombre}</div>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.55 }}>
+          Se mandó {rv.enviadaEn ? `el ${new Date(rv.enviadaEn).toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" })}` : ""}.
+          Mientras Meta la revisa no se puede cambiar. El CRM pregunta cada cinco minutos y te avisa cuando la decidan.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={cajita}>
+      <div style={titulo}>{rv && rv.estado === "REJECTED" ? "VOLVER A MANDAR A META" : "CREAR LA PLANTILLA EN META"}</div>
+      {rv && rv.estado === "REJECTED" && (
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5, marginBottom: 8 }}>
+          Meta rechazó «{rv.nombre}»{rv.rechazo ? `: ${MOTIVO_RECHAZO[rv.rechazo] || rv.rechazo}` : ""}. Corrige el texto y mándala con otro nombre.
+        </div>
+      )}
+      {!pu.base || !pu.clave ? (
+        <div style={nota}>Falta configurar el puente en Conexiones.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+          <div style={{ display: "flex", gap: 7 }}>
+            <input className="crm-in" value={idea} placeholder="De qué se trata, p. ej. 20% en inscripciones hasta el viernes"
+              onChange={(e) => setIdea(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5, flex: 1 }} />
+            <Btn size="sm" variant="outline" Icon={Sparkles} disabled={Boolean(busy) || !idea.trim()} onClick={redactar}>
+              {busy === "redactar" ? "Redactando…" : "Redactar con Claude"}
+            </Btn>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <input className="crm-in" value={nombreFinal} placeholder="nombre_para_meta" onChange={(e) => setNombreMeta(nombreParaMeta(e.target.value) || "")}
+              style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5, fontFamily: "var(--mono)" }} title="Nombre con el que queda en Meta" />
+            <select className="crm-in" value={categoria} onChange={(e) => setCategoria(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }}>
+              <option value="MARKETING">Marketing (promociones, novedades)</option>
+              <option value="UTILITY">Utilidad (avisos de algo ya en curso)</option>
+            </select>
+            <input className="crm-in" value={encabezado} placeholder="Encabezado (opcional)" maxLength={60}
+              onChange={(e) => setEncabezado(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+            <input className="crm-in" value={pie} placeholder="Pie (opcional), p. ej. Responde SALIR para no recibir más" maxLength={60}
+              onChange={(e) => setPie(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+          </div>
+          {problemas.length > 0 && draft.body.trim() && (
+            <ul style={{ margin: 0, paddingLeft: 18, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>
+              {problemas.map((x) => <li key={x}>{x}</li>)}
+            </ul>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <Btn size="sm" variant="solid" Icon={Send} disabled={Boolean(busy) || problemas.length > 0} onClick={mandar}>
+              {busy === "mandar" ? "Mandando…" : "Enviar a Meta para aprobación"}
+            </Btn>
+            <span style={nota}>Usa {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"} o {"{{empresa}}"} en el mensaje de abajo.</span>
+          </div>
+        </div>
+      )}
+      {err && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 7, lineHeight: 1.5 }}>{err}</div>}
+    </div>
+  );
+}
+
+function TemplatesView({ db, setDb, say, onEnviar }) {
   const [tab, setTab] = useState("whatsapp");
   const [draft, setDraft] = useState(null);
   const list = db.templates[tab];
 
+  const guardar = (t) => setDb((d) => {
+    const arr = d.templates[tab];
+    const exists = arr.some((x) => x.id === t.id);
+    return { ...d, templates: { ...d.templates, [tab]: exists ? arr.map((x) => x.id === t.id ? t : x) : [...arr, t] } };
+  });
+
   const save = () => {
     if (!draft.name.trim()) return;
-    setDb((d) => {
-      const arr = d.templates[tab];
-      const exists = arr.some((t) => t.id === draft.id);
-      return { ...d, templates: { ...d.templates, [tab]: exists ? arr.map((t) => t.id === draft.id ? draft : t) : [...arr, draft] } };
-    });
+    guardar(draft);
     setDraft(null); say("Plantilla guardada");
+  };
+
+  /* Lo que Meta decidió ya se vio al entrar aquí: se apaga el aviso del menú. */
+  const nuevas = db.templates.whatsapp.filter((t) => t.revision && t.revision.nueva).length;
+  useEffect(() => {
+    if (!nuevas) return;
+    setDb((d) => ({ ...d, templates: { ...d.templates, whatsapp: d.templates.whatsapp.map((t) => (t.revision && t.revision.nueva ? { ...t, revision: { ...t.revision, nueva: false } } : t)) } }));
+  }, [nuevas]);
+
+  const [revisando, setRevisando] = useState(false);
+  const revisarAhora = async () => {
+    const pu = db.integrations.puente;
+    setRevisando(true);
+    try {
+      const lista = (await traerPlantillasWa({ base: pu.base, clave: pu.clave })).plantillas || [];
+      const { avisos } = aplicarRevisiones(db, lista);
+      setDb((d) => aplicarRevisiones(d, lista).d);
+      say(avisos.length ? avisos.join(" ") : "Meta todavía no la ha revisado.");
+    } catch (e) { say((e && e.message) || String(e)); }
+    setRevisando(false);
   };
 
   return (
     <div>
       <Header eyebrow="Mensajería" title="Plantillas"
-        right={<Btn variant="solid" Icon={Plus} onClick={() => setDraft({ id: uid(), name: "", subject: "", body: "", html: "" })}>Nueva plantilla</Btn>} />
+        right={<Btn variant="solid" Icon={Plus} onClick={() => setDraft({ id: uid(), name: "", subject: "", body: "", html: "", ...(tab === "whatsapp" ? { meta: null } : {}) })}>Nueva plantilla</Btn>} />
       <div style={{ padding: "14px 28px", display: "flex", gap: 7, borderBottom: `1px solid ${C.line}` }}>
         {[["whatsapp", "WhatsApp"], ["email", "Correo de marketing"]].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} className="crm-btn" style={{ border: `1px solid ${tab === k ? C.jade : C.line}`, background: tab === k ? C.jade : C.panel, color: tab === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>{l}</button>
@@ -3844,6 +4356,23 @@ function TemplatesView({ db, setDb, say }) {
             </div>
             {t.subject && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.blue, marginTop: 6 }}>Asunto: {t.subject}</div>}
             {t.html && <div style={{ marginTop: 7 }}><Pill color={C.blue} soft={C.blueSoft}>HTML anexo · {pesoKb(t.html)} KB</Pill></div>}
+            {t.meta && (
+              <div style={{ marginTop: 7, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <Pill color={C.jade} soft={C.jadeSoft}>Aprobada en Meta · {t.meta.nombre}</Pill>
+                {tab === "whatsapp" && onEnviar && <Btn size="sm" variant="outline" Icon={Send} onClick={() => onEnviar(t.id)}>Enviar</Btn>}
+              </div>
+            )}
+            {!t.meta && revisionAbierta(t.revision) && (
+              <div style={{ marginTop: 7, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <Pill color={C.amber} soft={C.amberSoft}>En revisión en Meta · {t.revision.nombre}</Pill>
+                <Btn size="sm" variant="ghost" Icon={RefreshCw} disabled={revisando} onClick={revisarAhora}>{revisando ? "Preguntando…" : "Revisar ahora"}</Btn>
+              </div>
+            )}
+            {!t.meta && t.revision && t.revision.estado === "REJECTED" && (
+              <div style={{ marginTop: 7 }}>
+                <Pill color={C.clay} soft={C.claySoft}>Rechazada en Meta{t.revision.rechazo ? ` · ${MOTIVO_RECHAZO[t.revision.rechazo] || t.revision.rechazo}` : ""}</Pill>
+              </div>
+            )}
             <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginTop: 8, whiteSpace: "pre-wrap", lineHeight: 1.55 }}>{t.body}</div>
           </div>
         ))}
@@ -3856,8 +4385,19 @@ function TemplatesView({ db, setDb, say }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <Field def={{ label: "Nombre de la plantilla", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
             {tab === "email" && <Field def={{ label: "Asunto", type: "text" }} value={draft.subject} onChange={(v) => setDraft({ ...draft, subject: v })} />}
-            <Field def={{ label: tab === "email" && draft.html ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }}
-              value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+            {tab === "whatsapp" && <EnlaceMetaWa db={db} draft={draft} setDraft={setDraft} />}
+            {!(tab === "whatsapp" && draft.meta) && (
+              <Field def={{ label: tab === "email" && draft.html ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }}
+                value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+            )}
+            {tab === "whatsapp" && !draft.meta && (
+              <RevisionMetaWa db={db} draft={draft} setDraft={setDraft}
+                onEnviada={(revision) => {
+                  guardar({ ...draft, name: draft.name.trim() || revision.nombre, revision });
+                  setDraft(null);
+                  say("Enviada a Meta. Te aviso aquí cuando la aprueben.");
+                }} />
+            )}
             {tab === "email" && (
               <>
                 {draft.html && !String(draft.body || "").trim() && (
@@ -4707,6 +5247,9 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
     setBusy(false);
   };
 
+  /* El puente dice por quién sale WhatsApp; lo que falta configurar cambia. */
+  const waTwilio = salud?.whatsapp?.proveedor === "twilio";
+
   return (
     <div>
       <Header eyebrow="Ajustes" title="Conexiones" />
@@ -4718,7 +5261,7 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
             ? (salud
                 ? (salud.whatsapp?.enviar
                     ? <Pill color={C.jade} soft={C.jadeSoft}>Conectado</Pill>
-                    : <Pill color={C.clay} soft={C.claySoft}>Falta el token</Pill>)
+                    : <Pill color={C.clay} soft={C.claySoft}>{waTwilio ? "Falta configurar Twilio" : "Falta el token"}</Pill>)
                 : <Pill color={C.amber} soft={C.amberSoft}>Sin probar</Pill>)
             : <Pill color={C.jade} soft={C.jadeSoft}>Listo para usar</Pill>}>
           <Prose>El CRM personaliza el mensaje con los datos de cada registro. Lo que cambia es quién lo manda.</Prose>
@@ -4731,7 +5274,9 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
                   <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>{label}</div>
                   <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 2, lineHeight: 1.55 }}>
                     {key === "enlace" && "Se abre WhatsApp con el texto ya escrito en el chat correcto y tú das el último clic. Tu WhatsApp de siempre —el del celular o WhatsApp Web—, sin cuenta de empresa ni permisos de Meta. Funciona hoy, sin configurar nada."}
-                    {key === "api" && "El CRM lo manda por la WhatsApp Cloud API y no se abre ninguna ventana. Necesita el puente publicado y una cuenta de empresa en Meta."}
+                    {key === "api" && (waTwilio
+                      ? "El CRM lo manda por Twilio, desde tu número virtual, y no se abre ninguna ventana. Necesita el puente publicado y el número aprobado para WhatsApp en Twilio."
+                      : "El CRM lo manda por la WhatsApp Cloud API y no se abre ninguna ventana. Necesita el puente publicado y una cuenta de empresa en Meta, o un número de Twilio.")}
                   </div>
                 </div>
               </label>
@@ -4758,9 +5303,45 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
 
           {waModo === "api" && salud && !salud.whatsapp?.enviar && (
             <div style={{ background: C.claySoft, color: C.clay, borderRadius: 6, padding: "10px 12px", fontFamily: "var(--ui)", fontSize: 12.5, lineHeight: 1.6 }}>
-              El puente no puede mandar nada todavía. Falta <Mono>WA_TOKEN</Mono> como secreto,
-              o <Mono>WA_PHONE_ID</Mono> en <Mono>tracker/wrangler.toml</Mono> —que es el identificador del
-              número remitente, no el número—. Cómo sacarlos está en la guía de la tarjeta de Meta.
+              {waTwilio ? <>
+                El puente no puede mandar nada todavía. Falta <Mono>TWILIO_AUTH_TOKEN</Mono> como secreto,
+                o <Mono>TWILIO_WA_FROM</Mono> —tu número de Twilio— en <Mono>tracker/wrangler.toml</Mono>.
+                Los pasos están en <Mono>tracker/README.md</Mono>.
+              </> : <>
+                El puente no puede mandar nada todavía. Falta <Mono>WA_TOKEN</Mono> como secreto,
+                o <Mono>WA_PHONE_ID</Mono> en <Mono>tracker/wrangler.toml</Mono> —que es el identificador del
+                número remitente, no el número—. Cómo sacarlos está en la guía de la tarjeta de Meta.
+              </>}
+            </div>
+          )}
+
+          {waModo === "api" && hayPuente && (
+            <div style={{ border: "1px solid " + C.line, borderRadius: 7, padding: "11px 12px", marginTop: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600 }}>Lo que te escriben</div>
+                {salud && (salud.whatsapp?.ultimoRecibido
+                  ? <Pill color={C.jade} soft={C.jadeSoft}>Último mensaje: {fmt(new Date(salud.whatsapp.ultimoRecibido).toISOString())}</Pill>
+                  : salud.whatsapp?.recibir
+                    ? <Pill color={C.amber} soft={C.amberSoft}>Aún no llega nada</Pill>
+                    : <Pill color={C.clay} soft={C.claySoft}>Sin configurar</Pill>)}
+              </div>
+              <Prose>
+                Las respuestas entran solas a Mensajes, en el hilo de cada persona, y el CRM las recoge cada minuto
+                mientras esté abierto. Si quien escribe no está en el CRM, se crea su contacto con fuente WhatsApp.
+                {waTwilio ? (
+                <ol style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+                  <li>En console.twilio.com → Messaging → Senders → WhatsApp senders, abre tu número.</li>
+                  <li>En <b>Webhook URL for incoming messages</b> pon <Mono>{pu.base}/wa/twilio</Mono>, método <Mono>POST</Mono>.</li>
+                  <li>Nada más: el puente comprueba la firma de Twilio con el mismo <Mono>TWILIO_AUTH_TOKEN</Mono>.</li>
+                </ol>
+                ) : (
+                <ol style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+                  <li>En el puente, guarda <Mono>WA_APP_SECRET</Mono> (la clave secreta de la app, en Configuración de la app → Básica) y <Mono>WA_VERIFY_TOKEN</Mono> (una palabra que inventes), con <Mono>wrangler secret put</Mono>.</li>
+                  <li>En developers.facebook.com → tu app → WhatsApp → Configuración, en Webhook pon la URL <Mono>{pu.base}/wa/webhook</Mono> y esa misma palabra como token de verificación.</li>
+                  <li>En los campos del webhook, suscríbete a <Mono>messages</Mono>.</li>
+                </ol>
+                )}
+              </Prose>
             </div>
           )}
 
@@ -4989,7 +5570,15 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
               <Estado ok>Medición de correos</Estado>
               <Estado ok={salud.meta?.leads} falta={<Mono>META_TOKEN</Mono>}>Leads de Meta</Estado>
               <Estado ok={salud.meta?.metricas} falta={<Mono>META_AD_ACCOUNT</Mono>}>Métricas de campaña de Meta</Estado>
-              <Estado ok={salud.whatsapp?.enviar} falta={<Mono>WA_TOKEN</Mono>}>Envío por WhatsApp Cloud API</Estado>
+              {salud.whatsapp?.proveedor === "twilio" ? <>
+                <Estado ok={salud.whatsapp?.enviar} falta={<><Mono>TWILIO_AUTH_TOKEN</Mono> y <Mono>TWILIO_WA_FROM</Mono></>}>Envío de WhatsApp por Twilio</Estado>
+                <Estado ok={salud.whatsapp?.plantillas} falta={<Mono>TWILIO_AUTH_TOKEN</Mono>}>Plantillas aprobadas de WhatsApp (Twilio)</Estado>
+                <Estado ok={salud.whatsapp?.recibir} falta={<Mono>TWILIO_AUTH_TOKEN</Mono>}>Recibir WhatsApp (webhook de Twilio)</Estado>
+              </> : <>
+                <Estado ok={salud.whatsapp?.enviar} falta={<Mono>WA_TOKEN</Mono>}>Envío por WhatsApp Cloud API</Estado>
+                <Estado ok={salud.whatsapp?.plantillas} falta={<Mono>WA_WABA_ID</Mono>}>Plantillas aprobadas de WhatsApp</Estado>
+                <Estado ok={salud.whatsapp?.recibir} falta={<><Mono>WA_APP_SECRET</Mono> y <Mono>WA_VERIFY_TOKEN</Mono></>}>Recibir WhatsApp (webhook)</Estado>
+              </>}
               <Estado ok={salud.google?.credenciales} falta={<Mono>GADS_CLIENT_SECRET</Mono>}>Credenciales de Google Ads</Estado>
               <Estado ok={salud.google?.developerToken} falta={<Mono>GADS_DEV_TOKEN</Mono>}>Developer token de Google Ads</Estado>
               <Estado ok={salud.google?.autorizado} falta="dar el permiso una vez">Permiso de Google Ads</Estado>
@@ -6140,11 +6729,11 @@ function FiltrosPropiedad({ schema, rows, filtros, setFiltros, enLinea }) {
   );
 }
 
-function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne }) {
+function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSend, onLogOne }) {
   const integ = db.integrations;
   const gmail = useGmail();
   const templates = db.templates[channel];
-  const [tid, setTid] = useState(templates[0]?.id || "");
+  const [tid, setTid] = useState(() => (plantillaId && templates.some((x) => x.id === plantillaId) ? plantillaId : templates[0]?.id || ""));
   const t = templates.find((x) => x.id === tid);
   const [subject, setSubject] = useState(t?.subject || "");
   const [body, setBody] = useState(t?.body || "");
@@ -6236,7 +6825,13 @@ function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne 
 
   /* Versión en texto: la escrita a mano y, si no hay, la que se saca del
      diseño. Nunca se manda un correo con el cuerpo vacío. */
+  /* Enlazada a Meta, por WhatsApp sale la plantilla aprobada y no lo escrito
+     aquí: Meta no deja cambiarle ni una coma. */
+  const metaT = !esCorreo && t && t.meta ? t.meta : null;
+  const plantillaDe = (r) => (metaT ? plantillaWaPara(metaT, r, kind) : null);
+
   const cuerpoDe = (r) => {
+    if (metaT) { const pw = plantillaDe(r); return pw.err ? metaT.cuerpo : pw.texto; }
     const escrito = applyTemplate(body, r, kind);
     const txt = escrito.trim() || (conHtml ? htmlToText(applyTemplate(html, r, kind, true)) : escrito);
     return esCorreo ? withSignature(txt, integ.email.signature) : txt;
@@ -6339,7 +6934,8 @@ function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne 
     setErr(""); setBusy(true);
     let ok = 0;
     for (const r of cola) {
-      const res = await mandarWhatsApp(integ, r.props.phone, cuerpoDe(r));
+      const pw = plantillaDe(r);
+      const res = pw && pw.err ? { ok: false, err: pw.err } : await mandarWhatsApp(integ, r.props.phone, cuerpoDe(r), pw);
       if (!res.ok) {
         setErr(`Se enviaron ${ok} de ${cola.length}. Se detuvo en ${titleOf(kind, r)}: ${res.err}`);
         break;
@@ -6449,8 +7045,25 @@ function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne 
           <Field def={{ label: "Plantilla", type: "select", options: templates.map((x) => x.name) }}
             value={t?.name || ""} onChange={(name) => setTid((templates.find((x) => x.name === name) || {}).id || "")} />
           {esCorreo && <Field def={{ label: "Asunto", type: "text" }} value={subject} onChange={setSubject} />}
-          <Field def={{ label: conHtml ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }} value={body} onChange={setBody} />
-          <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Variables: {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"}, {"{{empresa}}"}</div>
+          {metaT ? (
+            <div style={{ background: C.jadeSoft, borderRadius: 6, padding: "9px 11px", fontFamily: "var(--ui)", fontSize: 12, color: C.ink, lineHeight: 1.55 }}>
+              <div style={{ fontWeight: 600, color: C.jade, marginBottom: 3 }}>Plantilla aprobada en Meta · {metaT.nombre}</div>
+              {porWa
+                ? "Sale tal cual Meta la aprobó, con los datos de cada persona en sus variables. Sirve aunque no te hayan escrito en las últimas 24 horas."
+                : "En el modo de enlace se abre el chat con este mismo texto. Para que salga como plantilla de Meta, cambia a “WhatsApp conectado” en Conexiones."}
+              {" "}El texto se cambia en el Administrador de WhatsApp, no aquí.
+            </div>
+          ) : (
+            <>
+              <Field def={{ label: conHtml ? "Mensaje en texto (respaldo del diseño)" : "Mensaje", type: "textarea" }} value={body} onChange={setBody} />
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Variables: {"{{nombre}}"}, {"{{apellido}}"}, {"{{institucion}}"}, {"{{empresa}}"}</div>
+              {porWa && (
+                <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.amber, lineHeight: 1.5 }}>
+                  Texto libre: sólo le llega a quien te escribió en las últimas 24 horas. Para los demás, enlaza esta plantilla a una aprobada en Meta, en Plantillas.
+                </div>
+              )}
+            </>
+          )}
 
           {esCorreo && <HtmlAttach value={html} onChange={setHtml} />}
 
@@ -6573,6 +7186,306 @@ function SendModal({ db, channel, kind, ids, listaId, onClose, onSend, onLogOne 
         </div>
       </div>
     </Modal>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   Drafts
+   Lee el roster público de un programa de fútbol masculino (NCAA, NAIA o
+   NJCAA) y muestra cuántos jugadores hay por año y por posición, y qué
+   posiciones va a necesitar en las próximas temporadas. Claude sólo extrae
+   la lista (/api/drafts); los conteos y el pronóstico salen de src/drafts.js.
+   Cada análisis se guarda con sus jugadores, que se pueden corregir a mano.
+   ──────────────────────────────────────────────────────────── */
+const PRIORIDAD = {
+  alta: { label: "Alta", color: C.clay, soft: C.claySoft },
+  media: { label: "Media", color: C.amber, soft: C.amberSoft },
+  baja: { label: "Baja", color: C.jade, soft: C.jadeSoft },
+};
+
+const thStyle = { fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 500, color: C.faint, letterSpacing: ".06em", textTransform: "uppercase", textAlign: "left", padding: "7px 10px", borderBottom: `1px solid ${C.line}` };
+const tdStyle = { fontFamily: "var(--ui)", fontSize: 13, color: C.ink, padding: "8px 10px", borderBottom: `1px solid ${C.line}` };
+const num = { fontFamily: "var(--mono)", textAlign: "center" };
+
+function DraftsView({ db, setDb, say }) {
+  const [selId, setSelId] = useState(db.drafts[0] ? db.drafts[0].id : null);
+  const [nuevo, setNuevo] = useState(false);
+  const sel = db.drafts.find((d) => d.id === selId) || db.drafts[0] || null;
+
+  const cambiar = (id, patch) => setDb((d) => ({ ...d, drafts: d.drafts.map((x) => x.id === id ? { ...x, ...patch } : x) }));
+  const borrar = (id) => {
+    if (!window.confirm("¿Borrar este análisis? No se puede deshacer.")) return;
+    setDb((d) => ({ ...d, drafts: d.drafts.filter((x) => x.id !== id) }));
+    say("Análisis borrado");
+  };
+  const guardar = (draft) => {
+    setDb((d) => ({ ...d, drafts: [draft, ...d.drafts] }));
+    setSelId(draft.id);
+    setNuevo(false);
+    say(`${draft.jugadores.length} jugadores leídos`);
+  };
+
+  return (
+    <div>
+      <Header eyebrow="Reclutamiento" title="Drafts"
+        right={<Btn variant="solid" Icon={Plus} onClick={() => setNuevo(true)}>Analizar un roster</Btn>} />
+      {!db.drafts.length ? (
+        <Empty title="Todavía no hay análisis"
+          hint="Pega el enlace del roster de un equipo de fútbol masculino (NCAA, NAIA o NJCAA) y te muestro qué posiciones va a necesitar."
+          action={<Btn variant="solid" Icon={Plus} onClick={() => setNuevo(true)}>Analizar un roster</Btn>} />
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "250px minmax(0,1fr)", gap: 18, padding: "20px 28px", alignItems: "start" }}>
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, overflow: "hidden" }}>
+            {db.drafts.map((d) => {
+              const on = sel && sel.id === d.id;
+              return (
+                <button key={d.id} onClick={() => setSelId(d.id)} className={on ? "" : "crm-row"}
+                  style={{ display: "block", width: "100%", textAlign: "left", border: "none", borderBottom: `1px solid ${C.line}`, borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : C.panel, padding: "10px 12px", cursor: "pointer" }}>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>{d.programa || "Sin nombre"}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2 }}>
+                    {[d.division, d.temporada, `${d.jugadores.length} jugadores`].filter(Boolean).join(" · ")}
+                  </div>
+                  <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, marginTop: 2 }}>{fmt(d.creadoEn)}</div>
+                </button>
+              );
+            })}
+          </div>
+          {sel && <DraftDetalle key={sel.id} draft={sel} onCambiar={(patch) => cambiar(sel.id, patch)} onBorrar={() => borrar(sel.id)} />}
+        </div>
+      )}
+      {nuevo && <NuevoDraft onClose={() => setNuevo(false)} onListo={guardar} />}
+    </div>
+  );
+}
+
+function NuevoDraft({ onClose, onListo }) {
+  const [url, setUrl] = useState("");
+  const [division, setDivision] = useState("");
+  const [texto, setTexto] = useState("");
+  const [conTexto, setConTexto] = useState(false);
+  const [estado, setEstado] = useState({ cargando: false, error: "" });
+
+  const listo = conTexto ? texto.trim() : /^https?:\/\/\S+\.\S+/.test(url.trim());
+  const analizar = async () => {
+    setEstado({ cargando: true, error: "" });
+    try {
+      const r = await fetch("/api/drafts", {
+        method: "POST",
+        redirect: "manual",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Origen": "drafts" },
+        body: JSON.stringify({ url: url.trim() || null, division, texto: conTexto ? texto : "" }),
+      });
+      if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+      if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("Drafts sólo funciona en la versión publicada del CRM.");
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+      onListo({
+        id: uid(),
+        url: url.trim(),
+        programa: data.programa || "",
+        division: division || (DIVISIONES.includes(data.division) ? data.division : ""),
+        temporada: data.temporada || "",
+        notas: data.notas || "",
+        fuente: data.fuente,
+        creadoEn: nowISO(),
+        jugadores: data.jugadores.map((j) => ({ ...j, id: uid() })),
+      });
+    } catch (e) {
+      setEstado({ cargando: false, error: (e && e.message) || String(e) });
+    }
+  };
+
+  return (
+    <Modal title="Analizar un roster" subtitle="Claude lee la plantilla y saca el año y la posición de cada jugador. Tarda entre 20 segundos y un minuto."
+      onClose={estado.cargando ? () => {} : onClose}
+      footer={<>
+        <Btn variant="ghost" disabled={estado.cargando} onClick={onClose}>Cancelar</Btn>
+        <Btn variant="solid" Icon={Sparkles} disabled={!listo || estado.cargando} onClick={analizar}>{estado.cargando ? "Leyendo el roster…" : "Analizar"}</Btn>
+      </>}>
+      <div style={{ display: "grid", gap: 14 }}>
+        <Field def={{ label: "Enlace del roster", type: "text" }} value={url} onChange={setUrl} />
+        <Field def={{ label: "División (si la dejas vacía, la deduce de la página)", type: "select", options: DIVISIONES }} value={division} onChange={setDivision} />
+        <label style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, cursor: "pointer" }}>
+          <input type="checkbox" checked={conTexto} onChange={(e) => setConTexto(e.target.checked)} />
+          La página no se deja leer: pegaré el texto del roster
+        </label>
+        {conTexto && (
+          <label style={{ display: "block" }}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5 }}>Texto del roster (selecciona la tabla en la página, cópiala y pégala aquí)</div>
+            <textarea className="crm-in" rows={9} value={texto} onChange={(e) => setTexto(e.target.value)} style={{ ...inputStyle, resize: "vertical", fontFamily: "var(--mono)", fontSize: 12 }} />
+          </label>
+        )}
+        {estado.error && <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay }}>{estado.error}</div>}
+      </div>
+    </Modal>
+  );
+}
+
+function DraftDetalle({ draft, onCambiar, onBorrar }) {
+  const a = useMemo(() => analizarRoster(draft), [draft]);
+  const [verJugadores, setVerJugadores] = useState(false);
+  const T = a.forecast.TOTAL;
+  const columnasAno = [...a.anos, ...(a.porAno.SD ? [{ key: "SD", label: "Sin año" }] : [])];
+  const filasGrupo = [...GRUPOS, ...(Object.values(a.matriz.SD).some(Boolean) ? [{ key: "SD", label: "Sin posición" }] : [])];
+  const cambiarJugador = (id, patch) => onCambiar({ jugadores: draft.jugadores.map((j) => j.id === id ? { ...j, ...patch } : j) });
+
+  const Kpi = ({ label, value, hint }) => (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: "12px 14px" }}>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".06em", textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontFamily: "var(--display)", fontSize: 26, fontWeight: 600, marginTop: 2 }}>{value}</div>
+      {hint && <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute }}>{hint}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{ display: "grid", gap: 14, minWidth: 0 }}>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16, display: "flex", gap: 14, alignItems: "flex-end", flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 220px" }}>
+          <Field def={{ label: "Programa", type: "text" }} value={draft.programa} onChange={(v) => onCambiar({ programa: v })} />
+        </div>
+        <div style={{ width: 150 }}>
+          <Field def={{ label: "División", type: "select", options: DIVISIONES }} value={draft.division} onChange={(v) => onCambiar({ division: v })} />
+        </div>
+        <div style={{ width: 110 }}>
+          <Field def={{ label: "Temporada", type: "text" }} value={draft.temporada} onChange={(v) => onCambiar({ temporada: v })} />
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {draft.url && <a href={draft.url} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}><Btn variant="outline" Icon={ExternalLink}>Roster</Btn></a>}
+          <Btn variant="danger" Icon={Trash2} onClick={onBorrar}>Borrar</Btn>
+        </div>
+      </div>
+
+      {draft.notas && (
+        <div style={{ background: C.amberSoft, color: C.amber, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, display: "flex", gap: 7, alignItems: "flex-start" }}>
+          <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} /> {draft.notas}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+        <Kpi label="Plantilla" value={a.total} hint={`Temporada ${a.base}`} />
+        <Kpi label="Último año" value={T.salen[0]} hint={draft.division === "NJCAA" ? "SO" : "GS + SR"} />
+        <Kpi label={`Quedan en ${a.temporadas[0]}`} value={T.quedan[0]} hint="sin reclutar a nadie" />
+        <Kpi label={`A reclutar ${a.temporadas[0]}`} value={T.faltan[0]} hint="para mantener el tamaño" />
+      </div>
+
+      <Card title="Conclusiones">
+        <ul style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 6 }}>
+          {a.conclusiones.map((c, i) => <li key={i} style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.5 }}>{c}</li>)}
+        </ul>
+      </Card>
+
+      <Card title="Pronóstico por posición" badge={<span style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute }}>
+        Jugadores que quedan al empezar cada temporada si no reclutan. En rojo, los que hay que traer para tener los mismos de hoy.
+        {draft.division === "NJCAA" ? " En NJCAA el SO está en su último año y al FR le queda 1." : " GS y SR se van; al JR le queda 1 año, al SO 2 y al FR 3."}
+      </span>}>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr>
+              <th style={thStyle}>Posición</th>
+              <th style={{ ...thStyle, textAlign: "center" }}>Hoy ({a.base})</th>
+              {a.temporadas.map((t) => <th key={t} style={{ ...thStyle, textAlign: "center" }}>{t}</th>)}
+              <th style={thStyle}>Prioridad {a.temporadas[0]}</th>
+            </tr></thead>
+            <tbody>
+              {[...GRUPOS, { key: "TOTAL", label: "Total" }].map((g) => {
+                const f = a.forecast[g.key];
+                const p = PRIORIDAD[f.prioridad];
+                const tot = g.key === "TOTAL";
+                return (
+                  <tr key={g.key} style={tot ? { background: "#F7F9F6" } : undefined}>
+                    <td style={{ ...tdStyle, fontWeight: tot ? 600 : 500 }}>{g.label}</td>
+                    <td style={{ ...tdStyle, ...num, fontWeight: 600 }}>{f.actual}</td>
+                    {a.temporadas.map((t, i) => (
+                      <td key={t} style={{ ...tdStyle, ...num }}>
+                        {f.quedan[i]}
+                        {f.faltan[i] > 0 && <span style={{ color: C.clay, fontSize: 11.5, marginLeft: 6 }}>−{f.faltan[i]}</span>}
+                      </td>
+                    ))}
+                    <td style={tdStyle}>{!tot && <Pill color={p.color} soft={p.soft}>{p.label}</Pill>}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 14 }}>
+        <Card title="Jugadores por año">
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${columnasAno.length}, 1fr)`, gap: 8 }}>
+            {columnasAno.map((y) => (
+              <div key={y.key} style={{ background: "#F7F9F6", borderRadius: 7, padding: "10px 6px", textAlign: "center" }}>
+                <div style={{ fontFamily: "var(--display)", fontSize: 22, fontWeight: 600 }}>{a.porAno[y.key]}</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.ink, fontWeight: 500 }}>{y.key}</div>
+                <div style={{ fontFamily: "var(--ui)", fontSize: 10.5, color: C.faint }}>{y.label}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        <Card title="Por posición y año">
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr>
+                <th style={thStyle}>Posición</th>
+                {columnasAno.map((y) => <th key={y.key} style={{ ...thStyle, textAlign: "center" }}>{y.key}</th>)}
+                <th style={{ ...thStyle, textAlign: "center" }}>Total</th>
+              </tr></thead>
+              <tbody>
+                {filasGrupo.map((g) => {
+                  const fila = a.matriz[g.key];
+                  return (
+                    <tr key={g.key}>
+                      <td style={{ ...tdStyle, fontWeight: 500 }}>{g.label}</td>
+                      {columnasAno.map((y) => <td key={y.key} style={{ ...tdStyle, ...num, color: fila[y.key] ? C.ink : C.faint }}>{fila[y.key]}</td>)}
+                      <td style={{ ...tdStyle, ...num, fontWeight: 600 }}>{Object.values(fila).reduce((s, n) => s + n, 0)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+
+      <Card title={`Jugadores (${draft.jugadores.length})`} badge={
+        <Btn size="sm" variant="ghost" Icon={verJugadores ? ChevronDown : ChevronRight} onClick={() => setVerJugadores(!verJugadores)}>{verJugadores ? "Ocultar" : "Ver y corregir"}</Btn>
+      }>
+        {verJugadores ? (
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr>
+                <th style={thStyle}>#</th><th style={thStyle}>Nombre</th><th style={thStyle}>Posición en la página</th><th style={thStyle}>Grupo</th><th style={thStyle}>Año</th>
+              </tr></thead>
+              <tbody>
+                {draft.jugadores.map((j) => (
+                  <tr key={j.id}>
+                    <td style={{ ...tdStyle, fontFamily: "var(--mono)", color: C.mute }}>{j.numero}</td>
+                    <td style={tdStyle}>{j.nombre}</td>
+                    <td style={{ ...tdStyle, color: C.mute }}>{j.posicion}{j.redshirt ? " · RS" : ""}</td>
+                    <td style={tdStyle}>
+                      <select className="crm-in" value={j.grupo} onChange={(e) => cambiarJugador(j.id, { grupo: e.target.value })} style={{ ...inputStyle, padding: "4px 6px", width: "auto", color: GRUPOS.some((g) => g.key === j.grupo) ? C.ink : C.clay }}>
+                        {GRUPOS.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
+                        <option value="SD">Sin posición</option>
+                      </select>
+                    </td>
+                    <td style={tdStyle}>
+                      <select className="crm-in" value={j.ano} onChange={(e) => cambiarJugador(j.id, { ano: e.target.value })} style={{ ...inputStyle, padding: "4px 6px", width: "auto", color: ANOS.some((y) => y.key === j.ano) ? C.ink : C.clay }}>
+                        {ANOS.map((y) => <option key={y.key} value={y.key}>{y.key} · {y.label}</option>)}
+                        <option value="SD">Sin año</option>
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Prose>Si Claude leyó mal el año o la posición de alguien, corrígelo aquí y los números se recalculan.</Prose>
+        )}
+      </Card>
+    </div>
   );
 }
 

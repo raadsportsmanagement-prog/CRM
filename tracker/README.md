@@ -129,7 +129,83 @@ npx wrangler secret put WA_TOKEN        # sólo para WhatsApp; suele ser el mism
 
 Y en `wrangler.toml`, que no lleva secretos sino identificadores:
 `META_PAGE_ID`, `META_AD_ACCOUNT` y, para WhatsApp, `WA_PHONE_ID` — que es el
-**identificador** del número remitente, no el número.
+**identificador** del número remitente, no el número— y `WA_WABA_ID`, el de la
+cuenta de WhatsApp Business, para leer las plantillas aprobadas.
+
+### Recibir lo que te escriben por WhatsApp
+
+Meta avisa de cada mensaje llamando a `/wa/webhook`. El puente lo guarda y el
+CRM lo recoge cada minuto mientras esté abierto. Hacen falta dos secretos más:
+
+```sh
+npx wrangler secret put WA_APP_SECRET    # Configuración de la app → Básica → Clave secreta
+npx wrangler secret put WA_VERIFY_TOKEN  # una palabra que inventes
+```
+
+Luego, en developers.facebook.com → tu app → WhatsApp → Configuración:
+
+1. **Webhook** → URL de devolución de llamada: `https://<tu-puente>/wa/webhook`,
+   y como token de verificación la misma palabra de `WA_VERIFY_TOKEN`.
+2. En los campos del webhook, suscríbete a `messages`.
+3. Suscribe la app a la cuenta de WhatsApp Business, una sola vez:
+   `POST /<WA_WABA_ID>/subscribed_apps` con el token de la app. Sin esto Meta
+   no manda nada aunque el webhook esté verificado.
+
+Sólo se guardan los mensajes que llegan, no los avisos de entregado y leído:
+cada mensaje que sale generaría tres escrituras, y el plan gratuito de KV da
+mil al día.
+
+## WhatsApp por Twilio, con un número virtual
+
+En vez de poner el número en Meta, lo pone Twilio: le compras uno virtual, lo
+registra como remitente de WhatsApp y el puente habla con Twilio. Por debajo
+sigue siendo la API de Meta, así que valen las mismas reglas: la ventana de 24
+horas y las plantillas aprobadas para el primer mensaje. El CRM no cambia en
+nada; sólo cambia por dónde sale.
+
+1. **Cuenta y número.** En [console.twilio.com](https://console.twilio.com),
+   sal del modo de prueba cargando saldo, y compra un número en
+   **Phone Numbers → Buy a number**. Uno de EE. UU. es el más barato y el que
+   menos papeles pide; sirve para escribirle a cualquier país.
+2. **Registrarlo en WhatsApp.** En **Messaging → Senders → WhatsApp senders →
+   Create new sender**, elige ese número y sigue el asistente: te pide entrar
+   con Facebook, elegir (o crear) el portafolio de Meta, el nombre que verá la
+   gente y verificar el número —Twilio recibe el código solo—. Meta lo revisa;
+   suele tardar desde minutos hasta un par de días.
+3. **Plantillas.** En **Messaging → Content Template Builder**, crea cada una
+   con variables `{{1}}`, `{{2}}`… en el texto y mándala a aprobación de
+   WhatsApp, categoría *Marketing* para las promociones. El CRM las lista con el
+   nombre que les pongas.
+4. **El puente.** En `wrangler.toml`, `TWILIO_ACCOUNT_SID` y `TWILIO_WA_FROM`
+   (el número, con `+` e indicativo). Y el secreto:
+
+   ```sh
+   npx wrangler secret put TWILIO_AUTH_TOKEN
+   npx wrangler deploy
+   ```
+
+5. **Lo que te escriben.** En el remitente de WhatsApp de Twilio, en
+   **Webhook URL for incoming messages**, pon `https://<tu-puente>/wa/twilio`
+   con método `POST`. No hace falta nada más: el puente comprueba la firma de
+   Twilio con el mismo Auth Token.
+
+Con `TWILIO_ACCOUNT_SID` puesto, todo WhatsApp va por Twilio y los `WA_*` de
+Meta se ignoran. Bórralo y vuelve a salir por Meta.
+
+Para probar antes de tener el número aprobado sirve el **Sandbox** de Twilio
+(Messaging → Try it out → Send a WhatsApp message): pon su número en
+`TWILIO_WA_FROM` y escríbele desde tu celular la palabra que te indica. Sólo
+deja escribirle a quien se unió así, y no sirve con tus propias plantillas.
+
+Lo que Twilio cobra va **encima** de lo que cobra Meta por cada plantilla: una
+pequeña tarifa por mensaje, enviado o recibido, más el alquiler del número.
+Míralo en twilio.com/whatsapp/pricing antes de un envío grande.
+
+Un detalle de cómo se ve en el CRM: Twilio acepta el mensaje al instante y lo
+entrega después, y los rechazos de Meta —la ventana de 24 horas, un número sin
+WhatsApp— llegan en ese después. El puente espera hasta un par de segundos para
+poder decir que falló y por qué; por eso cada envío tarda un poco más que por
+Meta. Lo que falle más tarde que eso queda como enviado.
 
 ## Conectar Google Ads
 
@@ -178,6 +254,11 @@ Públicas, porque tienen que serlo:
 - `GET /gads/vuelta` — la vuelta de Google al autorizar. No puede llevar clave
   porque la abre Google, así que se protege con un vale de un solo uso que creó
   `/gads/entrar` y que caduca en diez minutos.
+- `POST /wa/twilio` — los mensajes que llegan por Twilio. Se protege con la
+  firma de Twilio (`X-Twilio-Signature`), hecha con `TWILIO_AUTH_TOKEN`.
+- `GET|POST /wa/webhook` — los avisos de WhatsApp. No lleva clave porque la
+  llama Meta: el GET se protege con `WA_VERIFY_TOKEN` y cada POST con la firma
+  de la app (`WA_APP_SECRET`). Lo que no venga firmado por Meta no se anota.
 
 Con clave, todas:
 
@@ -189,7 +270,16 @@ Con clave, todas:
 - `GET /gads/campanas?dias=30` — lo mismo, en Google.
 - `GET /gads/entrar` — empieza la autorización de Google.
 - `POST /wa/enviar` — manda un WhatsApp. Cuerpo JSON: `{a, texto}`, o
-  `{a, plantilla, idioma, variables}` para una plantilla aprobada.
+  `{a, plantilla, idioma, variables}` para una plantilla aprobada. `variables`
+  es una lista para las plantillas de `{{1}}`, `{{2}}`… y un objeto
+  nombre → valor para las de variables con nombre.
+- `GET /wa/plantillas` — las plantillas de la cuenta, con su texto y variables.
+- `POST /wa/plantillas/crear` — crea una plantilla en Meta y la deja en
+  revisión. Cuerpo JSON: `{nombre, idioma, categoria, cuerpo, encabezado, pie,
+  ejemplos}`, con variables con nombre (`{{nombre}}`) y un ejemplo por cada
+  una. La aprobación se lee después con `/wa/plantillas`. Sólo por Meta, no
+  por Twilio.
+- `GET /wa/mensajes?desde=<ms>` — lo recibido por WhatsApp desde una marca.
 
 ## Lo que un medidor no puede prometer
 

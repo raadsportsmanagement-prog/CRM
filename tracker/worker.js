@@ -178,7 +178,9 @@ async function pedirJson(url, opciones, quien) {
   try { data = texto ? JSON.parse(texto) : null; } catch (_) {}
   if (!r.ok) {
     const e = data && data.error;
-    const detalle = (e && (e.message || e.error_description || e.status)) ||
+    /* Meta guarda la explicación para personas en error_user_msg; message
+       suele ser un "Invalid parameter" que no dice cuál. */
+    const detalle = (e && (e.error_user_msg || e.message || e.error_description || e.status)) ||
       (data && data.error_description) || `HTTP ${r.status}`;
     throw new Aviso(`${quien}: ${detalle}`, r.status === 401 || r.status === 403 ? 502 : 502);
   }
@@ -423,15 +425,23 @@ async function whatsappEnviar(env, cuerpo) {
   const a = String(cuerpo.a || "").replace(/\D/g, "");
   if (!a) throw new Aviso("Falta el número de destino.");
 
+  /* Las variables llegan de dos formas, según cómo se escribió la plantilla en
+     Meta: una lista para las de {{1}}, {{2}}…, y un objeto nombre → valor para
+     las de {{nombre}}. Meta no acepta mezclar, así que se respeta lo que venga. */
+  const vars = cuerpo.variables;
+  const parametros = Array.isArray(vars)
+    ? vars.map((v) => ({ type: "text", text: String(v) }))
+    : vars && typeof vars === "object"
+      ? Object.entries(vars).map(([k, v]) => ({ type: "text", parameter_name: k, text: String(v) }))
+      : [];
+
   const mensaje = cuerpo.plantilla
     ? {
         messaging_product: "whatsapp", to: a, type: "template",
         template: {
           name: String(cuerpo.plantilla),
           language: { code: String(cuerpo.idioma || "es") },
-          ...(Array.isArray(cuerpo.variables) && cuerpo.variables.length
-            ? { components: [{ type: "body", parameters: cuerpo.variables.map((v) => ({ type: "text", text: String(v) })) }] }
-            : {}),
+          ...(parametros.length ? { components: [{ type: "body", parameters: parametros }] } : {}),
         },
       }
     : {
@@ -466,8 +476,523 @@ async function whatsappEnviar(env, cuerpo) {
     if (/131026|not.*capable|no.*existe/i.test(m)) {
       throw new Aviso("Ese número no tiene WhatsApp, o no puede recibir mensajes de empresas.", 409);
     }
+    if (/132001|template.*(does not exist|name)/i.test(m)) {
+      throw new Aviso(`Meta no encuentra la plantilla «${cuerpo.plantilla}» en ese idioma. Revisa que esté aprobada y que el idioma coincida.`, 409);
+    }
+    if (/132000|number of parameters/i.test(m)) {
+      throw new Aviso("La plantilla de Meta pide otro número de variables. Vuelve a enlazarla en Plantillas.", 409);
+    }
     throw e;
   }
+}
+
+/* ── Las plantillas que Meta ya aprobó ──
+   El CRM no las puede inventar: cada una se crea y se aprueba en el
+   Administrador de WhatsApp. Aquí sólo se leen, con lo justo para enlazarlas
+   a una plantilla del CRM: su texto y qué variables pide.
+
+   Sólo se pueden usar desde el CRM las que llevan variables en el cuerpo y
+   nada más. Un encabezado con foto o un botón con enlace variable piden datos
+   que el CRM no tiene, y mandarlas a medias haría que Meta las rechace una por
+   una. Se listan igual, con el motivo, para que no parezca que desaparecieron. */
+async function whatsappPlantillas(env) {
+  if (!env.WA_TOKEN) throw falta("el token de WhatsApp", { secretos: ["WA_TOKEN"] });
+  if (!env.WA_WABA_ID) throw falta("la cuenta de WhatsApp Business", { vars: ["WA_WABA_ID"] });
+
+  const plantillas = [];
+  let despues = "";
+  for (let paginas = 0; paginas < 5; paginas++) {
+    const r = await graph(`/${env.WA_WABA_ID}/message_templates`, {
+      fields: "id,name,language,status,category,components,parameter_format,rejected_reason",
+      limit: "100",
+      ...(despues ? { after: despues } : {}),
+    }, env.WA_TOKEN);
+    for (const t of r.data || []) plantillas.push(resumirPlantilla(t));
+    despues = (r.paging && r.paging.next && r.paging.cursors && r.paging.cursors.after) || "";
+    if (!despues) break;
+  }
+  return { plantillas };
+}
+
+function resumirPlantilla(t) {
+  const comps = Array.isArray(t.components) ? t.components : [];
+  const cuerpo = String((comps.find((c) => c.type === "BODY") || {}).text || "");
+  const nombradas = String(t.parameter_format || "").toUpperCase() === "NAMED";
+  const marcas = [...cuerpo.matchAll(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g)].map((m) => m[1]);
+  const vars = nombradas
+    ? [...new Set(marcas)]
+    : [...new Set(marcas)].sort((x, y) => Number(x) - Number(y));
+
+  let motivo = "";
+  const cabeza = comps.find((c) => c.type === "HEADER");
+  if (cabeza && cabeza.format && cabeza.format !== "TEXT") motivo = "lleva un encabezado con archivo";
+  else if (cabeza && /\{\{/.test(String(cabeza.text || ""))) motivo = "lleva una variable en el encabezado";
+  const botones = (comps.find((c) => c.type === "BUTTONS") || {}).buttons || [];
+  if (!motivo && botones.some((b) => /\{\{/.test(String(b.url || "")))) motivo = "lleva un botón con enlace variable";
+
+  return {
+    id: t.id,
+    nombre: t.name,
+    idioma: t.language,
+    estado: t.status,
+    rechazo: t.rejected_reason && t.rejected_reason !== "NONE" ? t.rejected_reason : "",
+    categoria: t.category,
+    cuerpo,
+    vars,
+    formato: nombradas ? "nombrado" : "posicional",
+    motivo,
+  };
+}
+
+/* ── Crear una plantilla y mandarla a revisión ──
+   Meta la revisa por su cuenta —minutos, a veces un día— y el CRM se entera
+   preguntando por /wa/plantillas, igual que con las que se crean a mano en
+   WhatsApp Manager. Aquí sólo se arma lo que Meta exige y se le entrega.
+
+   Las variables van con nombre ({{nombre}}, {{institucion}}) y no numeradas:
+   así son las mismas palabras que usa el CRM y el enlace sale hecho. Meta pide
+   un ejemplo por variable para revisarla; los pone el CRM, que sabe qué dato
+   va en cada una. */
+const NOMBRE_PLANTILLA = /^[a-z0-9_]{1,512}$/;
+const VAR_NOMBRADA = /\{\{\s*([a-z0-9_]+)\s*\}\}/g;
+
+async function whatsappCrearPlantilla(env, c) {
+  if (conTwilio(env)) {
+    throw new Aviso("Con Twilio las plantillas se crean en su Content Template Builder; desde el CRM sólo se pueden crear yendo directo por Meta.", 400);
+  }
+  if (!env.WA_TOKEN) throw falta("el token de WhatsApp", { secretos: ["WA_TOKEN"] });
+  if (!env.WA_WABA_ID) throw falta("la cuenta de WhatsApp Business", { vars: ["WA_WABA_ID"] });
+
+  const nombre = String(c.nombre || "").trim();
+  if (!NOMBRE_PLANTILLA.test(nombre)) throw new Aviso("El nombre para Meta sólo admite minúsculas, números y guion bajo.");
+  const categoria = c.categoria === "UTILITY" ? "UTILITY" : "MARKETING";
+  const idioma = String(c.idioma || "es");
+  const cuerpo = String(c.cuerpo || "").trim().replace(VAR_NOMBRADA, (m, k) => `{{${k}}}`);
+  if (!cuerpo) throw new Aviso("El mensaje está vacío.");
+  if (cuerpo.length > 1024) throw new Aviso("Meta acepta hasta 1.024 caracteres en el mensaje.");
+
+  const ejemplos = c.ejemplos && typeof c.ejemplos === "object" ? c.ejemplos : {};
+  const vars = [...new Set([...cuerpo.matchAll(VAR_NOMBRADA)].map((m) => m[1]))];
+  const sinEjemplo = vars.find((k) => !String(ejemplos[k] || "").trim());
+  if (sinEjemplo) throw new Aviso(`Falta un ejemplo para {{${sinEjemplo}}}: Meta lo pide para revisar la plantilla.`);
+
+  const componentes = [];
+  const encabezado = String(c.encabezado || "").trim();
+  if (encabezado) componentes.push({ type: "HEADER", format: "TEXT", text: encabezado });
+  componentes.push({
+    type: "BODY",
+    text: cuerpo,
+    ...(vars.length ? { example: { body_text_named_params: vars.map((k) => ({ param_name: k, example: String(ejemplos[k]) })) } } : {}),
+  });
+  const pie = String(c.pie || "").trim();
+  if (pie) componentes.push({ type: "FOOTER", text: pie });
+
+  const r = await pedirJson(
+    `https://graph.facebook.com/${META_V}/${env.WA_WABA_ID}/message_templates`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.WA_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nombre, language: idioma, category: categoria, parameter_format: "NAMED", components: componentes }),
+    },
+    "Meta",
+  );
+  return { id: r.id || "", nombre, idioma, estado: r.status || "PENDING", categoria: r.category || categoria };
+}
+
+/* ════════════════════════════════════════════════════════════
+   WhatsApp — lo que te escriben
+
+   Meta avisa de cada mensaje llamando a /wa/webhook. Ese aviso no puede
+   esperar al CRM, que vive en un navegador que a esa hora puede estar
+   cerrado: se guarda aquí y el CRM lo recoge con /wa/mensajes cuando abre.
+
+   La puerta de entrada no lleva la clave del CRM —Meta no la tiene—, así que
+   se cuida de otra forma: cada aviso viene firmado con el secreto de la app
+   (X-Hub-Signature-256), y lo que no venga firmado por Meta no se anota.
+
+   De cada mensaje se guarda lo que hace falta para ponerlo en el hilo: quién,
+   cuándo y qué dijo. Las fotos y audios no se descargan —Meta los entrega
+   aparte y caducan—; se anota que llegó uno y su pie de foto, si trae.
+   ════════════════════════════════════════════════════════════ */
+
+const WA_ULTIMO = "wa:ultimo";
+
+/* La firma de Meta es un HMAC-SHA256 del cuerpo tal como llegó, en hex. */
+async function firmaMeta(secreto, cuerpo) {
+  const k = await crypto.subtle.importKey("raw", enc.encode(secreto), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const s = await crypto.subtle.sign("HMAC", k, enc.encode(cuerpo));
+  return "sha256=" + [...new Uint8Array(s)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function textoDeMensaje(m) {
+  const pie = (x) => (x && x.caption ? ` ${x.caption}` : "");
+  switch (m.type) {
+    case "text": return String((m.text && m.text.body) || "");
+    case "button": return String((m.button && m.button.text) || "");
+    case "interactive": {
+      const i = m.interactive || {};
+      return String((i.button_reply && i.button_reply.title) || (i.list_reply && i.list_reply.title) || "[Respuesta]");
+    }
+    case "image": return `[Foto]${pie(m.image)}`;
+    case "video": return `[Video]${pie(m.video)}`;
+    case "document": return `[Documento] ${(m.document && (m.document.filename || m.document.caption)) || ""}`.trim();
+    case "audio": return "[Audio]";
+    case "sticker": return "[Sticker]";
+    case "location": {
+      const l = m.location || {};
+      return `[Ubicación] ${[l.name, l.address].filter(Boolean).join(", ")} ${l.latitude},${l.longitude}`.trim();
+    }
+    case "contacts": return "[Contacto compartido]";
+    default: return `[${m.type || "Mensaje"}]`;
+  }
+}
+
+async function whatsappWebhook(req, env, ctx) {
+  if (req.method === "GET") {
+    /* La verificación de Meta: al guardar la dirección del webhook, Meta la
+       llama con el token que escribiste allá y espera que le devuelvan el
+       desafío tal cual. */
+    const u = new URL(req.url);
+    if (!env.WA_VERIFY_TOKEN) return new Response("Falta WA_VERIFY_TOKEN en el puente.", { status: 503 });
+    if (u.searchParams.get("hub.mode") === "subscribe" && igual(u.searchParams.get("hub.verify_token") || "", env.WA_VERIFY_TOKEN)) {
+      return new Response(u.searchParams.get("hub.challenge") || "", { headers: { "Content-Type": "text/plain", ...SIN_CACHE } });
+    }
+    return new Response("Token de verificación incorrecto.", { status: 403 });
+  }
+
+  if (!env.WA_APP_SECRET) return new Response("Falta WA_APP_SECRET en el puente.", { status: 503 });
+  const crudo = await req.text();
+  if (!igual(req.headers.get("x-hub-signature-256") || "", await firmaMeta(env.WA_APP_SECRET, crudo))) {
+    return new Response("Firma inválida.", { status: 401 });
+  }
+
+  let aviso = null;
+  try { aviso = JSON.parse(crudo); } catch (_) { return new Response("", { status: 400 }); }
+
+  const mensajes = [];
+  for (const entrada of aviso.entry || []) {
+    for (const cambio of entrada.changes || []) {
+      const v = cambio.value || {};
+      /* Sólo lo que llega a nuestro número. Los avisos de entregado y leído
+         también pasan por aquí, pero guardarlos gastaría tres escrituras por
+         cada mensaje que sale, y el plan gratuito da mil al día. */
+      if (env.WA_PHONE_ID && v.metadata && v.metadata.phone_number_id && v.metadata.phone_number_id !== env.WA_PHONE_ID) continue;
+      const nombres = new Map((v.contacts || []).map((c) => [c.wa_id, (c.profile && c.profile.name) || ""]));
+      for (const m of v.messages || []) {
+        if (m.type === "reaction" || !m.id || !m.from) continue;
+        mensajes.push({
+          ext: m.id,
+          de: m.from,
+          nombre: nombres.get(m.from) || "",
+          at: new Date(Number(m.timestamp) * 1000 || Date.now()).toISOString(),
+          tipo: m.type,
+          texto: textoDeMensaje(m).slice(0, 4000),
+        });
+      }
+    }
+  }
+
+  guardarRecibidos(env, ctx, mensajes);
+  return new Response("", { status: 200 });
+}
+
+/* Se contesta al aviso ya y se escribe después: si tarda, quien avisa (Meta o
+   Twilio) lo da por fallido y lo repite, y un mismo mensaje entraría varias
+   veces. */
+function guardarRecibidos(env, ctx, mensajes) {
+  if (!mensajes.length) return;
+  ctx.waitUntil((async () => {
+    const ms = Date.now();
+    await Promise.all(mensajes.map((m, i) => env.EVENTOS.put(
+      `wm:${String(ms).padStart(13, "0")}:${i}:${crypto.randomUUID().slice(0, 6)}`,
+      JSON.stringify(m),
+      { expirationTtl: 60 * 60 * 24 * 60 },
+    )));
+    await env.EVENTOS.put(WA_ULTIMO, String(ms));
+  })());
+}
+
+/* Lo recibido desde una fecha, para el CRM. Antes de listar se mira la marca
+   de lo último que entró: el CRM pregunta cada minuto, y casi siempre la
+   respuesta es "nada nuevo". Leer una llave cuesta poco; listar, en el plan
+   gratuito, sólo se puede mil veces al día. */
+async function whatsappRecibidos(env, desde) {
+  const ultimo = Number(await env.EVENTOS.get(WA_ULTIMO)) || 0;
+  if (!ultimo || ultimo <= desde) return { mensajes: [], truncado: false };
+
+  /* El "~" va después de cualquier letra o número: así lo que entró en el
+     mismo milisegundo de la marca, que ya se entregó, queda fuera del corte. */
+  const corte = `wm:${String(desde > 0 ? desde : 0).padStart(13, "0")}:~`;
+  const llaves = [];
+  let cursor = null, paginas = 0;
+  do {
+    const r = await env.EVENTOS.list({ prefix: "wm:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const k of r.keys) if (k.name > corte) llaves.push(k.name);
+    cursor = r.list_complete ? null : r.cursor;
+    paginas++;
+  } while (cursor && paginas < 5);
+
+  /* Cada mensaje es una lectura aparte. Se entregan de a 200, los más
+     viejos primero: el CRM vuelve a pedir desde el último y termina. */
+  llaves.sort();
+  const tanda = llaves.slice(0, 200);
+  const valores = await Promise.all(tanda.map((k) => env.EVENTOS.get(k)));
+  const mensajes = [];
+  tanda.forEach((k, i) => {
+    try { if (valores[i]) mensajes.push({ ...JSON.parse(valores[i]), recibido: Number(k.split(":")[1]) }); } catch (_) {}
+  });
+  return { mensajes, truncado: llaves.length > tanda.length };
+}
+
+/* ════════════════════════════════════════════════════════════
+   WhatsApp por Twilio — el mismo canal, otro intermediario
+
+   Twilio no es otro WhatsApp: por debajo sigue siendo la API de Meta, con sus
+   mismas dos reglas (la ventana de 24 horas y las plantillas aprobadas). Lo
+   que cambia es quién pone el número —uno virtual de Twilio, sin chip— y por
+   dónde pasa todo. Por eso aquí se contesta exactamente lo mismo que en la
+   parte de Meta, y el CRM no sabe ni le importa por cuál de los dos salió.
+
+   Basta con escribir TWILIO_ACCOUNT_SID en wrangler.toml para que WhatsApp
+   salga por Twilio. Sin él, sigue saliendo por Meta como antes.
+   ════════════════════════════════════════════════════════════ */
+
+const conTwilio = (env) => Boolean(env.TWILIO_ACCOUNT_SID);
+
+/* El número de Twilio se escribe como en el teléfono, con o sin "+", y aquí
+   se le pone el prefijo que Twilio exige para saber que es WhatsApp y no SMS. */
+const twNumero = (v) => `whatsapp:+${String(v || "").replace(/\D/g, "")}`;
+
+/* Twilio, a diferencia de Meta, no explica sus errores bajo "error": los pone
+   en la raíz, con un número propio. Se conserva el número porque es lo único
+   estable para traducirlo; el texto en inglés cambia cuando Twilio quiere. */
+async function twilio(env, url, { method = "GET", form } = {}) {
+  if (!env.TWILIO_AUTH_TOKEN) throw falta("el token de Twilio", { secretos: ["TWILIO_AUTH_TOKEN"] });
+  let r;
+  try {
+    r = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`,
+        ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+      },
+      ...(form ? { body: new URLSearchParams(form) } : {}),
+    });
+  } catch (_) {
+    throw new Aviso("No se pudo hablar con Twilio. Puede ser un corte de red momentáneo.", 502);
+  }
+  let data = null;
+  try { data = await r.json(); } catch (_) {}
+  if (!r.ok) {
+    if (r.status === 401 || (data && data.code === 20003)) {
+      throw new Aviso("Twilio no acepta las credenciales. Revisa TWILIO_ACCOUNT_SID y TWILIO_AUTH_TOKEN.", 502);
+    }
+    const e = new Aviso(`Twilio: ${(data && data.message) || `HTTP ${r.status}`}`, 502);
+    e.codigo = data && data.code;
+    throw e;
+  }
+  return data || {};
+}
+
+const twApi = (env, resto) => `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}${resto}`;
+
+/* Los errores que le van a pasar a cualquiera, dichos con palabras. Twilio
+   los entrega de dos formas: algunos al pedir el envío, y la mayoría —los que
+   dependen de Meta— un segundo después, en el estado del mensaje. */
+function twTraducir(codigo, plantilla) {
+  switch (Number(codigo)) {
+    case 63016:
+      return new Aviso(
+        "Esta persona no te ha escrito en las últimas 24 horas, así que WhatsApp no deja mandarle texto libre. " +
+        "Usa una plantilla aprobada, o abre el chat con el botón de enlace.", 409);
+    case 63003: case 63024: case 21211: case 21614:
+      return new Aviso("Ese número no tiene WhatsApp, o no puede recibir mensajes de empresas.", 409);
+    case 63027: case 21655:
+      return new Aviso(`Twilio no encuentra la plantilla «${plantilla}» en ese idioma, o Meta todavía no la aprueba.`, 409);
+    case 63028: case 21656:
+      return new Aviso("La plantilla de Twilio pide otro número de variables. Vuelve a enlazarla en Plantillas.", 409);
+    case 63049:
+      return new Aviso(
+        "Meta decidió no entregarle este mensaje de marketing. Lo hace cuando esa persona ya recibió muchos " +
+        "de distintas empresas hace poco; no es un error tuyo y no conviene reintentar enseguida.", 409);
+    case 63007:
+      return new Aviso("Twilio no tiene WhatsApp activado en el número de TWILIO_WA_FROM. Revisa que sea el remitente aprobado.", 503);
+    case 63018:
+      return new Aviso("Se superó el límite de envíos por segundo de WhatsApp. Espera un momento y sigue.", 429);
+    default:
+      return null;
+  }
+}
+
+/* El CRM conoce las plantillas por nombre e idioma, como en Meta; Twilio las
+   envía por su identificador (HX…). La traducción se guarda unos minutos en
+   memoria para que un envío masivo no le pregunte a Twilio por la lista entera
+   antes de cada mensaje. */
+let twCache = { at: 0, lista: [] };
+
+async function twContenidos(env, fresco = false) {
+  if (!fresco && Date.now() - twCache.at < 10 * 60 * 1000) return twCache.lista;
+  const lista = [];
+  let url = "https://content.twilio.com/v1/ContentAndApprovals?PageSize=500";
+  for (let paginas = 0; url && paginas < 5; paginas++) {
+    const r = await twilio(env, url);
+    lista.push(...(r.contents || []));
+    url = (r.meta && r.meta.next_page_url) || "";
+  }
+  twCache = { at: Date.now(), lista };
+  return lista;
+}
+
+async function twilioEnviar(env, cuerpo) {
+  if (!env.TWILIO_WA_FROM) throw falta("el número remitente de Twilio", { vars: ["TWILIO_WA_FROM"] });
+
+  const a = String(cuerpo.a || "").replace(/\D/g, "");
+  if (!a) throw new Aviso("Falta el número de destino.");
+
+  const form = { From: twNumero(env.TWILIO_WA_FROM), To: twNumero(a) };
+
+  if (cuerpo.plantilla) {
+    const nombre = String(cuerpo.plantilla);
+    const idioma = String(cuerpo.idioma || "es");
+    let sid = /^HX[0-9a-f]{32}$/i.test(nombre) ? nombre : "";
+    if (!sid) {
+      const buscar = (l) => l.find((c) => c.friendly_name === nombre && (c.language || "es") === idioma);
+      /* Si no está, puede que la plantilla sea de hace un minuto: se vuelve a
+         preguntar una vez antes de decir que no existe. */
+      const c = buscar(await twContenidos(env)) || buscar(await twContenidos(env, true));
+      if (!c) throw twTraducir(63027, nombre);
+      sid = c.sid;
+    }
+    form.ContentSid = sid;
+
+    /* Twilio numera las variables {{1}}, {{2}}… y las recibe como un objeto
+       con esos números de llave. La lista del CRM viene en ese mismo orden. */
+    const vars = cuerpo.variables;
+    const valores = Array.isArray(vars)
+      ? Object.fromEntries(vars.map((v, i) => [String(i + 1), String(v)]))
+      : vars && typeof vars === "object"
+        ? Object.fromEntries(Object.entries(vars).map(([k, v]) => [k, String(v)]))
+        : {};
+    if (Object.keys(valores).length) form.ContentVariables = JSON.stringify(valores);
+  } else {
+    form.Body = String(cuerpo.texto || "");
+    if (!form.Body.trim()) throw new Aviso("El mensaje está vacío.");
+  }
+
+  let m;
+  try {
+    m = await twilio(env, twApi(env, "/Messages.json"), { method: "POST", form });
+  } catch (e) {
+    throw twTraducir(e && e.codigo, cuerpo.plantilla) || e;
+  }
+
+  /* Twilio acepta el mensaje al instante y lo entrega después. Los rechazos
+     de Meta —la ventana de 24 horas, el número sin WhatsApp— llegan en ese
+     después, casi siempre antes de dos segundos. Se espera ese rato para que
+     el CRM marque el envío como fallido con la razón, en vez de como enviado. */
+  for (let i = 0; i < 4 && /^(accepted|queued|sending)$/.test(m.status || ""); i++) {
+    await new Promise((r) => setTimeout(r, 600));
+    try { m = await twilio(env, twApi(env, `/Messages/${m.sid}.json`)); } catch (_) { break; }
+  }
+  if (m.status === "failed" || m.status === "undelivered") {
+    throw twTraducir(m.error_code, cuerpo.plantilla) ||
+      new Aviso(`Twilio no pudo entregarlo (error ${m.error_code || "sin número"}): ${m.error_message || "sin detalle"}.`, 409);
+  }
+  return { id: m.sid || "", a };
+}
+
+/* Las plantillas en Twilio se llaman "contenidos" y se aprueban con Meta desde
+   la consola de Twilio. Se devuelven con la misma forma que las de Meta para
+   que el CRM las enlace igual. */
+async function twilioPlantillas(env) {
+  const estados = { approved: "APPROVED", pending: "PENDING", received: "PENDING", rejected: "REJECTED", paused: "PAUSED", disabled: "DISABLED" };
+  return {
+    plantillas: (await twContenidos(env, true)).map((c) => {
+      const tipos = c.types || {};
+      const principal = Object.values(tipos)[0] || {};
+      const cuerpo = String(principal.body || principal.title || "");
+      const marcas = (texto) => [...String(texto).matchAll(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g)].map((m) => m[1]);
+      const vars = [...new Set(marcas(cuerpo))];
+      const numeradas = vars.every((v) => /^\d+$/.test(v));
+      if (numeradas) vars.sort((x, y) => Number(x) - Number(y));
+
+      /* Igual que en Meta: una variable fuera del texto —en la dirección de
+         una foto o de un botón— pide un dato que el CRM no tiene. */
+      const ap = c.approval_requests || {};
+      const estado = String(ap.status || "unsubmitted").toLowerCase();
+      let motivo = "";
+      if (marcas(JSON.stringify(tipos)).some((v) => !vars.includes(v))) motivo = "lleva una variable fuera del texto";
+      else if (!cuerpo) motivo = "no tiene texto";
+      else if (estado === "rejected" && ap.rejection_reason) motivo = `Meta la rechazó: ${ap.rejection_reason}`;
+
+      return {
+        nombre: c.friendly_name || c.sid,
+        idioma: c.language || "es",
+        estado: estados[estado] || "SIN ENVIAR A APROBACIÓN",
+        categoria: String(ap.category || "").toUpperCase(),
+        cuerpo,
+        vars,
+        formato: numeradas ? "posicional" : "nombrado",
+        motivo,
+      };
+    }),
+  };
+}
+
+/* ── Lo que te escriben, por Twilio ──
+   Twilio avisa de cada mensaje con un POST de formulario a /wa/twilio, firmado
+   con el token de la cuenta (X-Twilio-Signature): un HMAC-SHA1, en base64, de
+   la dirección exacta seguida de cada campo y su valor, ordenados por nombre.
+   Lo que no venga firmado así no se anota. */
+async function firmaTwilio(token, url, campos) {
+  const texto = url + [...campos].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)).map(([k, v]) => k + v).join("");
+  const k = await crypto.subtle.importKey("raw", enc.encode(token), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const s = await crypto.subtle.sign("HMAC", k, enc.encode(texto));
+  return btoa(String.fromCharCode(...new Uint8Array(s)));
+}
+
+function textoDeTwilio(f) {
+  const n = Number(f.get("NumMedia")) || 0;
+  const cuerpo = String(f.get("Body") || "");
+  if (f.get("Latitude")) {
+    return `[Ubicación] ${[f.get("Label"), f.get("Address")].filter(Boolean).join(", ")} ${f.get("Latitude")},${f.get("Longitude")}`.trim();
+  }
+  if (f.get("ButtonText")) return String(f.get("ButtonText"));
+  if (!n) return cuerpo;
+  const tipo = String(f.get("MediaContentType0") || "");
+  const que = /^image\//.test(tipo) ? "[Foto]" : /^video\//.test(tipo) ? "[Video]" : /^audio\//.test(tipo) ? "[Audio]" : "[Documento]";
+  return `${que} ${cuerpo}`.trim();
+}
+
+async function twilioWebhook(req, env, ctx) {
+  if (!env.TWILIO_AUTH_TOKEN) return new Response("Falta TWILIO_AUTH_TOKEN en el puente.", { status: 503 });
+  let f;
+  try { f = await req.formData(); } catch (_) { return new Response("", { status: 400 }); }
+  if (!igual(req.headers.get("x-twilio-signature") || "", await firmaTwilio(env.TWILIO_AUTH_TOKEN, req.url, [...f.entries()]))) {
+    return new Response("Firma inválida.", { status: 401 });
+  }
+
+  /* Twilio responde con un TwiML vacío: "recibido, no contestes nada". Sin
+     esto deja una advertencia en la consola por cada mensaje. */
+  const listo = new Response("<Response></Response>", { headers: { "Content-Type": "text/xml" } });
+
+  /* Por esta misma puerta pueden pasar los avisos de entregado y leído si
+     alguien los configura en Twilio. No se guardan, por lo mismo que en Meta. */
+  const estado = String(f.get("MessageStatus") || f.get("SmsStatus") || "received");
+  if (estado !== "received" || !f.get("MessageSid")) return listo;
+  if (env.TWILIO_WA_FROM && twNumero(f.get("To")) !== twNumero(env.TWILIO_WA_FROM)) return listo;
+
+  const de = String(f.get("WaId") || f.get("From") || "").replace(/\D/g, "");
+  if (!de) return listo;
+  guardarRecibidos(env, ctx, [{
+    ext: String(f.get("MessageSid")),
+    de,
+    nombre: String(f.get("ProfileName") || ""),
+    at: new Date().toISOString(),
+    tipo: String(f.get("MessageType") || (Number(f.get("NumMedia")) ? "media" : "text")),
+    texto: textoDeTwilio(f).slice(0, 4000),
+  }]);
+  return listo;
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -746,7 +1271,21 @@ async function estadoPuente(env) {
       leads: Boolean((env.META_PAGE_TOKEN || env.META_TOKEN) && env.META_PAGE_ID),
       metricas: Boolean(env.META_TOKEN && env.META_AD_ACCOUNT),
     },
-    whatsapp: { enviar: Boolean(env.WA_TOKEN && env.WA_PHONE_ID) },
+    whatsapp: conTwilio(env) ? {
+      proveedor: "twilio",
+      enviar: Boolean(env.TWILIO_AUTH_TOKEN && env.TWILIO_WA_FROM),
+      plantillas: Boolean(env.TWILIO_AUTH_TOKEN),
+      recibir: Boolean(env.TWILIO_AUTH_TOKEN),
+      ultimoRecibido: Number(await env.EVENTOS.get(WA_ULTIMO)) || 0,
+    } : {
+      proveedor: "meta",
+      enviar: Boolean(env.WA_TOKEN && env.WA_PHONE_ID),
+      plantillas: Boolean(env.WA_TOKEN && env.WA_WABA_ID),
+      recibir: Boolean(env.WA_APP_SECRET && env.WA_VERIFY_TOKEN),
+      /* Si alguna vez llegó algo por el webhook. Que esté configurado no
+         prueba que Meta esté llamando: falta suscribir la app a la cuenta. */
+      ultimoRecibido: Number(await env.EVENTOS.get(WA_ULTIMO)) || 0,
+    },
     google: {
       credenciales: Boolean(env.GADS_CLIENT_ID && env.GADS_CLIENT_SECRET && env.GADS_CUSTOMER_ID),
       developerToken: Boolean(env.GADS_DEV_TOKEN),
@@ -761,9 +1300,22 @@ export default {
     const ruta = url.pathname;
 
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    /* El webhook de WhatsApp va antes que todo: lo llama Meta, no el CRM, así
+       que ni lleva la clave ni le sirven las reglas de abajo. Se protege con
+       la firma de Meta, dentro de whatsappWebhook. */
+    if (ruta === "/wa/webhook") {
+      if (req.method !== "GET" && req.method !== "POST") return new Response("", { status: 405 });
+      return whatsappWebhook(req, env, ctx);
+    }
+    /* Lo mismo para Twilio, que se protege con su propia firma. */
+    if (ruta === "/wa/twilio") {
+      if (req.method !== "POST") return new Response("", { status: 405 });
+      return twilioWebhook(req, env, ctx);
+    }
+
     /* Todo aquí se pide con GET menos una cosa: mandar un WhatsApp lleva
        texto de por medio y eso no cabe con dignidad en una dirección. */
-    const esEnvio = ruta === "/wa/enviar";
+    const esEnvio = ruta === "/wa/enviar" || ruta === "/wa/plantillas/crear";
     if (req.method === "POST" ? !esEnvio : req.method !== "GET" && req.method !== "HEAD") {
       return json({ error: "Método no permitido en esta dirección." }, 405);
     }
@@ -844,8 +1396,15 @@ export default {
         if (ruta === "/wa/enviar") {
           let cuerpo = {};
           try { cuerpo = await req.json(); } catch (_) { return json({ error: "El cuerpo no es JSON." }, 400); }
-          return json(await whatsappEnviar(env, cuerpo));
+          return json(await (conTwilio(env) ? twilioEnviar : whatsappEnviar)(env, cuerpo));
         }
+        if (ruta === "/wa/plantillas") return json(await (conTwilio(env) ? twilioPlantillas : whatsappPlantillas)(env));
+        if (ruta === "/wa/plantillas/crear") {
+          let cuerpo = {};
+          try { cuerpo = await req.json(); } catch (_) { return json({ error: "El cuerpo no es JSON." }, 400); }
+          return json(await whatsappCrearPlantilla(env, cuerpo));
+        }
+        if (ruta === "/wa/mensajes") return json(await whatsappRecibidos(env, desde));
       } catch (e) {
         /* Un Aviso trae un mensaje pensado para que lo lea una persona y su
            propio código; cualquier otro error se enseña tal cual antes que
