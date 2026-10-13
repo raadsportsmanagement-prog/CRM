@@ -7,7 +7,7 @@ import {
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
   Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
-  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus
+  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus, Save
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -4814,6 +4814,44 @@ const correoTexto = ({ titulo, parrafos, cta, url }) =>
    y está bien: lo que importa queda en Plantillas al mandarlo. */
 let memoriaEstudio = null;
 
+/* Los borradores van en IndexedDB y no con el resto del CRM: llevan la foto
+   de fondo y los diseños ya pintados, y con un par de piezas el localStorage
+   se llenaría. Quedan en este navegador, como todo lo demás. Se guardan los
+   últimos BORRADORES_MAX; al pasarse, se va el más viejo. */
+const BORRADORES_MAX = 15;
+let baseBorradores = null;
+const abrirBorradores = () => {
+  if (!baseBorradores) {
+    baseBorradores = new Promise((ok, mal) => {
+      const r = indexedDB.open("crm-estudio", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("borradores", { keyPath: "id" });
+      r.onsuccess = () => ok(r.result);
+      r.onerror = () => mal(r.error);
+    }).catch((e) => { baseBorradores = null; throw e; });
+  }
+  return baseBorradores;
+};
+const enBorradores = async (modo, hacer) => {
+  const bd = await abrirBorradores();
+  return new Promise((ok, mal) => {
+    const tx = bd.transaction("borradores", modo);
+    const r = hacer(tx.objectStore("borradores"));
+    tx.oncomplete = () => ok(r && r.result);
+    tx.onerror = () => mal(tx.error);
+    tx.onabort = () => mal(tx.error || new Error("El navegador canceló la escritura."));
+  });
+};
+const listarBorradores = async () =>
+  ((await enBorradores("readonly", (s) => s.getAll())) || []).sort((a, b) => b.actualizado.localeCompare(a.actualizado));
+const guardarBorrador = async (b) => {
+  await enBorradores("readwrite", (s) => s.put(b));
+  const todos = await listarBorradores();
+  const sobran = todos.slice(BORRADORES_MAX);
+  if (sobran.length) await enBorradores("readwrite", (s) => sobran.forEach((x) => s.delete(x.id)));
+  return todos.slice(0, BORRADORES_MAX);
+};
+const borrarBorrador = (id) => enBorradores("readwrite", (s) => s.delete(id));
+
 function EstudioView({ db, setDb, say, onListo }) {
   const pu = db.integrations.puente;
   const marca = (db.estudio && db.estudio.marca) || "";
@@ -4838,15 +4876,66 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [ctaUrl, setCtaUrl] = useState(m.ctaUrl ?? ((marca.match(/https:\/\/\S+/) || [])[0] || ""));
   const [ajusteCorreo, setAjusteCorreo] = useState("");
   const [hecho, setHecho] = useState(m.hecho || { wa: false, correo: false });
+  const [borradorId, setBorradorId] = useState(m.borradorId || null);
+  const [historial, setHistorial] = useState([]);
+  const [verHistorial, setVerHistorial] = useState(false);
 
   useEffect(() => {
-    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho };
-  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho]);
+    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId };
+  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId]);
+
+  useEffect(() => { listarBorradores().then(setHistorial).catch(() => {}); }, []);
+
+  /* Los diseños se guardan con su JPG ya pintado: al abrir el borrador sólo
+     hay que volver a sacarles la vista previa, sin pasar otra vez por Claude. */
+  const guardar = async (callado) => {
+    const id = borradorId || uid();
+    try {
+      setHistorial(await guardarBorrador({
+        id, actualizado: nowISO(),
+        titulo: (draft && draft.name.trim()) || brief.trim().slice(0, 70) || "Sin título",
+        fuente, brief, propuestas, elegida, foto, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho,
+        disenos: disenos.map(({ svg, archivo, textos }) => ({ svg, archivo, textos })),
+      }));
+      setBorradorId(id);
+      if (!callado) say("Borrador guardado");
+    } catch (e) { setErr(`No se pudo guardar el borrador: ${(e && e.message) || e}`); }
+  };
+
+  /* Lo que se manda a Meta o se aprueba como correo entra solo al historial,
+     para encontrarlo después aunque nadie haya pulsado "Guardar borrador". */
+  const hechoAntes = useRef(hecho);
+  useEffect(() => {
+    const a = hechoAntes.current;
+    hechoAntes.current = hecho;
+    if ((hecho.wa && !a.wa) || (hecho.correo && !a.correo)) guardar(true);
+  }, [hecho]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const abrir = (b) => {
+    const h = b.hecho || { wa: false, correo: false };
+    hechoAntes.current = h;
+    setBorradorId(b.id); setFuente(b.fuente || "idea"); setBrief(b.brief || "");
+    setPropuestas(b.propuestas || []); setElegida(b.elegida ?? -1); setFoto(b.foto || "");
+    setDisenos((b.disenos || []).map((d) => ({ ...d, vista: URL.createObjectURL(d.archivo) })));
+    setDiseno(b.diseno ?? -1); setDraft(b.draft || null); setSubida(b.subida || null);
+    setTextosImg(b.textosImg || { titular: "", apoyo: "", etiqueta: "" }); setCanales(b.canales || { wa: true, correo: false });
+    setCorreo(b.correo || null); setCtaUrl(b.ctaUrl || ""); setHecho(h);
+    setAjuste(""); setAjusteMsg(""); setAjusteCorreo(""); setErr(""); setVerHistorial(false);
+  };
+
+  const quitar = async (b) => {
+    try {
+      await borrarBorrador(b.id);
+      setHistorial((hs) => hs.filter((x) => x.id !== b.id));
+      if (b.id === borradorId) setBorradorId(null);
+    } catch (e) { setErr(`No se pudo borrar: ${(e && e.message) || e}`); }
+  };
 
   const empezarOtra = () => {
     memoriaEstudio = null;
     setPropuestas([]); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
-    setCorreo(null); setHecho({ wa: false, correo: false }); setBrief(""); setFoto("");
+    setCorreo(null); setHecho({ wa: false, correo: false }); setBrief(""); setFoto(""); setBorradorId(null);
+    hechoAntes.current = { wa: false, correo: false };
   };
 
   const p = elegida >= 0 ? propuestas[elegida] : null;
@@ -4958,8 +5047,47 @@ function EstudioView({ db, setDb, say, onListo }) {
 
   return (
     <div>
-      <Header eyebrow="Mensajería" title="Estudio de contenido" />
+      <Header eyebrow="Mensajería" title="Estudio de contenido" right={<>
+        <Btn variant="ghost" Icon={History} onClick={() => setVerHistorial((v) => !v)}>Recientes{historial.length ? ` (${historial.length})` : ""}</Btn>
+        {borradorId && <Btn variant="ghost" Icon={Plus} disabled={Boolean(busy)} onClick={empezarOtra}>Nueva pieza</Btn>}
+        <Btn variant="outline" Icon={Save} disabled={Boolean(busy) || (!brief.trim() && !propuestas.length)} onClick={() => guardar(false)}>
+          {borradorId ? "Guardar cambios" : "Guardar borrador"}
+        </Btn>
+      </>} />
       <div style={{ padding: 28, maxWidth: 1080 }}>
+
+        {verHistorial && (
+          <div style={paso}>
+            <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 10 }}>Piezas recientes</div>
+            {!historial.length ? (
+              <div style={nota}>Todavía no hay nada. Pulsa "Guardar borrador" en cualquier momento; lo que mandes a Meta o apruebes como correo también queda aquí.</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {historial.map((b) => {
+                  const h = b.hecho || {};
+                  const estado = [h.wa && "Enviada a Meta", h.correo && "Correo guardado"].filter(Boolean).join(" · ") || "Borrador";
+                  const vista = b.disenos && b.disenos[b.diseno >= 0 ? b.diseno : 0];
+                  return (
+                    <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 0", borderTop: `1px solid ${C.line}` }}>
+                      {vista ? <MiniaturaBorrador archivo={vista.archivo} /> : <div style={{ width: 64, height: 34, borderRadius: 4, background: "#EEF2F4", flexShrink: 0 }} />}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {b.titulo}{b.id === borradorId && <span style={{ color: C.jade, fontWeight: 500 }}> · abierta</span>}
+                        </div>
+                        <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>
+                          {estado} · {new Date(b.actualizado).toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" })}
+                        </div>
+                      </div>
+                      <Btn size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => abrir(b)}>Abrir</Btn>
+                      <Btn size="sm" variant="ghost" Icon={Trash2} onClick={() => quitar(b)} />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div style={{ ...nota, marginTop: 8 }}>Se guardan en este navegador las últimas {BORRADORES_MAX} piezas.</div>
+          </div>
+        )}
 
         <div style={paso}>
           {tituloPaso(1, "La idea")}
@@ -5151,6 +5279,18 @@ function EstudioView({ db, setDb, say, onListo }) {
       </div>
     </div>
   );
+}
+
+/* La miniatura saca su propia vista del JPG guardado y la suelta al irse. */
+function MiniaturaBorrador({ archivo }) {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    if (!archivo) return undefined;
+    const u = URL.createObjectURL(archivo);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [archivo]);
+  return url ? <img src={url} alt="" style={{ width: 64, height: 34, objectFit: "cover", borderRadius: 4, flexShrink: 0 }} /> : null;
 }
 
 /* Crear la plantilla en Meta sin salir del CRM: Claude la redacta si se le
