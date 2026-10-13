@@ -154,6 +154,30 @@ async function imagen(client, c) {
   const img = p.imagen && typeof p.imagen === "object" ? p.imagen : {};
   const conFoto = Boolean(c.conFoto);
   const comp = COMPOSICIONES[Number(c.variante) === 1 ? 1 : 0];
+  /* Ajustar no es rediseñar: se le entrega el SVG anterior y se le pide
+     tocar sólo lo que se dijo. */
+  if (c.ajuste && c.anterior) {
+    const r = await client.beta.messages.create({
+      model: MODELO,
+      max_tokens: 16000,
+      output_config: { effort: "medium" },
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      system: SISTEMA,
+      messages: [{ role: "user", content: `Este es el SVG actual de una imagen de encabezado:
+
+${String(c.anterior).slice(0, 40000)}
+
+Aplica sólo este cambio y deja todo lo demás exactamente igual (composición, colores, tipografías, posiciones, el logo como href="LOGO" y la foto como href="FOTO"): ${String(c.ajuste).slice(0, 1000)}
+${img.titular ? `Textos que deben quedar: titular «${img.titular}»${img.apoyo ? `, apoyo «${img.apoyo}»` : ""}${img.etiqueta ? `, etiqueta «${img.etiqueta}»` : ""}.` : ""}
+Devuelve sólo el SVG completo, sin nada antes ni después.` }],
+    });
+    if (r.stop_reason === "refusal") return json({ error: "Claude no quiso ajustar esta imagen." }, 422);
+    const t = textoDe(r);
+    const i0 = t.indexOf("<svg"), i1 = t.lastIndexOf("</svg>");
+    if (i0 < 0 || i1 < 0) return json({ error: "Claude no devolvió el diseño ajustado. Prueba otra vez." }, 502);
+    return json({ svg: t.slice(i0, i1 + 6) });
+  }
 
   const pedido = [
     marcaDe(c.marca),
@@ -172,7 +196,6 @@ Mensaje que acompaña: ${String(p.mensaje || "").slice(0, 1200)}`,
 ${conFoto ? '- Hay una foto: ponla de fondo con <image href="FOTO" x="0" y="0" width="1200" height="628" preserveAspectRatio="xMidYMid slice"/> y encima un degradado oscuro (#002B3D con opacidad) para que el texto se lea.\n' : "- No hay foto: el fondo es de la marca, con formas gráficas.\n"}- Nada de <script>, <foreignObject>, enlaces externos ni fuentes externas. Sin filtros pesados.
 - El texto no puede salirse del lienzo: el titular a lo sumo en 2 líneas (usa varios <text> o <tspan>), tamaño entre 80 y 130 px según su largo. Deja 60 px de margen.
 - WhatsApp recorta un poco los bordes en algunos teléfonos: lo importante al centro.`,
-    c.ajuste ? `Ajuste pedido sobre el diseño anterior: ${String(c.ajuste).slice(0, 1000)}\nDiseño anterior:\n${String(c.anterior || "").slice(0, 30000)}` : "",
   ].filter(Boolean).join("\n\n");
 
   const r = await client.beta.messages.create({
@@ -191,6 +214,74 @@ ${conFoto ? '- Hay una foto: ponla de fondo con <image href="FOTO" x="0" y="0" w
   return json({ svg: texto.slice(ini, fin + 6) });
 }
 
+/* ── Ajustar el mensaje elegido ──
+   Corrige lo que se pide y nada más: no es volver a proponer. */
+async function ajustarMensaje(client, c) {
+  const mensaje = String(c.mensaje || "").trim().slice(0, 4000);
+  const instruccion = String(c.instruccion || "").trim().slice(0, 1000);
+  if (!mensaje || !instruccion) return json({ error: "Falta el mensaje o qué cambiarle." }, 400);
+  const r = await client.beta.messages.create({
+    model: MODELO,
+    max_tokens: 4000,
+    output_config: { effort: "low" },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    system: SISTEMA,
+    messages: [{ role: "user", content: [marcaDe(c.marca), `Mensaje actual:\n${mensaje}\n\nAplica sólo este cambio y conserva el resto lo más igual posible: ${instruccion}\n\nDevuelve sólo el mensaje final.`].filter(Boolean).join("\n\n") }],
+  });
+  if (r.stop_reason === "refusal") return json({ error: "Claude no quiso ajustar este mensaje." }, 422);
+  const texto = textoDe(r).trim();
+  if (!texto) return json({ error: "Claude no devolvió el mensaje. Prueba otra vez." }, 502);
+  return json({ mensaje: texto });
+}
+
+/* ── La versión para correo ──
+   Mismo contenido, otro medio: un correo deja contar más y lleva asunto. Se
+   piden sólo los textos; el diseño del correo lo arma el CRM con una plantilla
+   fija, que es lo que se ve bien en Gmail, Outlook y el celular. */
+const ESQUEMA_CORREO = {
+  type: "object",
+  additionalProperties: false,
+  required: ["asunto", "preheader", "titulo", "parrafos", "cta"],
+  properties: {
+    asunto: { type: "string", description: "Asunto, máximo 60 caracteres, sin mayúsculas sostenidas" },
+    preheader: { type: "string", description: "Texto de vista previa del correo, máximo 90 caracteres" },
+    titulo: { type: "string", description: "Titular dentro del correo" },
+    parrafos: { type: "array", items: { type: "string" }, description: "2 a 4 párrafos cortos" },
+    cta: { type: "string", description: "Texto del botón principal, máximo 4 palabras" },
+  },
+};
+
+async function correo(client, c) {
+  const p = c.propuesta && typeof c.propuesta === "object" ? c.propuesta : {};
+  const anterior = c.anterior && typeof c.anterior === "object" ? JSON.stringify(c.anterior).slice(0, 8000) : "";
+  const instruccion = String(c.instruccion || "").trim().slice(0, 1000);
+  const pedido = [
+    marcaDe(c.marca),
+    anterior
+      ? `Versión actual del correo (JSON):\n${anterior}\n\nAplica sólo este cambio y conserva el resto lo más igual posible: ${instruccion}`
+      : `Convierte este mensaje de WhatsApp en un correo de marketing con el mismo contenido y la misma intención. En correo puedes desarrollar un poco más, pero sin relleno.
+Título de la pieza: ${p.titulo || ""}
+Titular de la imagen: ${(p.imagen && p.imagen.titular) || ""}
+Mensaje de WhatsApp:\n${String(p.mensaje || "").slice(0, 2000)}`,
+    `Reglas: personaliza con {{nombre}} en el saludo si encaja (sólo {{nombre}}, {{apellido}}, {{institucion}} o {{empresa}}). Sin formato de WhatsApp (*negrita*, _cursiva_): texto limpio. Sin enlaces en los párrafos: el enlace va en el botón.`,
+  ].filter(Boolean).join("\n\n");
+  const r = await client.beta.messages.create({
+    model: MODELO,
+    max_tokens: 8000,
+    output_config: { effort: "medium", format: { type: "json_schema", schema: ESQUEMA_CORREO } },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    system: SISTEMA,
+    messages: [{ role: "user", content: pedido }],
+  });
+  if (r.stop_reason === "refusal") return json({ error: "Claude no quiso preparar este correo." }, 422);
+  let datos = null;
+  try { datos = JSON.parse(textoDe(r)); } catch (_) {}
+  if (!datos || !datos.asunto) return json({ error: "Claude no devolvió el correo. Prueba otra vez." }, 502);
+  return json({ correo: datos });
+}
+
 export async function atenderEstudio(req, env) {
   if (req.method !== "POST") return json({ error: "Método no permitido" }, 405);
   if (!env.ANTHROPIC_API_KEY) return json({ error: "Falta conectar Claude: agrega el secreto ANTHROPIC_API_KEY al Worker (ver nube/README.md)." }, 503);
@@ -201,6 +292,8 @@ export async function atenderEstudio(req, env) {
   try {
     if (c.accion === "proponer") return await proponer(client, c);
     if (c.accion === "imagen") return await imagen(client, c);
+    if (c.accion === "ajustarMensaje") return await ajustarMensaje(client, c);
+    if (c.accion === "correo") return await correo(client, c);
     return json({ error: "Acción desconocida" }, 400);
   } catch (e) {
     if (e instanceof Anthropic.AuthenticationError) return json({ error: "La clave de Claude no es válida. Revisa el secreto ANTHROPIC_API_KEY." }, 502);

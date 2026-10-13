@@ -7,7 +7,7 @@ import {
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
   Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
-  Trophy, Palette, Newspaper, Lightbulb, ImagePlus
+  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -31,6 +31,9 @@ import {
   coleccionDe, buscarFicha,
 } from "./automations.js";
 import { ANOS, GRUPOS, DIVISIONES, analizarRoster } from "./drafts.js";
+import {
+  ETAPAS_AGENTE, HUMANO, agenteVacio, normalizaAgente, normalizeAgentes, normalizeAgentesChat, agentesDeBase,
+} from "./agentes.js";
 
 /* ────────────────────────────────────────────────────────────
    Paleta y tipografía
@@ -407,6 +410,10 @@ const emptyDb = () => ({
   listas: [],
   /* Drafts: cada roster analizado con sus jugadores (ver src/drafts.js). */
   drafts: [],
+  /* Agentes de texto (ver src/agentes.js) y, por conversación, a quién se
+     dejó fijado a mano: un agente o una persona. */
+  agentes: [],
+  agentesChat: {},
 });
 
 const PAPELERA_DIAS = 15;
@@ -458,6 +465,7 @@ function normalizeDb(raw) {
     const faltan = base.schema[k].filter((f) => f.system && !hay.has(f.key));
     return faltan.length ? [...guardado, ...faltan] : guardado;
   };
+  const agentes = normalizeAgentes(d.agentes);
   return {
     ...d,
     v: DATA_VERSION,
@@ -505,6 +513,8 @@ function normalizeDb(raw) {
     listas: arr(d.listas).filter((l) => l && l.id && l.kind)
       .map((l) => ({ ...l, tipo: l.tipo === "fija" ? "fija" : "activa", ids: arr(l.ids) })),
     drafts: arr(d.drafts).filter((x) => x && x.id).map((x) => ({ ...x, jugadores: arr(x.jugadores) })),
+    agentes,
+    agentesChat: normalizeAgentesChat(d.agentesChat, agentes),
   };
 }
 
@@ -1659,7 +1669,7 @@ export default function CRM() {
         <main style={{ flex: 1, minWidth: 0 }}>
           {view === "dashboard" && <Dashboard db={db} go={setView} />}
           {view === "messages" && (
-            <MessagesView db={db} say={say} setDetail={setDetail} setView={setView}
+            <MessagesView db={db} setDb={setDb} say={say} setDetail={setDetail} setView={setView}
               onLog={logActivity} onImport={importActivities} onBuzon={marcarBuzon} onVisto={marcarVisto}
               onEventos={aplicarEventos} onRebotes={aplicarRebotes}
               onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
@@ -3398,7 +3408,7 @@ function resumenBarrido({ nuevos, revisados, rebotados, movidos, leads, fichas, 
   return trozos.length ? trozos.join(" · ") : "Sin novedades";
 }
 
-function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
+function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
   const integ = db.integrations;
   const conversaciones = useMemo(() => construirConversaciones(db), [db]);
 
@@ -3406,6 +3416,7 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
   const [buscar, setBuscar] = useState("");
   const [filtro, setFiltro] = useState("all");
   const [sync, setSync] = useState({ busy: false, nota: "", err: "" });
+  const [seccion, setSeccion] = useState("chats");
 
   /* Igual que en Contactos: la casilla responde al instante y la lista se
      filtra un paso detrás, y se pintan de a 100. */
@@ -3459,6 +3470,8 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
 
   const sinNada = conversaciones.length === 0;
 
+  if (seccion === "agentes") return <AgentesView db={db} setDb={setDb} say={say} seccion={seccion} setSeccion={setSeccion} />;
+
   return (
     <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
       {/* Lista de conversaciones */}
@@ -3475,6 +3488,8 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
               {sync.busy ? "…" : "Correo"}
             </Btn>
           </div>
+
+          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} />
 
           <div style={{ position: "relative", marginTop: 12 }}>
             <Search size={13} color={C.faint} style={{ position: "absolute", left: 9, top: 9 }} />
@@ -3500,6 +3515,7 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
           {filtradas.slice(0, limite).map((c) => {
             const on = c.clave === sel;
             const ch = CHANNEL[c.ultimo.type];
+            const quien = agenteDe(db, c.kind, c.rec);
             return (
               <button key={c.clave} onClick={() => setSel(c.clave)} className={on ? "" : "crm-row"}
                 style={{ display: "flex", gap: 10, width: "100%", textAlign: "left", padding: "11px 14px", borderTop: "none", borderRight: "none", borderBottom: "1px solid #F2F4F0", borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : "transparent", cursor: "pointer" }}>
@@ -3509,6 +3525,8 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
                     <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--ui)", fontSize: 13, fontWeight: c.nuevos ? 700 : 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.nombre}</span>
+                    {quien.humano && <Headset size={11} color={C.clay} style={{ flexShrink: 0, alignSelf: "center" }}><title>Atiende una persona</title></Headset>}
+                    {quien.agente && <Bot size={11} color={C.jade} style={{ flexShrink: 0, alignSelf: "center" }}><title>{nombreAgente(quien.agente)}</title></Bot>}
                     <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, flexShrink: 0 }}>{haceRato(c.ultimo.at)}</span>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 3 }}>
@@ -3540,7 +3558,7 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
 
       {/* Conversación */}
       {activa
-        ? <Conversacion key={activa.clave} conv={activa} db={db} say={say} setDetail={setDetail} onLog={onLog} />
+        ? <Conversacion key={activa.clave} conv={activa} db={db} setDb={setDb} say={say} setDetail={setDetail} onLog={onLog} />
         : (
           <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
             <div style={{ textAlign: "center", maxWidth: 380 }}>
@@ -3566,13 +3584,384 @@ function MessagesView({ db, say, setDetail, setView, onLog, onImport, onBuzon, o
   );
 }
 
+/* ────────────────────────────────────────────────────────────
+   Agentes en Mensajes
+   Cada conversación tiene a lo sumo un agente: el que se le fijó a mano o, si
+   no, el primero de la lista que esté encendido y cuyas condiciones cumpla la
+   ficha. "Atiende una persona" apaga a todos para ese hilo.
+
+   Hoy el agente propone y una persona envía: corre en esta pestaña, como todo
+   lo demás. Que conteste solo, con el CRM cerrado, es trabajo del Worker.
+   ──────────────────────────────────────────────────────────── */
+const claveConv = (kind, id) => `${kind}:${id}`;
+
+/* Las condiciones se escriben sobre las propiedades de un contacto: una
+   empresa no tiene etapa de persona y queda sin agente salvo que se le fije. */
+function agentePorEtapa(db, kind, rec) {
+  if (kind !== "contact") return null;
+  return (db.agentes || []).find((a) => a.activo
+    && cumpleFiltros(rec, a.filtros.filter((c) => c.key), db.schema.contact)) || null;
+}
+
+function agenteDe(db, kind, rec) {
+  const fijo = (db.agentesChat || {})[claveConv(kind, rec.id)];
+  if (fijo === HUMANO) return { humano: true, fijo: true };
+  const a = fijo && (db.agentes || []).find((x) => x.id === fijo);
+  if (a) return { agente: a, fijo: true };
+  const porEtapa = agentePorEtapa(db, kind, rec);
+  return porEtapa ? { agente: porEtapa } : {};
+}
+
+const nombreAgente = (a) => a.nombre.trim() || "Agente sin nombre";
+
+/* Pide al agente el próximo mensaje para esta ficha. Usa el agente tal como
+   se le pasa —también uno a medio editar—, que es lo que deja probarlo antes
+   de guardarlo. */
+async function pedirAlAgente(db, agente, kind, rec, indicaciones = "") {
+  const tiene = (a) => (a.contactIds || []).includes(rec.id) || (a.companyIds || []).includes(rec.id);
+  const acts = db.activities.filter(tiene).sort((a, b) => (a.at < b.at ? 1 : -1));
+  const deals = db.deals.filter((d) => (d.contactIds || []).includes(rec.id) || d.companyId === rec.id);
+  const { nombre, etapa, objetivo, instrucciones, traspaso } = agente;
+  const r = await fetch("/api/claude", {
+    method: "POST",
+    redirect: "manual",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Origen": "agente" },
+    body: JSON.stringify({
+      tarea: "agente", pregunta: indicaciones,
+      agente: { nombre, etapa, objetivo, instrucciones, traspaso },
+      ficha: fichaParaClaude(db, kind, rec, acts, deals),
+    }),
+  });
+  if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+  if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("Los agentes sólo funcionan en la versión publicada del CRM.");
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+  return { texto: data.texto || "", traspaso: data.traspaso || "" };
+}
+
+const fijarAgenteChat = (setDb, clave, valor) => setDb((d) => {
+  const m = { ...(d.agentesChat || {}) };
+  if (valor) m[clave] = valor; else delete m[clave];
+  return { ...d, agentesChat: m };
+});
+
+/* Conversaciones | Agentes, arriba de la columna izquierda en las dos vistas. */
+function SeccionMensajes({ seccion, setSeccion, agentes }) {
+  const encendidos = agentes.filter((a) => a.activo).length;
+  return (
+    <div style={{ display: "flex", background: "#EEF1EB", borderRadius: 8, padding: 3, marginTop: 12 }}>
+      {[["chats", "Conversaciones", Inbox], ["agentes", "Agentes", Bot]].map(([k, l, I]) => {
+        const on = seccion === k;
+        return (
+          <button key={k} onClick={() => setSeccion(k)} className="crm-btn"
+            style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, border: "none", borderRadius: 6, padding: "5px 8px", background: on ? C.panel : "transparent", boxShadow: on ? "0 1px 2px rgba(19,28,26,.12)" : "none", color: on ? C.ink : C.mute, fontFamily: "var(--ui)", fontSize: 12, fontWeight: on ? 600 : 500, cursor: "pointer" }}>
+            <I size={12} /> {l}
+            {k === "agentes" && agentes.length > 0 && (
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{encendidos}/{agentes.length}</span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* En el encabezado del hilo: quién atiende y, para cambiarlo, el mismo menú. */
+function SelectorAgente({ db, setDb, kind, rec }) {
+  const clave = claveConv(kind, rec.id);
+  const fijo = (db.agentesChat || {})[clave] || "";
+  const quien = agenteDe(db, kind, rec);
+  const porEtapa = agentePorEtapa(db, kind, rec);
+  const color = quien.humano ? C.clay : quien.agente ? C.jade : C.faint;
+  return (
+    <label title="Qué agente atiende esta conversación"
+      style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${C.line}`, borderRadius: 999, padding: "2px 4px 2px 10px", background: C.panel, maxWidth: 260 }}>
+      {quien.humano ? <Headset size={13} color={color} /> : <Bot size={13} color={color} />}
+      <select className="crm-in" value={fijo} onChange={(e) => fijarAgenteChat(setDb, clave, e.target.value)}
+        style={{ border: "none", background: "transparent", fontFamily: "var(--ui)", fontSize: 12, color: C.ink, padding: "3px 4px", outline: "none", minWidth: 0, maxWidth: 220, cursor: "pointer" }}>
+        <option value="">{porEtapa ? `Según la etapa: ${nombreAgente(porEtapa)}` : "Según la etapa: ninguno"}</option>
+        {(db.agentes || []).map((a) => (
+          <option key={a.id} value={a.id}>{nombreAgente(a)}{a.etapa ? ` · ${a.etapa}` : ""}{a.activo ? "" : " (apagado)"}</option>
+        ))}
+        <option value={HUMANO}>Atiende una persona</option>
+      </select>
+    </label>
+  );
+}
+
+function AgentesView({ db, setDb, say, seccion, setSeccion }) {
+  const agentes = db.agentes || [];
+  const [sel, setSel] = useState(() => (agentes[0] || {}).id || "");
+  const actual = agentes.find((a) => a.id === sel) || null;
+
+  useEffect(() => {
+    if (!actual && agentes.length) setSel(agentes[0].id);
+  }, [actual, agentes.length]);
+
+  const conversaciones = useMemo(() => construirConversaciones(db), [db]);
+  /* Cuántas conversaciones atiende hoy cada agente, contando lo fijado a mano. */
+  const carga = useMemo(() => {
+    const n = {};
+    let personas = 0;
+    for (const c of conversaciones) {
+      const q = agenteDe(db, c.kind, c.rec);
+      if (q.humano) personas++;
+      else if (q.agente) n[q.agente.id] = (n[q.agente.id] || 0) + 1;
+    }
+    return { n, personas };
+  }, [conversaciones, db.agentes, db.agentesChat]);
+
+  const guardar = (a) => setDb((d) => ({ ...d, agentes: (d.agentes || []).map((x) => (x.id === a.id ? normalizaAgente(a) : x)) }));
+  const crear = (a) => {
+    setDb((d) => ({ ...d, agentes: [...(d.agentes || []), a] }));
+    setSel(a.id);
+  };
+  const crearBase = () => {
+    const nuevos = agentesDeBase();
+    setDb((d) => ({ ...d, agentes: [...(d.agentes || []), ...nuevos] }));
+    setSel(nuevos[0].id);
+    say("Cuatro agentes creados, apagados. Revísalos y enciende los que quieras.");
+  };
+  const borrar = (id) => {
+    setDb((d) => {
+      const resto = (d.agentes || []).filter((x) => x.id !== id);
+      return { ...d, agentes: resto, agentesChat: normalizeAgentesChat(d.agentesChat, resto) };
+    });
+    say("Agente eliminado");
+  };
+  const mover = (i, paso) => setDb((d) => {
+    const l = [...(d.agentes || [])];
+    const j = i + paso;
+    if (j < 0 || j >= l.length) return d;
+    [l[i], l[j]] = [l[j], l[i]];
+    return { ...d, agentes: l };
+  });
+  const alternar = (a) => {
+    guardar({ ...a, activo: !a.activo });
+    say(a.activo ? `${nombreAgente(a)} apagado` : `${nombreAgente(a)} encendido`);
+  };
+
+  return (
+    <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
+      <div style={{ width: 316, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: C.panel, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: "18px 16px 12px", borderBottom: `1px solid ${C.line}` }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
+                {agentes.length} agente{agentes.length === 1 ? "" : "s"}
+              </div>
+              <h1 style={{ fontFamily: "var(--display)", fontSize: 21, fontWeight: 600, letterSpacing: "-.02em", margin: "3px 0 0" }}>Mensajes</h1>
+            </div>
+            <Btn size="sm" variant="outline" Icon={Plus} onClick={() => crear(agenteVacio())}>Nuevo</Btn>
+          </div>
+          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={agentes} />
+        </div>
+
+        <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: "#F6F8F4", fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, lineHeight: 1.5 }}>
+          A cada conversación la atiende el primero de arriba hacia abajo que esté encendido y cuyas condiciones cumpla.
+          {carga.personas > 0 && <> {carga.personas} conversación(es) las atiende una persona.</>}
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {agentes.map((a, i) => {
+            const on = a.id === sel;
+            return (
+              <div key={a.id} onClick={() => setSel(a.id)} className={on ? "" : "crm-row"}
+                style={{ display: "flex", gap: 10, alignItems: "center", padding: "11px 10px 11px 14px", borderBottom: "1px solid #F2F4F0", borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : "transparent", cursor: "pointer" }}>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, width: 14, textAlign: "right", flexShrink: 0 }}>{i + 1}</span>
+                <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, background: a.activo ? tonoDe(a.id) : "#D9DED5", color: "#fff", display: "grid", placeItems: "center" }}>
+                  <Bot size={15} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: a.activo ? C.ink : C.mute, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nombreAgente(a)}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {[a.etapa || "Sin etapa", a.activo ? `${carga.n[a.id] || 0} conversación(es)` : "Apagado"].join(" · ")}
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+                  <button type="button" className="crm-btn" disabled={i === 0} onClick={() => mover(i, -1)} title="Subir: gana si cumple a la vez que otro"
+                    style={{ border: "none", background: "transparent", color: C.faint, cursor: i === 0 ? "default" : "pointer", padding: 1, opacity: i === 0 ? 0.3 : 1, display: "inline-flex" }}><ArrowUp size={12} /></button>
+                  <button type="button" className="crm-btn" disabled={i === agentes.length - 1} onClick={() => mover(i, 1)} title="Bajar"
+                    style={{ border: "none", background: "transparent", color: C.faint, cursor: i === agentes.length - 1 ? "default" : "pointer", padding: 1, opacity: i === agentes.length - 1 ? 0.3 : 1, display: "inline-flex" }}><ArrowDown size={12} /></button>
+                </div>
+              </div>
+            );
+          })}
+          {agentes.length === 0 && (
+            <div style={{ padding: "30px 18px", textAlign: "center", fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, lineHeight: 1.6 }}>
+              Todavía no hay agentes.
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0, overflowY: "auto", background: C.canvas }}>
+        {actual
+          ? <EditorAgente key={actual.id} db={db} agente={actual} indice={agentes.indexOf(actual)} conversaciones={conversaciones}
+              onGuardar={(a) => { guardar(a); say("Agente guardado"); }}
+              onAlternar={() => alternar(actual)}
+              onBorrar={() => borrar(actual.id)} />
+          : (
+            <div style={{ height: "100%", display: "grid", placeItems: "center", padding: 24 }}>
+              <div style={{ textAlign: "center", maxWidth: 440 }}>
+                <Bot size={30} color={C.faint} />
+                <div style={{ fontFamily: "var(--display)", fontSize: 16, fontWeight: 600, marginTop: 12 }}>Un agente para cada momento</div>
+                <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.mute, marginTop: 6, lineHeight: 1.6 }}>
+                  Cada agente atiende a las personas de una etapa —prospecto, lead en curso, cliente, post venta— con su propio objetivo y su forma de hablar, y pasa la conversación a una persona cuando no le corresponde.
+                </div>
+                <div style={{ marginTop: 16, display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                  <Btn variant="outline" Icon={Plus} onClick={() => crear(agenteVacio())}>En blanco</Btn>
+                  <Btn variant="solid" Icon={Sparkles} onClick={crearBase}>Crear los de las 4 etapas</Btn>
+                </div>
+              </div>
+            </div>
+          )}
+      </div>
+    </div>
+  );
+}
+
+function EditorAgente({ db, agente, indice, conversaciones, onGuardar, onAlternar, onBorrar }) {
+  const [draft, setDraft] = useState(agente);
+  /* Encender o apagar desde arriba no debe borrar lo que se está editando. */
+  useEffect(() => { setDraft((d) => ({ ...d, activo: agente.activo })); }, [agente.activo]);
+  const cambiado = JSON.stringify({ ...draft, activo: agente.activo }) !== JSON.stringify(agente);
+  const set = (parche) => setDraft((d) => ({ ...d, ...parche }));
+  const setFiltros = (fn) => setDraft((d) => ({ ...d, filtros: typeof fn === "function" ? fn(d.filtros) : fn }));
+
+  const schema = db.schema.contact;
+  const condiciones = draft.filtros.filter((c) => c.key);
+  const cumplen = useMemo(
+    () => db.contacts.filter((r) => cumpleFiltros(r, condiciones, schema)).length,
+    [db.contacts, draft.filtros, schema]);
+
+  /* Para probar: las conversaciones de contactos, primero las que le tocan. */
+  const deContactos = conversaciones.filter((c) => c.kind === "contact");
+  const suyas = deContactos.filter((c) => cumpleFiltros(c.rec, condiciones, schema));
+  const opciones = [...suyas, ...deContactos.filter((c) => !suyas.includes(c))].slice(0, 200);
+  const [prueba, setPrueba] = useState({ clave: "", indicaciones: "", busy: false, texto: "", traspaso: "", err: "" });
+  const conv = opciones.find((c) => c.clave === prueba.clave) || opciones[0] || null;
+
+  const probar = async () => {
+    if (!conv) return;
+    setPrueba((p) => ({ ...p, busy: true, texto: "", traspaso: "", err: "" }));
+    try {
+      const r = await pedirAlAgente(db, draft, conv.kind, conv.rec, prueba.indicaciones);
+      setPrueba((p) => ({ ...p, busy: false, ...r }));
+    } catch (e) {
+      setPrueba((p) => ({ ...p, busy: false, err: (e && e.message) || String(e) }));
+    }
+  };
+
+  const etiqueta = (t) => <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5, letterSpacing: ".02em" }}>{t}</div>;
+  const ayuda = (t) => <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 4, lineHeight: 1.5 }}>{t}</div>;
+  const area = (k, filas, ph) => (
+    <textarea className="crm-in" rows={filas} value={draft[k]} placeholder={ph} onChange={(e) => set({ [k]: e.target.value })}
+      style={{ ...inputStyle, resize: "vertical", lineHeight: 1.55 }} />
+  );
+  const tarjeta = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 };
+
+  return (
+    <div style={{ padding: "22px 28px 40px", maxWidth: 860, display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
+            Prioridad {indice + 1} · {agente.activo ? "Encendido" : "Apagado"}
+          </div>
+          <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em", marginTop: 3 }}>{nombreAgente(draft)}</div>
+        </div>
+        <Btn variant="outline" Icon={agente.activo ? Pause : Play} onClick={onAlternar}>{agente.activo ? "Apagar" : "Encender"}</Btn>
+        <Btn variant="danger" Icon={Trash2} onClick={onBorrar}>Eliminar</Btn>
+        <Btn variant="solid" Icon={Check} disabled={!cambiado} onClick={() => onGuardar({ ...draft, activo: agente.activo })}>Guardar</Btn>
+      </div>
+
+      <div style={tarjeta}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <label>{etiqueta("Nombre")}
+            <input className="crm-in" value={draft.nombre} placeholder="Luna" onChange={(e) => set({ nombre: e.target.value })} style={inputStyle} />
+          </label>
+          <label>{etiqueta("Etapa que atiende")}
+            <input className="crm-in" value={draft.etapa} list="etapas-agente" placeholder="Prospecto" onChange={(e) => set({ etapa: e.target.value })} style={inputStyle} />
+            <datalist id="etapas-agente">{ETAPAS_AGENTE.map((x) => <option key={x} value={x} />)}</datalist>
+          </label>
+        </div>
+        <div style={{ marginTop: 12 }}>{etiqueta("Objetivo")}{area("objetivo", 2, "Qué tiene que lograr con cada persona.")}</div>
+        <div style={{ marginTop: 12 }}>
+          {etiqueta("Instrucciones")}
+          {area("instrucciones", 7, "Tono, cómo se presenta, qué puede ofrecer, precios, enlaces, qué nunca debe decir…")}
+          {ayuda("Lo que no esté aquí ni en la ficha, el agente no lo sabe: no inventa precios, fechas ni enlaces.")}
+        </div>
+        <div style={{ marginTop: 12 }}>{etiqueta("Cuándo pasa la conversación a una persona")}{area("traspaso", 2, "")}</div>
+      </div>
+
+      <div style={tarjeta}>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
+          <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600 }}>Cuándo le toca</div>
+          <span style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute }}>
+            <strong style={{ color: C.ink }}>{cumplen}</strong> de {db.contacts.length} contactos cumplen hoy
+          </span>
+        </div>
+        {ayuda(condiciones.length
+          ? "Atiende a los contactos que cumplan todas estas condiciones, salvo que un agente de más arriba también las cumpla."
+          : "Sin condiciones atiende a todos los contactos que no haya tomado un agente de más arriba. Ponlo al final de la lista o agrégale condiciones.")}
+        <FiltrosPropiedad schema={schema} rows={db.contacts} filtros={draft.filtros} setFiltros={setFiltros} />
+      </div>
+
+      <div style={tarjeta}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "var(--display)", fontSize: 14, fontWeight: 600 }}>
+          <Sparkles size={14} color={C.plum} /> Probar
+        </div>
+        {ayuda("Escribe lo que este agente le contestaría a una conversación real, con lo que tengas aquí aunque no esté guardado. No se envía nada.")}
+        {!conv ? (
+          <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, marginTop: 10 }}>Todavía no hay conversaciones con contactos para probar.</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <select className="crm-in" value={conv.clave} onChange={(e) => setPrueba((p) => ({ ...p, clave: e.target.value, texto: "", traspaso: "", err: "" }))}
+                style={{ ...inputStyle, flex: "1 1 220px", width: "auto" }}>
+                {opciones.map((c) => <option key={c.clave} value={c.clave}>{c.nombre}{suyas.includes(c) ? "" : " (no le toca)"}</option>)}
+              </select>
+              <input className="crm-in" value={prueba.indicaciones} placeholder="Indicaciones para esta prueba (opcional)"
+                onChange={(e) => setPrueba((p) => ({ ...p, indicaciones: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter" && !prueba.busy) probar(); }}
+                style={{ ...inputStyle, flex: "2 1 260px", width: "auto" }} />
+              <Btn variant="solid" Icon={Bot} disabled={prueba.busy} onClick={probar}>{prueba.busy ? "Pensando…" : "Probar"}</Btn>
+            </div>
+            {conv.ultimo && (
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 8 }}>
+                Último mensaje ({conv.ultimo.dir === "in" ? "recibido" : "enviado"}): {resumen(conv.ultimo).slice(0, 160)}
+              </div>
+            )}
+            {prueba.texto && (
+              <div style={{ marginTop: 12, background: CHANNEL.whatsapp.soft, borderRadius: "10px 10px 3px 10px", padding: "10px 13px", fontFamily: "var(--ui)", fontSize: 13, lineHeight: 1.55, whiteSpace: "pre-wrap", color: C.ink }}>
+                {prueba.texto}
+              </div>
+            )}
+            {prueba.traspaso && (
+              <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "flex-start", background: C.claySoft, borderRadius: 8, padding: "10px 13px", fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.5 }}>
+                <Headset size={14} style={{ flexShrink: 0, marginTop: 2 }} /> Pasaría la conversación a una persona: {prueba.traspaso}
+              </div>
+            )}
+            {prueba.err && <div style={{ marginTop: 10, fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>{prueba.err}</div>}
+          </>
+        )}
+      </div>
+
+      <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, lineHeight: 1.6 }}>
+        Por ahora el agente propone el mensaje dentro de cada conversación y una persona lo revisa y lo envía. Que conteste solo por WhatsApp, también con el CRM cerrado, es el siguiente paso.
+      </div>
+    </div>
+  );
+}
+
 /* ── Un hilo abierto ──
    Lo recibido a la izquierda y lo enviado a la derecha, como en cualquier
    chat, con el color del canal por el que fue. Las llamadas y las notas
    aparecen en el medio y en pequeño: son parte de la relación pero no del
    intercambio de mensajes, y mezclarlas como globos haría creer que se le
    escribió algo a la persona. */
-function Conversacion({ conv, db, say, setDetail, onLog }) {
+function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
   const integ = db.integrations;
   const gmail = useGmail();
   const rec = conv.rec;
@@ -3618,6 +4007,24 @@ function Conversacion({ conv, db, say, setDetail, onLog }) {
   };
 
   const limpiar = () => { setTexto(""); setAsunto(""); setTid(""); setHtml(""); };
+
+  /* El agente que atiende este hilo propone la respuesta; se escribe en la
+     caja para que una persona la lea, la corrija y la envíe. */
+  const quien = agenteDe(db, kind, rec);
+  const [sugerencia, setSugerencia] = useState({ busy: false, traspaso: "" });
+  const sugerir = async () => {
+    if (!quien.agente) return;
+    setErr("");
+    setSugerencia({ busy: true, traspaso: "" });
+    try {
+      const r = await pedirAlAgente(db, quien.agente, kind, rec);
+      setSugerencia({ busy: false, traspaso: r.traspaso });
+      if (r.texto) { setTexto(r.texto); setTid(""); setHtml(""); }
+    } catch (e) {
+      setSugerencia({ busy: false, traspaso: "" });
+      setErr((e && e.message) || String(e));
+    }
+  };
 
   /* El diseño sólo viaja cuando el CRM manda el correo él mismo. Un enlace que
      abre un borrador no puede llevar HTML —ni mailto: ni la ventana de Gmail
@@ -3763,6 +4170,7 @@ function Conversacion({ conv, db, say, setDetail, onLog }) {
             {[OBJ[kind].singular, correo, tel ? `+${tel}` : ""].filter(Boolean).join(" · ")}
           </div>
         </div>
+        <SelectorAgente db={db} setDb={setDb} kind={kind} rec={rec} />
         <Btn size="sm" variant="outline" Icon={User} onClick={() => setDetail({ kind, id: conv.id })}>Ver ficha</Btn>
       </div>
 
@@ -3864,7 +4272,21 @@ function Conversacion({ conv, db, say, setDetail, onLog }) {
                   {plantillas.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>
               )}
+              {modo === "responder" && quien.agente && (
+                <Btn size="sm" variant="outline" Icon={Bot} disabled={sugerencia.busy} onClick={sugerir}
+                  style={{ borderRadius: 999, marginLeft: "auto" }}>
+                  {sugerencia.busy ? "Pensando…" : `Sugerir con ${nombreAgente(quien.agente)}`}
+                </Btn>
+              )}
             </div>
+
+            {sugerencia.traspaso && (
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", background: C.claySoft, borderRadius: 8, padding: "8px 11px", marginBottom: 8, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>
+                <Headset size={13} style={{ flexShrink: 0 }} />
+                <span style={{ flex: 1, minWidth: 180 }}>{quien.agente ? nombreAgente(quien.agente) : "El agente"} prefiere que conteste una persona: {sugerencia.traspaso}</span>
+                <Btn size="sm" variant="outline" onClick={() => { fijarAgenteChat(setDb, conv.clave, HUMANO); setSugerencia({ busy: false, traspaso: "" }); say("La conversación queda en manos de una persona"); }}>Tomarla yo</Btn>
+              </div>
+            )}
 
             {esCorreo && (
               <input className="crm-in" placeholder="Asunto" value={asunto} onChange={(e) => setAsunto(e.target.value)}
@@ -4359,6 +4781,35 @@ async function pedirEstudio(cuerpo) {
   return data;
 }
 
+/* El correo de marketing con la identidad de Catch. Diseño fijo de tablas,
+   que es lo que respetan Gmail, Outlook y los celulares; Claude pone los
+   textos. Las variables ({{nombre}}) quedan tal cual para que el envío las
+   llene, y todo lo demás se escapa. */
+const correoHtml = ({ imagen, preheader, titulo, parrafos, cta, url }) => {
+  const e = (t) => escapeHtml(t);
+  const fuente = "font-family:Arial,Helvetica,sans-serif;";
+  const cabeza = imagen
+    ? `<tr><td><img src="${e(imagen)}" width="600" alt="${e(titulo)}" style="display:block;width:100%;height:auto;border:0"></td></tr>`
+    : `<tr><td style="background:#002B3D;padding:26px 36px;${fuente}color:#ffffff;font-size:28px;font-weight:800;letter-spacing:1px">CATCH <span style="color:#00A3AD;font-size:13px;font-weight:700;letter-spacing:0">by Raad Sports</span></td></tr>`;
+  const cuerpo = parrafos.filter((x) => x.trim())
+    .map((x) => `<p style="margin:0 0 14px;${fuente}font-size:16px;line-height:1.6;color:#33475B">${e(x.trim()).replace(/\n/g, "<br>")}</p>`).join("");
+  const boton = cta && url
+    ? `<tr><td style="padding:6px 36px 34px"><a href="${e(url)}" style="display:inline-block;background:#00A3AD;color:#ffffff;${fuente}font-size:16px;font-weight:700;padding:14px 28px;border-radius:6px;text-decoration:none">${e(cta)}</a></td></tr>`
+    : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#EEF2F4">` +
+    `<div style="display:none;max-height:0;overflow:hidden;opacity:0">${e(preheader)}</div>` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EEF2F4"><tr><td align="center" style="padding:24px 12px">` +
+    `<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;background:#ffffff;border-radius:10px;overflow:hidden">` +
+    cabeza +
+    `<tr><td style="padding:32px 36px 10px"><h1 style="margin:0 0 16px;${fuente}font-size:26px;line-height:1.25;color:#002B3D">${e(titulo)}</h1>${cuerpo}</td></tr>` +
+    boton +
+    `<tr><td style="background:#002B3D;padding:18px 36px;${fuente}font-size:12px;line-height:1.5;color:#9FB6C1">Catch by Raad Sports · Si no quieres recibir más correos, responde a este mensaje con la palabra BAJA.</td></tr>` +
+    `</table></td></tr></table></body></html>`;
+};
+
+const correoTexto = ({ titulo, parrafos, cta, url }) =>
+  [titulo, ...parrafos.filter((x) => x.trim()), cta && url ? `${cta}: ${url}` : ""].filter(Boolean).join("\n\n");
+
 /* Lo que llevas armado sobrevive a cambiar de pestaña; al recargar se pierde,
    y está bien: lo que importa queda en Plantillas al mandarlo. */
 let memoriaEstudio = null;
@@ -4380,10 +4831,23 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
   const [verMarca, setVerMarca] = useState(!marca);
+  const [ajusteMsg, setAjusteMsg] = useState("");
+  const [textosImg, setTextosImg] = useState(m.textosImg || { titular: "", apoyo: "", etiqueta: "" });
+  const [canales, setCanales] = useState(m.canales || { wa: true, correo: false });
+  const [correo, setCorreo] = useState(m.correo || null);
+  const [ctaUrl, setCtaUrl] = useState(m.ctaUrl ?? ((marca.match(/https:\/\/\S+/) || [])[0] || ""));
+  const [ajusteCorreo, setAjusteCorreo] = useState("");
+  const [hecho, setHecho] = useState(m.hecho || { wa: false, correo: false });
 
   useEffect(() => {
-    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida };
-  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida]);
+    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho };
+  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho]);
+
+  const empezarOtra = () => {
+    memoriaEstudio = null;
+    setPropuestas([]); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
+    setCorreo(null); setHecho({ wa: false, correo: false }); setBrief(""); setFoto("");
+  };
 
   const p = elegida >= 0 ? propuestas[elegida] : null;
   const ponerMarca = (v) => setDb((d) => ({ ...d, estudio: { ...(d.estudio || {}), marca: v } }));
@@ -4398,17 +4862,52 @@ function EstudioView({ db, setDb, say, onListo }) {
   };
 
   const elegir = (i) => {
-    setElegida(i); setDisenos([]); setDiseno(-1); setSubida(null);
+    setElegida(i); setDisenos([]); setDiseno(-1); setSubida(null); setCorreo(null); setHecho({ wa: false, correo: false });
+    const im = propuestas[i].imagen || {};
+    setTextosImg({ titular: im.titular || "", apoyo: im.apoyo || "", etiqueta: im.etiqueta || "" });
     setDraft({ id: uid(), name: propuestas[i].titulo, subject: "", body: propuestas[i].mensaje, html: "", meta: null });
+  };
+
+  const ajustarMensaje = async () => {
+    setBusy("ajustarMsg"); setErr("");
+    try {
+      const r = await pedirEstudio({ accion: "ajustarMensaje", mensaje: draft.body, instruccion: ajusteMsg, marca });
+      setDraft((d) => ({ ...d, body: r.mensaje }));
+      setAjusteMsg("");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const crearCorreo = async (instruccion) => {
+    setBusy("correo"); setErr("");
+    try {
+      const r = await pedirEstudio({
+        accion: "correo", marca,
+        propuesta: { ...p, mensaje: draft.body, imagen: { ...(p.imagen || {}), ...textosImg } },
+        ...(instruccion && correo ? { anterior: correo, instruccion } : {}),
+      });
+      setCorreo({ ...r.correo, parrafos: Array.isArray(r.correo.parrafos) ? r.correo.parrafos : [] });
+      setAjusteCorreo(""); setHecho((h) => ({ ...h, correo: false }));
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const datosCorreo = correo ? { imagen: subida ? subida.url : "", preheader: correo.preheader, titulo: correo.titulo, parrafos: correo.parrafos, cta: correo.cta, url: ctaUrl.trim() } : null;
+
+  const guardarCorreo = () => {
+    const t = { id: uid(), name: `${(draft.name || correo.titulo).trim()} (correo)`, subject: correo.asunto, body: correoTexto(datosCorreo), html: correoHtml(datosCorreo) };
+    setDb((d) => ({ ...d, templates: { ...d.templates, email: [...d.templates.email, t] } }));
+    setHecho((h) => ({ ...h, correo: true }));
+    say("Plantilla de correo guardada en Plantillas → Correo de marketing.");
   };
 
   const disenar = async (variante, previo) => {
     const r = await pedirEstudio({
-      accion: "imagen", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje }, marca, conFoto: Boolean(foto), variante,
-      ...(previo ? { ajuste, anterior: previo.svg } : {}),
+      accion: "imagen", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje, imagen: { ...(p.imagen || {}), ...textosImg } }, marca, conFoto: Boolean(foto), variante,
+      ...(previo ? { ajuste: ajuste.trim() || "Pon los textos indicados en lugar de los actuales.", anterior: previo.svg } : {}),
     });
     const archivo = await svgAJpg(r.svg, foto);
-    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo) };
+    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), textos: { ...textosImg } };
   };
 
   const disenarDos = async () => {
@@ -4515,12 +5014,28 @@ function EstudioView({ db, setDb, say, onListo }) {
               ))}
             </div>
             {propuestas.some((x) => x.fuentes && x.fuentes.length) && <div style={{ ...nota, marginTop: 10 }}>Abre las fuentes y confirma los datos antes de mandarlo: Claude resume, pero el que publica eres tú.</div>}
+            {draft && (
+              <div style={{ marginTop: 16, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+                <Field def={{ label: "Mensaje elegido (puedes editarlo aquí mismo)", type: "textarea" }} value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                  <input className="crm-in" value={ajusteMsg} onChange={(e) => setAjusteMsg(e.target.value)} placeholder="O pídele un cambio puntual, p. ej. más corto, quita el emoji, menciona que los cupos son limitados"
+                    style={{ ...inputStyle, flex: 1, minWidth: 240, padding: "6px 9px", fontSize: 12.5 }} />
+                  <Btn variant="outline" Icon={Sparkles} disabled={Boolean(busy) || !ajusteMsg.trim()} onClick={ajustarMensaje}>{busy === "ajustarMsg" ? "Ajustando…" : "Ajustar con Claude"}</Btn>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
         {p && draft && (
           <div style={paso}>
             {tituloPaso(3, "La imagen")}
+            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1.4fr 1fr", gap: 8, marginBottom: 12 }}>
+              {[["titular", "Titular de la imagen"], ["apoyo", "Frase de apoyo (opcional)"], ["etiqueta", "Etiqueta (opcional)"]].map(([k, l]) => (
+                <input key={k} className="crm-in" value={textosImg[k]} placeholder={l} title={l}
+                  onChange={(e) => setTextosImg((t) => ({ ...t, [k]: e.target.value }))} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+              ))}
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
               <label className="crm-btn" style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${C.line}`, background: C.panel, borderRadius: 6, padding: "5px 11px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>
                 <ImagePlus size={13} />{foto ? "Cambiar foto de fondo" : "Usar una foto de fondo (opcional)"}
@@ -4545,12 +5060,15 @@ function EstudioView({ db, setDb, say, onListo }) {
                   <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                     <input className="crm-in" value={ajuste} onChange={(e) => setAjuste(e.target.value)} placeholder="Ajustar esta opción, p. ej. titular más grande, sin la etiqueta, fondo más claro"
                       style={{ ...inputStyle, flex: 1, minWidth: 240, padding: "6px 9px", fontSize: 12.5 }} />
-                    <Btn variant="outline" Icon={RefreshCw} disabled={Boolean(busy) || !ajuste.trim()} onClick={ajustar}>{busy === "ajustar" ? "Ajustando…" : "Ajustar"}</Btn>
+                    <Btn variant="outline" Icon={RefreshCw}
+                      disabled={Boolean(busy) || (!ajuste.trim() && JSON.stringify(textosImg) === JSON.stringify(disenos[diseno].textos || {}))}
+                      onClick={ajustar}>{busy === "ajustar" ? "Ajustando…" : "Ajustar este diseño"}</Btn>
                     <Btn variant="solid" Icon={Check} disabled={Boolean(busy) || !pu.base || !pu.clave || Boolean(subida)} onClick={usarDiseno}>
                       {busy === "subir" ? "Preparando…" : subida ? "Imagen lista" : "Usar esta imagen"}
                     </Btn>
                   </div>
                 )}
+                <div style={{ ...nota, marginTop: 6 }}>Ajustar toca sólo lo que pidas (o los textos que cambies arriba) sobre la opción marcada; el resto del diseño se queda igual.</div>
                 {(!pu.base || !pu.clave) && <div style={{ ...nota, marginTop: 6 }}>Falta configurar el puente en Conexiones para poder usar la imagen.</div>}
               </>
             )}
@@ -4559,18 +5077,72 @@ function EstudioView({ db, setDb, say, onListo }) {
 
         {p && draft && (
           <div style={paso}>
-            {tituloPaso(4, "La plantilla")}
+            {tituloPaso(4, "Las plantillas")}
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <Field def={{ label: "Nombre de la plantilla", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
-              <Field def={{ label: "Mensaje", type: "textarea" }} value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
-              <RevisionMetaWa key={subida ? subida.id : "sin-imagen"} db={db} draft={draft} setDraft={setDraft} sinRedactar
-                imagenInicial={subida}
-                onEnviada={(revision) => {
-                  setDb((d) => ({ ...d, templates: { ...d.templates, whatsapp: [...d.templates.whatsapp, { ...draft, name: draft.name.trim() || revision.nombre, revision }] } }));
-                  memoriaEstudio = null;
-                  say("Enviada a Meta. Te aviso en Plantillas cuando la aprueben.");
-                  onListo();
-                }} />
+              <Field def={{ label: "Nombre de la pieza", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
+              <div style={{ display: "flex", gap: 16, fontFamily: "var(--ui)", fontSize: 13 }}>
+                {[["wa", "WhatsApp (aprobación de Meta)"], ["correo", "Correo de marketing"]].map(([k, l]) => (
+                  <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input type="checkbox" checked={canales[k]} onChange={(e) => setCanales((c) => ({ ...c, [k]: e.target.checked }))} style={{ accentColor: C.jade }} />{l}
+                  </label>
+                ))}
+              </div>
+
+              {canales.wa && (hecho.wa ? (
+                <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.jade }}>✓ WhatsApp enviada a Meta. Te aviso en Plantillas cuando la aprueben.</div>
+              ) : (
+                <RevisionMetaWa key={subida ? subida.id : "sin-imagen"} db={db} draft={draft} setDraft={setDraft} sinRedactar
+                  imagenInicial={subida}
+                  onEnviada={(revision) => {
+                    setDb((d) => ({ ...d, templates: { ...d.templates, whatsapp: [...d.templates.whatsapp, { ...draft, name: draft.name.trim() || revision.nombre, revision }] } }));
+                    setHecho((h) => ({ ...h, wa: true }));
+                    say("Enviada a Meta. Te aviso en Plantillas cuando la aprueben.");
+                  }} />
+              ))}
+
+              {canales.correo && (
+                <div style={{ background: "#F4F7F2", border: `1px solid ${C.line}`, borderRadius: 7, padding: "11px 12px", display: "flex", flexDirection: "column", gap: 9 }}>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em" }}>VERSIÓN PARA CORREO</div>
+                  {!correo ? (
+                    <div>
+                      <Btn size="sm" variant="solid" Icon={Mail} disabled={Boolean(busy)} onClick={() => crearCorreo()}>{busy === "correo" ? "Escribiendo…" : "Crear la versión para correo"}</Btn>
+                      <div style={{ ...nota, marginTop: 6 }}>Mismo contenido, con asunto y un poco más de desarrollo.{subida ? " Lleva la misma imagen arriba." : " Si eliges la imagen en el paso 3, la lleva arriba."}</div>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                        <input className="crm-in" value={correo.asunto} placeholder="Asunto" title="Asunto" onChange={(e) => setCorreo({ ...correo, asunto: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                        <input className="crm-in" value={correo.preheader} placeholder="Texto de vista previa" title="Texto de vista previa" onChange={(e) => setCorreo({ ...correo, preheader: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                        <input className="crm-in" value={correo.titulo} placeholder="Titular" title="Titular" onChange={(e) => setCorreo({ ...correo, titulo: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5, gridColumn: "1 / -1" }} />
+                      </div>
+                      <textarea className="crm-in" rows={6} value={correo.parrafos.join("\n\n")} title="Párrafos (sepáralos con una línea en blanco)"
+                        onChange={(e) => setCorreo({ ...correo, parrafos: e.target.value.split(/\n\s*\n/) })}
+                        style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: 12.5, resize: "vertical" }} />
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr", gap: 8 }}>
+                        <input className="crm-in" value={correo.cta} placeholder="Texto del botón" onChange={(e) => setCorreo({ ...correo, cta: e.target.value })} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                        <input className="crm-in" value={ctaUrl} placeholder="Enlace del botón (https://…)" onChange={(e) => setCtaUrl(e.target.value)} style={{ ...inputStyle, padding: "6px 9px", fontSize: 12.5 }} />
+                      </div>
+                      {!/^https?:\/\/\S+$/.test(ctaUrl.trim()) && <div style={{ ...nota, color: C.clay }}>Sin un enlace válido el correo sale sin botón.</div>}
+                      <iframe title="Vista previa del correo" sandbox="" srcDoc={correoHtml(datosCorreo)} style={{ width: "100%", height: 520, border: `1px solid ${C.line}`, borderRadius: 6, background: "#fff" }} />
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <input className="crm-in" value={ajusteCorreo} onChange={(e) => setAjusteCorreo(e.target.value)} placeholder="Pídele un cambio puntual, p. ej. asunto más directo, un párrafo menos"
+                          style={{ ...inputStyle, flex: 1, minWidth: 240, padding: "6px 9px", fontSize: 12.5 }} />
+                        <Btn variant="outline" Icon={Sparkles} disabled={Boolean(busy) || !ajusteCorreo.trim()} onClick={() => crearCorreo(ajusteCorreo)}>{busy === "correo" ? "Ajustando…" : "Ajustar con Claude"}</Btn>
+                      </div>
+                      {hecho.correo
+                        ? <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.jade }}>✓ Guardada en Plantillas → Correo de marketing. Lista para tus envíos masivos.</div>
+                        : <div><Btn variant="solid" Icon={Check} disabled={Boolean(busy) || !correo.asunto.trim()} onClick={guardarCorreo}>Aprobar y guardar plantilla de correo</Btn></div>}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {(hecho.wa || hecho.correo) && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Btn variant="outline" onClick={onListo}>Ver en Plantillas</Btn>
+                  <Btn variant="ghost" Icon={Plus} onClick={empezarOtra}>Empezar otra pieza</Btn>
+                </div>
+              )}
             </div>
           </div>
         )}
