@@ -182,7 +182,10 @@ async function pedirJson(url, opciones, quien) {
        suele ser un "Invalid parameter" que no dice cuál. */
     const detalle = (e && (e.error_user_msg || e.message || e.error_description || e.status)) ||
       (data && data.error_description) || `HTTP ${r.status}`;
-    throw new Aviso(`${quien}: ${detalle}`, r.status === 401 || r.status === 403 ? 502 : 502);
+    /* El código de Meta va al final: con mensajes tan vagos como "cannot be
+       used with this API", es lo único que permite buscar la causa. */
+    const codigo = e && e.code ? ` (código ${e.code}${e.error_subcode ? `/${e.error_subcode}` : ""})` : "";
+    throw new Aviso(`${quien}: ${detalle}${codigo}`, r.status === 401 || r.status === 403 ? 502 : 502);
   }
   return data || {};
 }
@@ -684,7 +687,7 @@ async function whatsappCrearPlantilla(env, c) {
       headers: { Authorization: `Bearer ${env.WA_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify({ name: nombre, language: idioma, category: categoria, parameter_format: "NAMED", components: componentes }),
     },
-    "Meta",
+    "Meta (al crear la plantilla)",
   );
   return { id: r.id || "", nombre, idioma, estado: r.status || "PENDING", categoria: r.category || categoria };
 }
