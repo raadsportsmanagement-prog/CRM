@@ -598,21 +598,26 @@ async function servirImagen(env, id) {
    entrega el archivo entero de una vez. Devuelve el handle que pide la
    plantilla como ejemplo. */
 async function subirEjemploMeta(env, id) {
-  if (!env.META_APP_ID) throw falta("el identificador de la app de Meta", { vars: ["META_APP_ID"] });
   const r = await env.EVENTOS.getWithMetadata(IMG + id, { type: "arrayBuffer" });
   if (!r.value) throw new Aviso("No encuentro la imagen en el puente. Vuelve a subirla.");
   const tipo = (r.metadata && r.metadata.tipo) || "image/jpeg";
+  /* La sesión tiene que abrirse en la app que emitió el token: si es otra,
+     Meta la rechaza. Se le pregunta al token de cuál es; META_APP_ID queda
+     de respaldo. */
+  const app = await pedirJson(`https://graph.facebook.com/${META_V}/app?access_token=${encodeURIComponent(env.WA_TOKEN)}`, {}, "Meta")
+    .then((a) => a && a.id, () => null) || env.META_APP_ID;
+  if (!app) throw falta("el identificador de la app de Meta", { vars: ["META_APP_ID"] });
   const sesion = await pedirJson(
-    `https://graph.facebook.com/${META_V}/${env.META_APP_ID}/uploads?${new URLSearchParams({
+    `https://graph.facebook.com/${META_V}/${app}/uploads?${new URLSearchParams({
       file_name: `encabezado.${tipo === "image/png" ? "png" : "jpg"}`, file_length: String(r.value.byteLength), file_type: tipo, access_token: env.WA_TOKEN,
     })}`,
     { method: "POST" },
-    "Meta",
+    "Meta (al subir la imagen)",
   );
   const subida = await pedirJson(
     `https://graph.facebook.com/${META_V}/${sesion.id}`,
     { method: "POST", headers: { Authorization: `OAuth ${env.WA_TOKEN}`, file_offset: "0" }, body: r.value },
-    "Meta",
+    "Meta (al subir la imagen)",
   );
   if (!subida.h) throw new Aviso("Meta no devolvió la imagen subida. Prueba otra vez.");
   return subida.h;
