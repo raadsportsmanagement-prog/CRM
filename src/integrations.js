@@ -671,12 +671,15 @@ export async function traerCorreos({ clientId, direcciones, desde, tope = 400, p
     if (Number.isFinite(t)) base.push(`after:${t - 86400}`);
   }
 
-  /* De a veinte direcciones por consulta: la cadena de búsqueda tiene un
+  /* También por copia: una respuesta a varios deja al contacto en Cc, y
+     buscando sólo en Para ese correo no aparecía en su hilo.
+
+     De a veinte direcciones por consulta: la cadena de búsqueda tiene un
      límite y con la libreta entera en una sola Gmail la rechazaría. */
   const lotes = [];
   for (let i = 0; i < conocidas.length; i += 20) {
     const grupo = conocidas.slice(i, i + 20);
-    lotes.push(`${base.join(" ")} {${grupo.map((d) => `from:${d} to:${d}`).join(" ")}}`);
+    lotes.push(`${base.join(" ")} {${grupo.map((d) => `from:${d} to:${d} cc:${d}`).join(" ")}}`);
   }
 
   /* El tope se reparte por lote y no de corrido. Gmail devuelve lo más nuevo

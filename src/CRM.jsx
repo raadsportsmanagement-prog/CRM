@@ -926,7 +926,7 @@ export default function CRM() {
        vuelve en cero y el aviso diría "sin correos nuevos" habiendo traído
        decenas. Los identificadores también se reparten aquí por lo mismo. */
     const actuales = (dbRef.current || db || {}).activities || [];
-    const vistos = new Set(actuales.map((a) => a.ext).filter(Boolean));
+    const vistos = clavesExternas(actuales);
     const conId = list
       .filter((a) => a.ext && !vistos.has(a.ext))
       .map((a) => ({ id: uid(), ...a }));
@@ -935,7 +935,7 @@ export default function CRM() {
     setDb((d) => {
       /* Se vuelve a filtrar contra el estado real por si entró algo entre
          medias —otra pestaña, dos sincronizaciones seguidas—. */
-      const yaEstan = new Set(d.activities.map((a) => a.ext).filter(Boolean));
+      const yaEstan = clavesExternas(d.activities);
       const entran = conId.filter((a) => !yaEstan.has(a.ext));
       if (!entran.length) return d;
 
@@ -1444,12 +1444,16 @@ export default function CRM() {
         aperturas: integ.medicion.aperturas, clics: integ.medicion.clics,
       });
     }
+    /* Con el identificador de Gmail el barrido lo reconoce en Enviados y no
+       lo mete dos veces. Va aparte de `ext`, que es la marca de lo traído de
+       fuera: el resumen de envíos cuenta justo lo que no la tiene. */
+    let gid = "";
     try {
-      await sendGmail({ to, subject: asunto, body: cuerpo, html, clientId: integ.email.clientId });
+      gid = await sendGmail({ to, subject: asunto, body: cuerpo, html, clientId: integ.email.clientId });
     } catch (e) {
       return { ok: false, err: (e && e.message) || String(e) };
     }
-    logActivity({ type: "email", subject: asunto, body: cuerpo, auto: p.autoId, ...(trk ? { trk } : {}), ...enlaces });
+    logActivity({ type: "email", subject: asunto, body: cuerpo, auto: p.autoId, ...(trk ? { trk } : {}), ...(gid ? { gmailId: gid } : {}), ...enlaces });
     return { ok: true, texto: `Correo enviado a ${titleOf(ent, rec)}` };
   };
 
@@ -1488,6 +1492,7 @@ export default function CRM() {
      siguiente latido— con la hora de salida ya pasada a la vista. */
   const datosListos = Boolean(db);
   const waPregunta = useRef(0);
+  const correoPregunta = useRef(0);
   const revPregunta = useRef(0);
   useEffect(() => {
     if (!datosListos) return undefined;
@@ -1503,6 +1508,14 @@ export default function CRM() {
       if (ahora - waPregunta.current >= 55000) {
         waPregunta.current = ahora;
         try { await recogerWhatsApp(d, importarWhatsApp, marcarBuzon); } catch (_) { /* se reintenta en el siguiente latido */ }
+      }
+
+      /* 0a. Las respuestas por correo, cada dos minutos. Antes sólo bajaban al
+             pulsar "Correo", y un hilo con lo enviado y sin lo contestado se
+             lee como si nadie hubiera respondido. */
+      if (ahora - correoPregunta.current >= 115000) {
+        correoPregunta.current = ahora;
+        try { await recogerCorreo(d, importActivities, marcarBuzon); } catch (_) { /* se reintenta en el siguiente latido */ }
       }
 
       /* 0b. Las plantillas que esperan la revisión de Meta, cada cinco
@@ -3010,6 +3023,18 @@ function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEve
 
 const ES_MENSAJE = (a) => a && (a.type === "whatsapp" || a.type === "email");
 
+/* Lo ya guardado, por su identificador de fuera. Un correo que el CRM mandó
+   por la API guarda su identificador de Gmail, y el barrido lo vuelve a ver en
+   Enviados como `gmail:<id>`: es el mismo, no hay que meterlo otra vez. */
+const clavesExternas = (acts) => {
+  const s = new Set();
+  for (const a of acts) {
+    if (a.ext) s.add(a.ext);
+    if (a.gmailId) s.add(`gmail:${a.gmailId}`);
+  }
+  return s;
+};
+
 /* Se cuenta en cada pintada de la app para el número del rail, así que lo
    primero que hace es descartar todo lo que no sea un mensaje recibido: con
    miles de actividades guardadas eso deja el recorrido en nada.
@@ -3226,17 +3251,9 @@ async function recogerWhatsAppYa(db, onWhatsApp, onBuzon) {
   return { mensajes, fichas };
 }
 
-async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
-  const integ = db.integrations;
-  const mide = midiendo(integ.medicion);
-  /* Los anuncios sólo entran si hay puente y alguna plataforma encendida.
-     Media configuración no se intenta: daría un error por cada barrido. */
-  const anun = integ.anuncios;
-  const trayendoLeads = Boolean(onLeads && integ.puente.base && integ.puente.clave && (anun.meta || anun.google));
-  const conWa = Boolean(onWhatsApp && integ.whatsapp.modo === "api" && integ.puente.base && integ.puente.clave);
-
-  /* Índice dirección → fichas. Dos personas pueden compartir el correo de la
-     empresa, así que una dirección puede apuntar a varias. */
+/* Índice dirección → fichas. Dos personas pueden compartir el correo de la
+   empresa, así que una dirección puede apuntar a varias. */
+function indiceDirecciones(db) {
   const porDireccion = new Map();
   const anotar = (correo, kind, id) => {
     const d = String(correo || "").trim().toLowerCase();
@@ -3246,6 +3263,63 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
   };
   db.contacts.forEach((r) => anotar(r.props.email, "contact", r.id));
   db.companies.forEach((r) => anotar(r.props.email, "company", r.id));
+  return porDireccion;
+}
+
+/* Los correos cruzados con la gente del CRM, ya como actividades. Lo usan el
+   botón "Correo" y la revisión sola del latido: dos copias de esto se habrían
+   separado a la primera corrección. */
+async function bajarCorreos(db, porDireccion, progreso = () => {}) {
+  const { mensajes, revisados, truncado } = await traerCorreos({
+    clientId: db.integrations.email.clientId,
+    direcciones: [...porDireccion.keys()],
+    desde: db.buzon.correoAl,
+    alAvanzar: (hechos, total) => progreso(`Revisando ${hechos} de ${total}…`),
+  });
+  const acts = mensajes.map((m) => {
+    const contactIds = [], companyIds = [];
+    m.contrapartes.forEach((d) => (porDireccion.get(d) || []).forEach(({ kind, id }) => {
+      (kind === "contact" ? contactIds : companyIds).push(id);
+    }));
+    return {
+      ext: m.ext, type: "email", dir: m.dir, at: m.at,
+      subject: m.subject, body: m.body,
+      contactIds: [...new Set(contactIds)], companyIds: [...new Set(companyIds)],
+    };
+  });
+  return { acts, revisados, truncado };
+}
+
+/* Las respuestas por correo, solas y sin ventanas. Sólo corre si la pestaña ya
+   tiene el permiso de lectura vigente: pedirlo abriría la ventana de Google
+   sin que nadie haya pulsado nada, y el navegador la bloquearía igual. Cuando
+   el permiso vence —Google lo da por una hora— se renueva al pulsar "Correo". */
+let correoEnCurso = null;
+function recogerCorreo(db, onImport, onBuzon) {
+  if (!db.integrations.email.clientId || !gmailStatus().puedeLeer) return null;
+  if (!correoEnCurso) {
+    correoEnCurso = (async () => {
+      const porDireccion = indiceDirecciones(db);
+      if (!porDireccion.size) return 0;
+      const { acts } = await bajarCorreos(db, porDireccion);
+      const n = onImport(acts);
+      onBuzon({ correoAl: nowISO() });
+      return n;
+    })().finally(() => { correoEnCurso = null; });
+  }
+  return correoEnCurso;
+}
+
+async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
+  const integ = db.integrations;
+  const mide = midiendo(integ.medicion);
+  /* Los anuncios sólo entran si hay puente y alguna plataforma encendida.
+     Media configuración no se intenta: daría un error por cada barrido. */
+  const anun = integ.anuncios;
+  const trayendoLeads = Boolean(onLeads && integ.puente.base && integ.puente.clave && (anun.meta || anun.google));
+  const conWa = Boolean(onWhatsApp && integ.whatsapp.modo === "api" && integ.puente.base && integ.puente.clave);
+
+  const porDireccion = indiceDirecciones(db);
 
   const fichasDe = (correo) => {
     const contactIds = [], companyIds = [];
@@ -3266,6 +3340,15 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
   const notas = [];
   const marca = {};
   let nuevos = 0, revisados = 0, rebotados = 0, movidos = 0, leads = 0, fichas = 0, wa = 0;
+
+  /* Lo mismo cuando sí hay otras fuentes: el barrido seguiría con ellas y el
+     aviso hablaría de WhatsApp o de leads sin mencionar el correo, como si la
+     bandeja se hubiera revisado y no hubiera respuestas. */
+  if (!conGmail) {
+    notas.push(integ.email.clientId
+      ? "Correo: ningún contacto ni empresa tiene correo guardado, no hay con quién cruzar la bandeja."
+      : "Correo sin revisar: falta el ID de cliente de Google en Conexiones.");
+  }
 
   if (conWa) {
     progreso("Preguntando por WhatsApp…");
@@ -3291,25 +3374,8 @@ async function correrBarrido({ db, progreso = () => {}, onImport, onBuzon, onLee
     }
 
     progreso("Buscando en la bandeja…");
-    const { mensajes, revisados: rev, truncado } = await traerCorreos({
-      clientId: integ.email.clientId,
-      direcciones: [...porDireccion.keys()],
-      desde: db.buzon.correoAl,
-      alAvanzar: (hechos, total) => progreso(`Revisando ${hechos} de ${total}…`),
-    });
+    const { acts, revisados: rev, truncado } = await bajarCorreos(db, porDireccion, progreso);
     revisados = rev;
-
-    const acts = mensajes.map((m) => {
-      const contactIds = [], companyIds = [];
-      m.contrapartes.forEach((d) => (porDireccion.get(d) || []).forEach(({ kind, id }) => {
-        (kind === "contact" ? contactIds : companyIds).push(id);
-      }));
-      return {
-        ext: m.ext, type: "email", dir: m.dir, at: m.at,
-        subject: m.subject, body: m.body,
-        contactIds: [...new Set(contactIds)], companyIds: [...new Set(companyIds)],
-      };
-    });
 
     progreso("Buscando correos devueltos…");
     const { rebotes, truncado: rebotesCortados, revisados: avisos } = await traerRebotes({
@@ -4051,11 +4117,14 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
     say("Respuesta registrada");
   };
 
-  const registrarSalida = (cuerpo, asuntoFinal, trk) => onLog({
+  const registrarSalida = (cuerpo, asuntoFinal, trk, gid) => onLog({
     type: canalReal, dir: "out",
     subject: asuntoFinal || (esCorreo ? "Correo" : "Mensaje de WhatsApp"),
     body: cuerpo,
     ...(trk ? { trk } : {}),
+    /* Con el identificador de Gmail el barrido lo reconoce en Enviados y no
+       lo duplica en el hilo. */
+    ...(gid ? { gmailId: gid } : {}),
     ...(kind === "contact" ? { contactIds: [conv.id] } : { companyIds: [conv.id] }),
   });
 
@@ -4114,8 +4183,8 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
               aperturas: integ.medicion.aperturas, clics: integ.medicion.clics,
             })
           : diseno;
-        await sendGmail({ to: correo, subject: asu, body: cuerpo, html, clientId: integ.email.clientId });
-        registrarSalida(cuerpo, asu, trk);
+        const gid = await sendGmail({ to: correo, subject: asu, body: cuerpo, html, clientId: integ.email.clientId });
+        registrarSalida(cuerpo, asu, trk, gid);
         limpiar();
         say(`Correo enviado a ${correo}`);
       } catch (e) {
@@ -4858,7 +4927,13 @@ function EstudioView({ db, setDb, say, onListo }) {
   const m = memoriaEstudio || {};
   const [fuente, setFuente] = useState(m.fuente || "idea");
   const [brief, setBrief] = useState(m.brief || "");
-  const [propuestas, setPropuestas] = useState(m.propuestas || []);
+  /* Cada "Proponer" suma una tanda en vez de pisar la anterior, y cada diseño
+     —también los ajustados— se queda en la lista: así se puede volver a lo
+     que no se eligió en su momento. La elegida se recuerda por tanda, porque
+     se puede mirar una tanda sin cambiar de mensaje. */
+  const [tandas, setTandas] = useState(m.tandas || []);
+  const [vista, setVista] = useState(m.vista ?? -1);
+  const [tandaElegida, setTandaElegida] = useState(m.tandaElegida ?? -1);
   const [elegida, setElegida] = useState(m.elegida ?? -1);
   const [foto, setFoto] = useState(m.foto || "");
   const [disenos, setDisenos] = useState(m.disenos || []);
@@ -4881,8 +4956,8 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [verHistorial, setVerHistorial] = useState(false);
 
   useEffect(() => {
-    memoriaEstudio = { fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId };
-  }, [fuente, brief, propuestas, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId]);
+    memoriaEstudio = { fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId };
+  }, [fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId]);
 
   useEffect(() => { listarBorradores().then(setHistorial).catch(() => {}); }, []);
 
@@ -4894,8 +4969,8 @@ function EstudioView({ db, setDb, say, onListo }) {
       setHistorial(await guardarBorrador({
         id, actualizado: nowISO(),
         titulo: (draft && draft.name.trim()) || brief.trim().slice(0, 70) || "Sin título",
-        fuente, brief, propuestas, elegida, foto, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho,
-        disenos: disenos.map(({ svg, archivo, textos }) => ({ svg, archivo, textos })),
+        fuente, brief, tandas, vista, tandaElegida, elegida, foto, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho,
+        disenos: disenos.map(({ svg, archivo, textos, variante, ronda, para }) => ({ svg, archivo, textos, variante, ronda, para })),
       }));
       setBorradorId(id);
       if (!callado) say("Borrador guardado");
@@ -4911,12 +4986,28 @@ function EstudioView({ db, setDb, say, onListo }) {
     if ((hecho.wa && !a.wa) || (hecho.correo && !a.correo)) guardar(true);
   }, [hecho]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  /* Lo mismo con cada respuesta de Claude: una tanda o un diseño nuevo se
+     guarda solo, para que el historial no dependa de acordarse de guardar
+     ni se pierda al recargar. */
+  const cuentas = useRef(`${tandas.length}/${disenos.length}`);
+  useEffect(() => {
+    const c = `${tandas.length}/${disenos.length}`;
+    if (c === cuentas.current) return;
+    cuentas.current = c;
+    if (tandas.length) guardar(true);
+  }, [tandas.length, disenos.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const abrir = (b) => {
     const h = b.hecho || { wa: false, correo: false };
     hechoAntes.current = h;
+    /* Los borradores de antes del historial traen una sola tanda suelta. */
+    const ts = b.tandas || (b.propuestas && b.propuestas.length ? [{ at: b.actualizado, fuente: b.fuente, brief: b.brief, propuestas: b.propuestas }] : []);
+    const te = b.tandas ? (b.tandaElegida ?? -1) : ((b.elegida ?? -1) >= 0 ? 0 : -1);
+    const ds = (b.disenos || []).map((d, i) => ({ variante: i % 2, ronda: 0, para: `${te}:${b.elegida}`, ...d, vista: URL.createObjectURL(d.archivo) }));
+    cuentas.current = `${ts.length}/${ds.length}`;
     setBorradorId(b.id); setFuente(b.fuente || "idea"); setBrief(b.brief || "");
-    setPropuestas(b.propuestas || []); setElegida(b.elegida ?? -1); setFoto(b.foto || "");
-    setDisenos((b.disenos || []).map((d) => ({ ...d, vista: URL.createObjectURL(d.archivo) })));
+    setTandas(ts); setVista(b.vista ?? ts.length - 1); setTandaElegida(te); setElegida(b.elegida ?? -1); setFoto(b.foto || "");
+    setDisenos(ds);
     setDiseno(b.diseno ?? -1); setDraft(b.draft || null); setSubida(b.subida || null);
     setTextosImg(b.textosImg || { titular: "", apoyo: "", etiqueta: "" }); setCanales(b.canales || { wa: true, correo: false });
     setCorreo(b.correo || null); setCtaUrl(b.ctaUrl || ""); setHecho(h);
@@ -4933,25 +5024,37 @@ function EstudioView({ db, setDb, say, onListo }) {
 
   const empezarOtra = () => {
     memoriaEstudio = null;
-    setPropuestas([]); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
+    setTandas([]); setVista(-1); setTandaElegida(-1); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
     setCorreo(null); setHecho({ wa: false, correo: false }); setBrief(""); setFoto(""); setBorradorId(null);
     hechoAntes.current = { wa: false, correo: false };
+    cuentas.current = "0/0";
   };
 
-  const p = elegida >= 0 ? propuestas[elegida] : null;
+  const propuestas = (tandas[vista] && tandas[vista].propuestas) || [];
+  const p = tandaElegida >= 0 && elegida >= 0 && tandas[tandaElegida] ? tandas[tandaElegida].propuestas[elegida] : null;
+  /* Los diseños se cuelgan del mensaje para el que se hicieron: al volver a
+     un mensaje anterior vuelven también sus imágenes. */
+  const clave = p ? `${tandaElegida}:${elegida}` : "";
+  const deEste = disenos.map((d, i) => ({ d, i })).filter(({ d }) => d.para === clave);
+  const sigRonda = deEste.reduce((mx, { d }) => Math.max(mx, d.ronda + 1), 0);
+  /* En grande la última ronda y la marcada; lo demás, en miniatura debajo. */
+  const grandes = deEste.filter(({ d, i }) => d.ronda === sigRonda - 1 || i === diseno);
+  const anteriores = deEste.filter(({ d, i }) => d.ronda !== sigRonda - 1 && i !== diseno).reverse();
   const ponerMarca = (v) => setDb((d) => ({ ...d, estudio: { ...(d.estudio || {}), marca: v } }));
 
   const proponer = async () => {
     setBusy("proponer"); setErr("");
     try {
       const r = await pedirEstudio({ accion: "proponer", fuente, brief, marca });
-      setPropuestas(r.propuestas); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
+      setVista(tandas.length);
+      setTandas([...tandas, { at: nowISO(), fuente, brief, propuestas: r.propuestas }]);
     } catch (e) { setErr((e && e.message) || String(e)); }
     setBusy("");
   };
 
   const elegir = (i) => {
-    setElegida(i); setDisenos([]); setDiseno(-1); setSubida(null); setCorreo(null); setHecho({ wa: false, correo: false });
+    const ultimo = disenos.reduce((u, d, j) => (d.para === `${vista}:${i}` ? j : u), -1);
+    setTandaElegida(vista); setElegida(i); setDiseno(ultimo); setSubida(null); setCorreo(null); setHecho({ wa: false, correo: false });
     const im = propuestas[i].imagen || {};
     setTextosImg({ titular: im.titular || "", apoyo: im.apoyo || "", etiqueta: im.etiqueta || "" });
     setDraft({ id: uid(), name: propuestas[i].titulo, subject: "", body: propuestas[i].mensaje, html: "", meta: null });
@@ -4996,7 +5099,7 @@ function EstudioView({ db, setDb, say, onListo }) {
       ...(previo ? { ajuste: ajuste.trim() || "Pon los textos indicados en lugar de los actuales.", anterior: previo.svg } : {}),
     });
     const archivo = await svgAJpg(r.svg, foto);
-    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), textos: { ...textosImg } };
+    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), textos: { ...textosImg }, variante, para: clave, ronda: sigRonda };
   };
 
   const disenarDos = async () => {
@@ -5005,7 +5108,8 @@ function EstudioView({ db, setDb, say, onListo }) {
       const hechos = await Promise.allSettled([disenar(0), disenar(1)]);
       const buenos = hechos.filter((h) => h.status === "fulfilled").map((h) => h.value);
       if (!buenos.length) throw hechos[0].reason;
-      setDisenos(buenos); setDiseno(0);
+      setDiseno(disenos.length);
+      setDisenos([...disenos, ...buenos]);
     } catch (e) { setErr((e && e.message) || String(e)); }
     setBusy("");
   };
@@ -5013,8 +5117,11 @@ function EstudioView({ db, setDb, say, onListo }) {
   const ajustar = async () => {
     setBusy("ajustar"); setErr(""); setSubida(null);
     try {
-      const nuevo = await disenar(diseno, disenos[diseno]);
-      setDisenos((ds) => ds.map((d, i) => (i === diseno ? nuevo : d)));
+      /* El ajustado entra como uno más y el original se queda en Anteriores. */
+      const previo = disenos[diseno];
+      const nuevo = await disenar(previo.variante ?? 0, previo);
+      setDiseno(disenos.length);
+      setDisenos([...disenos, nuevo]);
       setAjuste("");
     } catch (e) { setErr((e && e.message) || String(e)); }
     setBusy("");
@@ -5050,7 +5157,7 @@ function EstudioView({ db, setDb, say, onListo }) {
       <Header eyebrow="Mensajería" title="Estudio de contenido" right={<>
         <Btn variant="ghost" Icon={History} onClick={() => setVerHistorial((v) => !v)}>Recientes{historial.length ? ` (${historial.length})` : ""}</Btn>
         {borradorId && <Btn variant="ghost" Icon={Plus} disabled={Boolean(busy)} onClick={empezarOtra}>Nueva pieza</Btn>}
-        <Btn variant="outline" Icon={Save} disabled={Boolean(busy) || (!brief.trim() && !propuestas.length)} onClick={() => guardar(false)}>
+        <Btn variant="outline" Icon={Save} disabled={Boolean(busy) || (!brief.trim() && !tandas.length)} onClick={() => guardar(false)}>
           {borradorId ? "Guardar cambios" : "Guardar borrador"}
         </Btn>
       </>} />
@@ -5060,12 +5167,15 @@ function EstudioView({ db, setDb, say, onListo }) {
           <div style={paso}>
             <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 10 }}>Piezas recientes</div>
             {!historial.length ? (
-              <div style={nota}>Todavía no hay nada. Pulsa "Guardar borrador" en cualquier momento; lo que mandes a Meta o apruebes como correo también queda aquí.</div>
+              <div style={nota}>Todavía no hay nada. Cada propuesta y cada diseño que te da Claude se guarda aquí solo, con lo que no elegiste; también puedes pulsar "Guardar borrador" en cualquier momento.</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column" }}>
                 {historial.map((b) => {
                   const h = b.hecho || {};
                   const estado = [h.wa && "Enviada a Meta", h.correo && "Correo guardado"].filter(Boolean).join(" · ") || "Borrador";
+                  const nT = b.tandas ? b.tandas.length : (b.propuestas && b.propuestas.length ? 1 : 0);
+                  const nD = (b.disenos || []).length;
+                  const cuanto = [nT && `${nT} ${nT === 1 ? "tanda" : "tandas"}`, nD && `${nD} ${nD === 1 ? "diseño" : "diseños"}`].filter(Boolean).join(", ");
                   const vista = b.disenos && b.disenos[b.diseno >= 0 ? b.diseno : 0];
                   return (
                     <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 0", borderTop: `1px solid ${C.line}` }}>
@@ -5075,7 +5185,7 @@ function EstudioView({ db, setDb, say, onListo }) {
                           {b.titulo}{b.id === borradorId && <span style={{ color: C.jade, fontWeight: 500 }}> · abierta</span>}
                         </div>
                         <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>
-                          {estado} · {new Date(b.actualizado).toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" })}
+                          {estado}{cuanto ? ` · ${cuanto}` : ""} · {new Date(b.actualizado).toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" })}
                         </div>
                       </div>
                       <Btn size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => abrir(b)}>Abrir</Btn>
@@ -5124,9 +5234,23 @@ function EstudioView({ db, setDb, say, onListo }) {
         {propuestas.length > 0 && (
           <div style={paso}>
             {tituloPaso(2, "Elige un mensaje")}
+            {tandas.length > 1 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginRight: 2 }}>TANDAS</span>
+                {tandas.map((t, k) => (
+                  <button key={k} onClick={() => setVista(k)} title={t.brief} className="crm-btn"
+                    style={{ border: `1px solid ${vista === k ? C.jade : C.line}`, background: vista === k ? C.jade : C.panel, color: vista === k ? "#fff" : C.mute, borderRadius: 999, padding: "3px 11px", fontFamily: "var(--ui)", fontSize: 12, cursor: "pointer" }}>
+                    {k + 1} · {new Date(t.at).toLocaleTimeString("es-CO", { hour: "numeric", minute: "2-digit" })}{tandaElegida === k ? " ✓" : ""}
+                  </button>
+                ))}
+              </div>
+            )}
+            {tandas.length > 1 && tandas[vista] && tandas[vista].brief !== brief && (
+              <div style={{ ...nota, marginBottom: 10 }}>Pedida con: «{tandas[vista].brief}»</div>
+            )}
             <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
               {propuestas.map((x, i) => (
-                <div key={i} style={{ flex: "1 1 280px", border: `1.5px solid ${elegida === i ? C.jade : C.line}`, borderRadius: 8, padding: 13, background: elegida === i ? "#F7FAF8" : C.panel, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div key={i} style={{ flex: "1 1 280px", border: `1.5px solid ${tandaElegida === vista && elegida === i ? C.jade : C.line}`, borderRadius: 8, padding: 13, background: tandaElegida === vista && elegida === i ? "#F7FAF8" : C.panel, display: "flex", flexDirection: "column", gap: 8 }}>
                   <div style={{ fontFamily: "var(--display)", fontSize: 13.5, fontWeight: 600 }}>{x.titulo}</div>
                   {x.imagen && x.imagen.titular && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: C.blue }}>IMAGEN: {x.imagen.titular}</div>}
                   <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, whiteSpace: "pre-wrap", lineHeight: 1.55, flex: 1 }}>{x.mensaje}</div>
@@ -5137,13 +5261,14 @@ function EstudioView({ db, setDb, say, onListo }) {
                       ))}
                     </div>
                   )}
-                  <Btn size="sm" variant={elegida === i ? "solid" : "outline"} Icon={Check} disabled={Boolean(busy)} onClick={() => elegir(i)}>{elegida === i ? "Elegido" : "Usar este"}</Btn>
+                  <Btn size="sm" variant={tandaElegida === vista && elegida === i ? "solid" : "outline"} Icon={Check} disabled={Boolean(busy)} onClick={() => elegir(i)}>{tandaElegida === vista && elegida === i ? "Elegido" : "Usar este"}</Btn>
                 </div>
               ))}
             </div>
             {propuestas.some((x) => x.fuentes && x.fuentes.length) && <div style={{ ...nota, marginTop: 10 }}>Abre las fuentes y confirma los datos antes de mandarlo: Claude resume, pero el que publica eres tú.</div>}
             {draft && (
               <div style={{ marginTop: 16, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+                {tandaElegida !== vista && tandaElegida >= 0 && <div style={{ ...nota, marginBottom: 8 }}>El mensaje elegido es de la tanda {tandaElegida + 1}.</div>}
                 <Field def={{ label: "Mensaje elegido (puedes editarlo aquí mismo)", type: "textarea" }} value={draft.body} onChange={(v) => setDraft({ ...draft, body: v })} />
                 <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
                   <input className="crm-in" value={ajusteMsg} onChange={(e) => setAjusteMsg(e.target.value)} placeholder="O pídele un cambio puntual, p. ej. más corto, quita el emoji, menciona que los cupos son limitados"
@@ -5171,19 +5296,31 @@ function EstudioView({ db, setDb, say, onListo }) {
               </label>
               {foto && <><img src={foto} alt="" style={{ height: 34, borderRadius: 4 }} /><Btn size="sm" variant="ghost" Icon={X} onClick={() => setFoto("")}>Quitar</Btn></>}
               <Btn variant="solid" Icon={Palette} disabled={Boolean(busy)} onClick={disenarDos}>
-                {busy === "disenar" ? "Diseñando…" : disenos.length ? "Diseñar otras 2" : "Diseñar 2 opciones"}
+                {busy === "disenar" ? "Diseñando…" : deEste.length ? "Diseñar otras 2" : "Diseñar 2 opciones"}
               </Btn>
             </div>
             {busy === "disenar" && espera("Claude está diseñando dos composiciones; tarda alrededor de un minuto.")}
-            {disenos.length > 0 && (
+            {deEste.length > 0 && (
               <>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  {disenos.map((d, i) => (
+                  {grandes.map(({ d, i }) => (
                     <button key={i} onClick={() => { setDiseno(i); setSubida(null); }} style={{ padding: 0, border: `3px solid ${diseno === i ? C.jade : "transparent"}`, borderRadius: 8, background: "none", cursor: "pointer", flex: "1 1 320px", maxWidth: 500 }}>
                       <img src={d.vista} alt={`Opción ${i + 1}`} style={{ display: "block", width: "100%", borderRadius: 5 }} />
                     </button>
                   ))}
                 </div>
+                {anteriores.length > 0 && (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 6 }}>ANTERIORES · toca una para recuperarla</div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      {anteriores.map(({ d, i }) => (
+                        <button key={i} onClick={() => { setDiseno(i); setSubida(null); }} title="Recuperar este diseño" style={{ padding: 0, border: `2px solid ${C.line}`, borderRadius: 6, background: "none", cursor: "pointer" }}>
+                          <img src={d.vista} alt="Diseño anterior" style={{ display: "block", width: 150, borderRadius: 4 }} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {diseno >= 0 && (
                   <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                     <input className="crm-in" value={ajuste} onChange={(e) => setAjuste(e.target.value)} placeholder="Ajustar esta opción, p. ej. titular más grande, sin la etiqueta, fondo más claro"
@@ -5196,7 +5333,7 @@ function EstudioView({ db, setDb, say, onListo }) {
                     </Btn>
                   </div>
                 )}
-                <div style={{ ...nota, marginTop: 6 }}>Ajustar toca sólo lo que pidas (o los textos que cambies arriba) sobre la opción marcada; el resto del diseño se queda igual.</div>
+                <div style={{ ...nota, marginTop: 6 }}>Ajustar toca sólo lo que pidas (o los textos que cambies arriba) sobre la opción marcada; el resto del diseño se queda igual y la versión anterior queda en Anteriores.</div>
                 {(!pu.base || !pu.clave) && <div style={{ ...nota, marginTop: 6 }}>Falta configurar el puente en Conexiones para poder usar la imagen.</div>}
               </>
             )}
