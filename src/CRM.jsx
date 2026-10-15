@@ -1842,7 +1842,8 @@ function Dashboard({ db, go }) {
   const k = {
     contacts: db.contacts.filter((c) => isToday(c.props.createdAt)).length,
     companies: db.companies.filter((c) => isToday(c.props.createdAt)).length,
-    messages: today.filter((a) => a.type === "whatsapp" || a.type === "email").length,
+    /* Lo que salió de nosotros: las respuestas que llegan (dir "in") no cuentan. */
+    interactions: today.filter((a) => a.dir !== "in").length,
     activities: today.length,
   };
   const byType = ["whatsapp", "email", "call", "note"].map((t) => ({ t, n: today.filter((a) => a.type === t).length }));
@@ -1865,7 +1866,7 @@ function Dashboard({ db, go }) {
       <div style={{ padding: 28, display: "flex", flexDirection: "column", gap: 22 }}>
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
           <KPI label="Contactos creados hoy" value={k.contacts} sub={`${db.contacts.length} en total`} />
-          <KPI label="Mensajes registrados hoy" value={k.messages} sub="WhatsApp + correo" accent={C.jade} />
+          <KPI label="Interacciones que hice hoy" value={k.interactions} sub="llamadas · WhatsApp · correos · notas" accent={C.jade} />
           <KPI label="Empresas creadas hoy" value={k.companies} sub={`${db.companies.length} en total`} />
           <KPI label="Actividades de hoy" value={k.activities} sub="llamadas · WhatsApp · correos" />
         </div>
