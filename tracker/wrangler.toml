@@ -48,10 +48,13 @@ WA_PHONE_ID = "1339016502634465"
 # falta para subir la imagen de ejemplo al crear una plantilla con imagen.
 META_APP_ID = "1768965847650468"
 
-# WhatsApp — el identificador de la cuenta de WhatsApp Business, para leer las
-# plantillas aprobadas. Está en business.facebook.com → Cuentas → Cuentas de
-# WhatsApp, debajo del nombre de la cuenta.
-WA_WABA_ID = "1435679215133577"
+# WhatsApp — la cuenta donde viven las plantillas, para crearlas y leer las
+# aprobadas. Está en business.facebook.com → Configuración → Cuentas → Cuentas
+# de WhatsApp: la que tiene el número en su pestaña "Números de teléfono".
+# No es el identificador que muestra developers.facebook.com junto al número:
+# con el modelo nuevo de Meta ese es la cuenta del número, y crear plantillas
+# ahí da "WhatsApp accounts cannot be used with this API" (100/2388339).
+WA_WABA_ID = "1784255429408787"
 
 # WhatsApp por Twilio — en vez de Meta. Con TWILIO_ACCOUNT_SID puesto, todo
 # WhatsApp sale y entra por Twilio y lo de WA_* de arriba se ignora; vacío,
