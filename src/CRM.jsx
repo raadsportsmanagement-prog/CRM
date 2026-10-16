@@ -1713,7 +1713,8 @@ export default function CRM() {
       {detail && (
         <RecordDetail db={db} detail={detail} onClose={() => setDetail(null)} setModal={setModal}
           onLog={(a) => { logActivity(a); say("Actividad registrada"); }}
-          onEdit={() => setModal({ kind: "record", objKind: detail.kind, id: detail.id })} />
+          onEdit={() => setModal({ kind: "record", objKind: detail.kind, id: detail.id })}
+          onContactos={(dealId, contactIds) => setDb((d) => ({ ...d, deals: d.deals.map((r) => (r.id === dealId ? { ...r, contactIds } : r)) }))} />
       )}
 
       {/* Modales */}
@@ -8897,7 +8898,49 @@ function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
   );
 }
 
-function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
+/* Contactos de un negocio: se pueden asociar después de crearlo, buscando
+   por nombre, correo o teléfono, y quitar con la ×. */
+function ContactosDelNegocio({ db, rec, onChange }) {
+  const [q, setQ] = useState("");
+  const ids = rec.contactIds || [];
+  const asociados = ids.map((cid) => db.contacts.find((c) => c.id === cid)).filter(Boolean);
+  const busca = norm(q.trim());
+  const opciones = busca
+    ? db.contacts.filter((c) => !ids.includes(c.id) && [titleOf("contact", c), c.props.email, c.props.phone].some((v) => v && norm(String(v)).includes(busca))).slice(0, 6)
+    : [];
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
+      <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>Contactos asociados</div>
+      {asociados.length === 0 && <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, marginBottom: 10 }}>Este negocio no tiene contactos todavía.</div>}
+      {asociados.map((c) => (
+        <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", gap: 8, borderBottom: "1px solid #F2F4F0" }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 12.5 }}>{titleOf("contact", c)}</div>
+            {(c.props.email || c.props.phone) && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{c.props.email || c.props.phone}</div>}
+          </div>
+          <button title="Quitar del negocio" onClick={() => onChange(ids.filter((x) => x !== c.id))} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.faint }}><X size={14} /></button>
+        </div>
+      ))}
+      <div style={{ position: "relative", marginTop: 10 }}>
+        <input className="crm-in" placeholder="Buscar contacto para asociar…" value={q} onChange={(e) => setQ(e.target.value)} style={inputStyle} />
+        {busca && (
+          <div style={{ marginTop: 6, border: `1px solid ${C.line}`, borderRadius: 7, overflow: "hidden" }}>
+            {opciones.length === 0 && <div style={{ padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint }}>Ningún contacto coincide.</div>}
+            {opciones.map((c) => (
+              <button key={c.id} onClick={() => { onChange([...ids, c.id]); setQ(""); }} className="crm-btn"
+                style={{ display: "flex", width: "100%", justifyContent: "space-between", gap: 8, padding: "8px 10px", border: "none", borderTop: `1px solid #F2F4F0`, background: C.panel, cursor: "pointer", textAlign: "left" }}>
+                <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.ink }}>{titleOf("contact", c)}</span>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{c.props.email || c.props.phone || ""}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit, onContactos }) {
   const { kind, id } = detail;
   const coll = kind === "contact" ? db.contacts : kind === "company" ? db.companies : db.deals;
   const rec = coll.find((r) => r.id === id);
@@ -8942,6 +8985,8 @@ function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
               </div>
             ))}
           </div>
+
+          {kind === "deal" && <ContactosDelNegocio db={db} rec={rec} onChange={(ids) => onContactos(id, ids)} />}
 
           {relatedDeals.length > 0 && (
             <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
