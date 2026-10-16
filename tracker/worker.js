@@ -16,6 +16,9 @@
    · /c/<id>?u=…   el enlace por el que pasan los enlaces del correo. Anota el
                    clic y redirige de inmediato al destino real.
 
+   · /b/<id>?s=…   darse de baja de los envíos masivos. Anota la baja; el CRM
+                   la recoge con el resto de eventos.
+
    Y una tercera para el CRM: /eventos, que entrega lo anotado desde una fecha.
    Ésa sí pide clave.
 
@@ -470,8 +473,19 @@ async function whatsappEnviar(env, cuerpo) {
       },
       "WhatsApp",
     );
-    return { id: ((r.messages || [])[0] || {}).id || "", a };
+    const id = ((r.messages || [])[0] || {}).id || "";
+    /* "Aceptado" sólo quiere decir que Meta lo puso en cola. Si después no
+       lo puede entregar —sin método de pago, el límite de plantillas de
+       marketing por persona, la ventana de 24 horas— lo avisa por el webhook,
+       casi siempre en un par de segundos. Se espera ese rato, como con Twilio. */
+    for (let i = 0; id && i < 4; i++) {
+      await new Promise((ok) => setTimeout(ok, 600));
+      const f = await env.EVENTOS.get(`wx:${id}`, "json");
+      if (f) throw new Aviso(waFallo(f.codigo, f.detalle, cuerpo.plantilla), 409);
+    }
+    return { id, a };
   } catch (e) {
+    if (e instanceof Aviso && e.status === 409) throw e;
     /* 131047 y 131026 son los dos que le van a pasar a cualquiera, y el texto
        de Meta no explica qué hacer. Aquí sí. */
     const m = String((e && e.message) || "");
@@ -493,6 +507,19 @@ async function whatsappEnviar(env, cuerpo) {
     }
     throw e;
   }
+}
+
+/* Los fallos que Meta avisa después de aceptar un mensaje, en palabras. */
+function waFallo(codigo, detalle, plantilla) {
+  const c = Number(codigo);
+  if (c === 131047) return "Esta persona no te ha escrito en las últimas 24 horas, así que Meta no deja mandarle texto libre. Usa una plantilla aprobada.";
+  if (c === 131026) return "Ese número no tiene WhatsApp, o no puede recibir mensajes de empresas.";
+  if (c === 131042) return "Meta no lo entregó por un problema de pago: la cuenta de WhatsApp no tiene un método de pago válido (código 131042).";
+  if (c === 131049) return "Meta no lo entregó para no saturar a esta persona con mensajes de marketing. Prueba más tarde o con otra plantilla (código 131049).";
+  if (c === 131050) return "Esta persona pidió dejar de recibir mensajes de marketing de tu empresa (código 131050).";
+  if (c === 130472) return "Meta no lo entregó: el número está en un experimento de Meta que limita los mensajes de marketing (código 130472).";
+  if (c === 132001) return `Meta no encuentra la plantilla «${plantilla}» en ese idioma (código 132001).`;
+  return `Meta aceptó el mensaje pero no lo entregó: ${detalle || "sin detalle"} (código ${c || "sin número"}).`;
 }
 
 /* ── Las plantillas que Meta ya aprobó ──
@@ -624,6 +651,91 @@ async function subirEjemploMeta(env, id) {
   );
   if (!subida.h) throw new Aviso("Meta no devolvió la imagen subida. Prueba otra vez.");
   return subida.h;
+}
+
+/* ════════════════════════════════════════════════════════════
+   Instagram — publicar lo que sale del Estudio
+   ════════════════════════════════════════════════════════════
+   La cuenta de Instagram profesional cuelga de la página de Facebook, así que
+   no hace falta otro token: se habla con el de la página. Lo que sí hace falta
+   es que el token del usuario de sistema lleve instagram_basic e
+   instagram_content_publish, y que la cuenta de Instagram esté asignada.
+
+   Publicar son dos pasos: un "contenedor" con la imagen y el texto, que
+   Instagram procesa por su cuenta, y la publicación de ese contenedor. La
+   imagen la descarga Instagram de la misma dirección pública que usa Meta para
+   las plantillas. */
+const IG_CUENTA = "meta:ig-cuenta";
+
+async function cuentaInstagram(env, token) {
+  if (env.IG_USER_ID) return env.IG_USER_ID;
+  const guardada = await env.EVENTOS.get(IG_CUENTA);
+  if (guardada) return guardada;
+  const r = await graph(`/${env.META_PAGE_ID}`, { fields: "instagram_business_account" }, token);
+  const id = r.instagram_business_account && r.instagram_business_account.id;
+  if (!id) {
+    throw new Aviso(
+      `La página ${env.META_PAGE_ID} no tiene una cuenta de Instagram profesional vinculada, o el token no la alcanza. ` +
+      "Vincúlala en la página → Configuración → Cuentas vinculadas, y asígnala al usuario de sistema en " +
+      "Configuración del negocio → Usuarios del sistema → Asignar activos → Cuentas de Instagram.",
+      502,
+    );
+  }
+  await env.EVENTOS.put(IG_CUENTA, id, { expirationTtl: 86400 });
+  return id;
+}
+
+async function instagramPublicar(env, url, c) {
+  if (!env.META_TOKEN && !env.META_PAGE_TOKEN) throw falta("el token de Meta", { secretos: ["META_TOKEN"] });
+  if (!env.META_PAGE_ID) throw falta("el id de la página de Facebook", { vars: ["META_PAGE_ID"] });
+
+  const id = String(c.imagen || "");
+  if (!/^[a-f0-9]{32}$/.test(id)) throw new Aviso("Falta la imagen de la publicación.");
+  const img = await env.EVENTOS.getWithMetadata(IMG + id, { type: "stream" });
+  if (!img.value) throw new Aviso("No encuentro la imagen en el puente. Vuelve a prepararla.");
+  img.value.cancel();
+  if (img.metadata && img.metadata.tipo !== "image/jpeg") throw new Aviso("Instagram sólo publica imágenes JPG.");
+
+  /* Los topes de Instagram, dichos antes de que los diga él a medio publicar. */
+  const texto = String(c.texto || "").trim();
+  if (texto.length > 2200) throw new Aviso(`El texto tiene ${texto.length} caracteres; Instagram acepta hasta 2.200.`);
+  if ((texto.match(/#[\p{L}\p{N}_]+/gu) || []).length > 30) throw new Aviso("Instagram acepta hasta 30 hashtags por publicación.");
+
+  const token = await tokenDePagina(env);
+  const ig = await cuentaInstagram(env, token);
+  const post = (ruta, params) => pedirJson(
+    `https://graph.facebook.com/${META_V}${ruta}`,
+    { method: "POST", body: new URLSearchParams({ ...params, access_token: token }) },
+    "Instagram",
+  );
+
+  try {
+    const contenedor = await post(`/${ig}/media`, { image_url: `${url.origin}/wa/imagen/${id}`, caption: texto });
+    /* Una imagen suele quedar lista en un par de segundos. Si pasa de quince,
+       se avisa en vez de esperar sin límite: el contenedor caduca solo. */
+    for (let i = 0; ; i++) {
+      const s = await graph(`/${contenedor.id}`, { fields: "status_code,status" }, token);
+      if (s.status_code === "FINISHED") break;
+      if (s.status_code === "ERROR" || s.status_code === "EXPIRED") {
+        throw new Aviso(`Instagram no pudo procesar la imagen: ${s.status || s.status_code}.`, 502);
+      }
+      if (i >= 10) throw new Aviso("Instagram sigue procesando la imagen. Prueba a publicar otra vez en un minuto.", 504);
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+    const pub = await post(`/${ig}/media_publish`, { creation_id: contenedor.id });
+    const info = await graph(`/${pub.id}`, { fields: "permalink" }, token).catch(() => ({}));
+    return { id: pub.id, permalink: info.permalink || "" };
+  } catch (e) {
+    /* (#10) y (#200) son permisos: el mensaje de Meta no dice cuál falta. */
+    if (/código (10|200)\b/.test(String((e && e.message) || ""))) {
+      throw new Aviso(
+        "El token de Meta no tiene permiso para publicar en Instagram. Genera otro para el usuario de sistema con " +
+        "instagram_basic e instagram_content_publish, y guárdalo con wrangler secret put META_TOKEN.",
+        502,
+      );
+    }
+    throw e;
+  }
 }
 
 const NOMBRE_PLANTILLA = /^[a-z0-9_]{1,512}$/;
@@ -763,13 +875,27 @@ async function whatsappWebhook(req, env, ctx) {
   try { aviso = JSON.parse(crudo); } catch (_) { return new Response("", { status: 400 }); }
 
   const mensajes = [];
+  const fallos = [];
   for (const entrada of aviso.entry || []) {
     for (const cambio of entrada.changes || []) {
       const v = cambio.value || {};
       /* Sólo lo que llega a nuestro número. Los avisos de entregado y leído
          también pasan por aquí, pero guardarlos gastaría tres escrituras por
-         cada mensaje que sale, y el plan gratuito da mil al día. */
+         cada mensaje que sale, y el plan gratuito da mil al día. Los de
+         fallido sí se guardan: son pocos, y sin ellos un mensaje que Meta
+         aceptó y luego no entregó se queda como enviado. */
       if (env.WA_PHONE_ID && v.metadata && v.metadata.phone_number_id && v.metadata.phone_number_id !== env.WA_PHONE_ID) continue;
+      for (const st of v.statuses || []) {
+        if (st.status !== "failed" || !st.id) continue;
+        const e = (st.errors || [])[0] || {};
+        const fallo = {
+          codigo: e.code || 0,
+          detalle: (e.error_data && e.error_data.details) || e.message || e.title || "",
+          a: st.recipient_id || "",
+        };
+        console.log("WhatsApp no entregó", st.id, JSON.stringify(fallo));
+        fallos.push([st.id, fallo]);
+      }
       const nombres = new Map((v.contacts || []).map((c) => [c.wa_id, (c.profile && c.profile.name) || ""]));
       for (const m of v.messages || []) {
         if (m.type === "reaction" || !m.id || !m.from) continue;
@@ -786,6 +912,10 @@ async function whatsappWebhook(req, env, ctx) {
   }
 
   guardarRecibidos(env, ctx, mensajes);
+  if (fallos.length) {
+    ctx.waitUntil(Promise.all(fallos.map(([id, f]) =>
+      env.EVENTOS.put(`wx:${id}`, JSON.stringify(f), { expirationTtl: 60 * 60 * 24 * 7 }))));
+  }
   return new Response("", { status: 200 });
 }
 
@@ -1363,6 +1493,7 @@ async function estadoPuente(env) {
     meta: {
       leads: Boolean((env.META_PAGE_TOKEN || env.META_TOKEN) && env.META_PAGE_ID),
       metricas: Boolean(env.META_TOKEN && env.META_AD_ACCOUNT),
+      instagram: Boolean((env.META_PAGE_TOKEN || env.META_TOKEN) && env.META_PAGE_ID),
     },
     whatsapp: conTwilio(env) ? {
       proveedor: "twilio",
@@ -1411,9 +1542,40 @@ export default {
       return twilioWebhook(req, env, ctx);
     }
 
+    /* ── Darse de baja ──
+       La dirección que va en la cabecera List-Unsubscribe y al pie de los
+       envíos masivos. Gmail y Yahoo la piden a quien manda en volumen, y sin
+       ella al que no quiere tus correos sólo le queda el botón de spam, que es
+       lo que de verdad hunde una cuenta.
+
+       El POST es la baja con un clic (RFC 8058): lo manda el propio Gmail
+       cuando alguien pulsa "Anular suscripción", sin abrir nada. El GET sólo
+       enseña un botón para confirmar, y es a propósito: los filtros de
+       seguridad de muchas empresas abren todos los enlaces de un correo para
+       revisarlos, y si con abrirlo bastara darían de baja a medio mundo.
+
+       El identificador es el de la ficha en el CRM, firmado con la clave para
+       que nadie dé de baja a otro inventándose el número. */
+    const baja = ruta.match(/^\/b\/([A-Za-z0-9_-]{1,64})$/);
+    if (baja) {
+      if (req.method !== "GET" && req.method !== "POST") return new Response("", { status: 405 });
+      if (!env.CLAVE) return new Response("", { status: 500 });
+      const s = url.searchParams.get("s") || "";
+      if (!igual(s, await firmar(env.CLAVE, `baja|${baja[1]}`))) {
+        return pagina("Enlace no válido", "<p>Este enlace de baja no está completo. Responde al correo pidiendo la baja y te sacamos de la lista.</p>");
+      }
+      if (req.method === "GET") {
+        return pagina("¿Dejar de recibir estos correos?",
+          `<form method="post"><p>Pulsa el botón y no te volveremos a escribir a esta dirección.</p>` +
+          `<button type="submit" style="font:inherit;padding:.6em 1.2em;border-radius:6px;border:0;background:#0E5C4F;color:#fff;cursor:pointer">Darme de baja</button></form>`);
+      }
+      ctx.waitUntil(anotar(env, { rid: baja[1], tipo: "baja", ...contexto(req) }));
+      return pagina("Listo", "<p>No volverás a recibir estos correos. Puedes cerrar esta pestaña.</p>");
+    }
+
     /* Todo aquí se pide con GET menos una cosa: mandar un WhatsApp lleva
        texto de por medio y eso no cabe con dignidad en una dirección. */
-    const esEnvio = ruta === "/wa/enviar" || ruta === "/wa/plantillas/crear" || ruta === "/wa/imagen";
+    const esEnvio = ruta === "/wa/enviar" || ruta === "/wa/plantillas/crear" || ruta === "/wa/imagen" || ruta === "/ig/publicar";
     if (req.method === "POST" ? !esEnvio : req.method !== "GET" && req.method !== "HEAD") {
       return json({ error: "Método no permitido en esta dirección." }, 405);
     }
@@ -1473,7 +1635,7 @@ export default {
        Todo lo de aquí abajo pide la misma clave del medidor, menos /gads/vuelta,
        que la abre Google y no puede llevarla: ésa se protege con el nonce de un
        solo uso que creó /gads/entrar. */
-    if (ruta.startsWith("/meta/") || ruta.startsWith("/gads/") || ruta.startsWith("/wa/") || ruta === "/puente/salud") {
+    if (ruta.startsWith("/meta/") || ruta.startsWith("/gads/") || ruta.startsWith("/wa/") || ruta.startsWith("/ig/") || ruta === "/puente/salud") {
       if (ruta === "/gads/vuelta") {
         try { return await gadsVuelta(env, url); }
         catch (e) { return pagina("No se pudo terminar", `<p>${(e && e.message) || e}</p>`); }
@@ -1504,6 +1666,11 @@ export default {
           return json(await whatsappCrearPlantilla(env, cuerpo));
         }
         if (ruta === "/wa/mensajes") return json(await whatsappRecibidos(env, desde));
+        if (ruta === "/ig/publicar") {
+          let cuerpo = {};
+          try { cuerpo = await req.json(); } catch (_) { return json({ error: "El cuerpo no es JSON." }, 400); }
+          return json(await instagramPublicar(env, url, cuerpo));
+        }
       } catch (e) {
         /* Un Aviso trae un mensaje pensado para que lo lea una persona y su
            propio código; cualquier otro error se enseña tal cual antes que

@@ -49,7 +49,7 @@ export const DEFAULT_INTEGRATIONS = {
   /* "enlace" abre WhatsApp con el texto puesto y tú das el último clic;
      "api" lo manda solo, por el puente. Ver WHATSAPP_MODES, más abajo. */
   whatsapp: { countryCode: "57", modo: "enlace" },
-  email: { mode: "gmailCompose", clientId: CLIENT_ID_SEMILLA, account: "", signature: "", leerBandeja: false },
+  email: { mode: "gmailCompose", clientId: CLIENT_ID_SEMILLA, account: "", signature: "", leerBandeja: false, topeDiario: 150 },
   /* La dirección del puente y su clave. Están aquí arriba y no dentro de una
      conexión concreta porque es un solo servicio para todo lo que no cabe en
      el navegador: medir correos, traer leads y mandar WhatsApp. */
@@ -106,6 +106,10 @@ export function normalizeIntegrations(raw) {
       /* Leer la bandeja es un permiso aparte y se pide sólo si se activa: sin
          esto el CRM nunca ve nada de lo que llega, únicamente lo que manda. */
       leerBandeja: Boolean(e.leerBandeja),
+      /* Cuántos correos salen como mucho en un día, contando todo lo que se
+         manda desde la cuenta. Gmail deja unos 500 (Workspace, 2.000), pero
+         rozar ese tope a diario ya es lo que mira su filtro de spam. */
+      topeDiario: Math.min(2000, Math.max(1, Math.round(Number(e.topeDiario)) || 150)),
     },
     medicion: {
       /* Espejo de `puente`, no un segundo sitio donde escribirlos. Todo lo que
@@ -368,8 +372,13 @@ function extraerImagenes(html) {
   return { html: con, partes };
 }
 
-export function buildMime({ to, subject, body, html }) {
+export function buildMime({ to, subject, body, html, baja }) {
   const cabeceras = [`To: ${header(to)}`, `Subject: ${header(subject)}`, "MIME-Version: 1.0"];
+  /* La baja con un clic: con estas dos cabeceras Gmail pone "Anular
+     suscripción" junto al remitente y avisa él mismo al medidor. Es lo que
+     Gmail y Yahoo exigen a quien manda en volumen, y lo que evita que el que
+     ya no quiere tus correos tenga que pulsar "Spam" para dejar de verlos. */
+  if (baja) cabeceras.push(`List-Unsubscribe: <${baja}>`, "List-Unsubscribe-Post: List-Unsubscribe=One-Click");
   /* Se aligera antes de armarlo: los scripts que trae un diseño exportado de
      la web no los ejecuta ningún lector de correo, pero sí cuentan para el
      peso, y el peso es lo que hace que Gmail lo recorte. Ver aligerarHtml,
@@ -471,12 +480,12 @@ const enEspera = (ms) => {
 /* Envía de verdad. Devuelve el id del mensaje en Gmail. No se pone cabecera
    From: Gmail usa la cuenta que dio el permiso, que es justo lo que se quiere.
    El correo queda en Enviados como cualquier otro. */
-export async function sendGmail({ to, subject, body, html, clientId }) {
+export async function sendGmail({ to, subject, body, html, baja, clientId }) {
   const dest = String(to || "").trim();
   if (!dest) throw new Error("El destinatario no tiene correo.");
   /* El mensaje se arma una sola vez: reintentar es volver a mandar lo mismo,
      no volver a componerlo. */
-  const raw = b64url(buildMime({ to: dest, subject, body, html }));
+  const raw = b64url(buildMime({ to: dest, subject, body, html, baja }));
 
   for (let intento = 0; ; intento++) {
     const token = await validToken(clientId);

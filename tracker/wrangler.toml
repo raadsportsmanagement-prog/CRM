@@ -3,6 +3,13 @@ main = "worker.js"
 account_id = "37a4f1c5346b8417a7e4d73114b5b281" # cuenta ivan@raadsports.com, la misma del CRM
 compatibility_date = "2025-01-01"
 
+# Una dirección del dominio propio, y no la de workers.dev: ésa la comparten
+# miles de remitentes —spammers incluidos— y los filtros desconfían de los
+# enlaces que llevan a ella. La de workers.dev sigue viva para que los enlaces
+# de los correos ya enviados no se rompan.
+routes = [{ pattern = "go.raadsports.com", custom_domain = true }]
+workers_dev = true
+
 # Donde se anotan los eventos. Crea el espacio con:
 #   npx wrangler kv namespace create EVENTOS
 # y pega abajo el id que imprime.

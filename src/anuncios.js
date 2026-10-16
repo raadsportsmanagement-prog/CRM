@@ -93,6 +93,16 @@ export const crearPlantillaWa = ({ base, clave, plantilla }) =>
     body: JSON.stringify(plantilla),
   });
 
+/* Publica en el Instagram de la página una imagen ya subida con subirImagenWa
+   (su id) y su texto. Sale publicada en el momento, a la vista de todos.
+   Devuelve {id, permalink}. */
+export const publicarInstagram = ({ base, clave, imagen, texto }) =>
+  pedir(base, clave, "/ig/publicar", {}, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ imagen, texto }),
+  });
+
 /* Lo que te escribieron por WhatsApp desde una marca. La marca es la hora del
    puente, no la de este computador: así un reloj atrasado aquí no hace perder
    ni repetir nada. */

@@ -282,6 +282,69 @@ Mensaje de WhatsApp:\n${String(p.mensaje || "").slice(0, 2000)}`,
   return json({ correo: datos });
 }
 
+/* ── La versión para Instagram ──
+   La imagen no se rediseña: se recompone el SVG elegido en vertical (4:5, el
+   formato que más ocupa en el feed), con los mismos textos y elementos. El
+   texto es un pie de foto, no un mensaje: sin variables y sin enlaces, porque
+   en Instagram no se pueden pulsar. */
+async function adaptarInstagram(client, c) {
+  const svg = String(c.svg || "").slice(0, 40000);
+  if (!svg.includes("<svg")) return json({ error: "Falta el diseño que hay que adaptar." }, 400);
+  const r = await client.beta.messages.create({
+    model: MODELO,
+    max_tokens: 16000,
+    output_config: { effort: "medium" },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    system: SISTEMA,
+    messages: [{ role: "user", content: `Este es el SVG de una imagen horizontal de 1200×628:
+
+${svg}
+
+Recompónlo como publicación vertical de Instagram de 1080×1350: <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1080" height="1350" viewBox="0 0 1080 1350">.
+- Mismos textos, colores, tipografías, elementos gráficos y estilo: que se reconozca como la misma pieza. Reacomoda las posiciones para el formato alto; no estires nada.
+- El logo sigue como <image href="LOGO" .../> con su proporción 3.53:1 y preserveAspectRatio="xMidYMid meet".
+${c.conFoto ? '- La foto de fondo cubre todo el lienzo: <image href="FOTO" x="0" y="0" width="1080" height="1350" preserveAspectRatio="xMidYMid slice"/>, con el degradado encima.\n' : ""}- El titular puede crecer y partirse en más líneas; deja 80 px de margen y nada importante en los 120 px de abajo.
+- Nada de <script>, <foreignObject>, enlaces externos ni fuentes externas.
+Devuelve sólo el SVG completo, sin nada antes ni después.` }],
+  });
+  if (r.stop_reason === "refusal") return json({ error: "Claude no quiso adaptar esta imagen." }, 422);
+  const t = textoDe(r);
+  const i0 = t.indexOf("<svg"), i1 = t.lastIndexOf("</svg>");
+  if (i0 < 0 || i1 < 0) return json({ error: "Claude no devolvió el diseño para Instagram. Prueba otra vez." }, 502);
+  return json({ svg: t.slice(i0, i1 + 6) });
+}
+
+async function instagram(client, c) {
+  const p = c.propuesta && typeof c.propuesta === "object" ? c.propuesta : {};
+  const anterior = String(c.anterior || "").trim().slice(0, 4000);
+  const instruccion = String(c.instruccion || "").trim().slice(0, 1000);
+  const pedido = [
+    marcaDe(c.marca),
+    anterior && instruccion
+      ? `Texto actual de la publicación de Instagram:\n${anterior}\n\nAplica sólo este cambio y conserva el resto lo más igual posible: ${instruccion}`
+      : `Convierte este mensaje de WhatsApp en el texto de una publicación de Instagram de la marca, con el mismo contenido e intención.
+Título de la pieza: ${p.titulo || ""}
+Titular de la imagen: ${(p.imagen && p.imagen.titular) || ""}
+Mensaje de WhatsApp:\n${String(p.mensaje || "").slice(0, 2000)}`,
+    `Reglas: la primera línea engancha por sí sola (es lo único que se ve sin pulsar "más"). Párrafos cortos separados por una línea en blanco. Sin variables como {{nombre}}: le habla a toda la audiencia. Sin formato de WhatsApp (*negrita*, _cursiva_). Sin enlaces: si hay que llevar a algún sitio, di "link en la bio". Como mucho cuatro emojis. Cierra con una línea de 5 a 10 hashtags relevantes, en español y en inglés si aplica. Máximo 1.500 caracteres en total.
+Devuelve sólo el texto final.`,
+  ].filter(Boolean).join("\n\n");
+  const r = await client.beta.messages.create({
+    model: MODELO,
+    max_tokens: 4000,
+    output_config: { effort: "medium" },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    system: SISTEMA,
+    messages: [{ role: "user", content: pedido }],
+  });
+  if (r.stop_reason === "refusal") return json({ error: "Claude no quiso preparar esta publicación." }, 422);
+  const texto = textoDe(r).trim();
+  if (!texto) return json({ error: "Claude no devolvió el texto. Prueba otra vez." }, 502);
+  return json({ texto });
+}
+
 export async function atenderEstudio(req, env) {
   if (req.method !== "POST") return json({ error: "Método no permitido" }, 405);
   if (!env.ANTHROPIC_API_KEY) return json({ error: "Falta conectar Claude: agrega el secreto ANTHROPIC_API_KEY al Worker (ver nube/README.md)." }, 503);
@@ -294,6 +357,8 @@ export async function atenderEstudio(req, env) {
     if (c.accion === "imagen") return await imagen(client, c);
     if (c.accion === "ajustarMensaje") return await ajustarMensaje(client, c);
     if (c.accion === "correo") return await correo(client, c);
+    if (c.accion === "adaptarInstagram") return await adaptarInstagram(client, c);
+    if (c.accion === "instagram") return await instagram(client, c);
     return json({ error: "Acción desconocida" }, 400);
   } catch (e) {
     if (e instanceof Anthropic.AuthenticationError) return json({ error: "La clave de Claude no es válida. Revisa el secreto ANTHROPIC_API_KEY." }, 502);

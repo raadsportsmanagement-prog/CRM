@@ -7,7 +7,7 @@ import {
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
   Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
-  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus, Save
+  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus, Save, Instagram
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -18,9 +18,10 @@ import {
 } from "./integrations.js";
 import {
   midiendo, nuevoTrk, marcarHtml, textoAHtml, traerEventos, estadoDe,
+  puedeDarBaja, enlaceBaja, pieBajaTexto, pieBajaHtml,
 } from "./tracking.js";
 import {
-  traerLeads, traerCampanas, enviarWhatsApp, probarPuente, traerPlantillasWa, crearPlantillaWa, subirImagenWa, traerWhatsApp,
+  traerLeads, traerCampanas, enviarWhatsApp, probarPuente, traerPlantillasWa, crearPlantillaWa, subirImagenWa, publicarInstagram, traerWhatsApp,
   leadAProps, leadATexto, leadAAsunto, nombrePlataforma, partirNombre,
 } from "./anuncios.js";
 import {
@@ -83,11 +84,19 @@ const LEAD_STATUS = ["Nuevo", "Abierto", "Intento de contacto", "Conectado", "Ca
 /* Estado de la dirección de correo. No lo escribe nadie a mano: lo pone el
    barrido de Gmail cuando vuelve un rebote, y el medidor cuando alguien abre o
    pincha —que es la prueba de que el correo sí llegó—. */
-const MAIL_STATUS = ["Entregado", "Rebote temporal", "Rebotado"];
+const MAIL_STATUS = ["Entregado", "Rebote temporal", "Rebotado", "Dado de baja"];
 /* Un rebote definitivo no lo borra una apertura vieja que llegue tarde: el
-   estado sólo sube de rango, nunca baja solo. */
-const RANGO_MAIL = { "": 0, Entregado: 1, "Rebote temporal": 2, Rebotado: 3 };
+   estado sólo sube de rango, nunca baja solo. La baja es lo más alto: la pidió
+   la persona, y ninguna apertura posterior la deshace. */
+const RANGO_MAIL = { "": 0, Entregado: 1, "Rebote temporal": 2, Rebotado: 3, "Dado de baja": 4 };
 const peorEstado = (a, b) => ((RANGO_MAIL[b] || 0) > (RANGO_MAIL[a] || 0) ? b : a || "");
+/* A quién no se le vuelve a escribir. Mandar a una dirección que ya rebotó, o a
+   alguien que pidió la baja, es lo que más rápido hunde la reputación de una
+   cuenta de correo. */
+const noSeEscribe = (r) => {
+  const e = (r && r.props && r.props.emailStatus) || "";
+  return e === "Rebotado" || e === "Dado de baja";
+};
 const LEAD_SOURCE = ["Meta Lead Ads", "Google Lead Form", "Facebook", "Instagram", "WhatsApp", "Sitio web", "Referido", "Evento", "Carga masiva", "Manual", "Llamada entrante"];
 
 const BASE_SCHEMA = {
@@ -1106,13 +1115,14 @@ export default function CRM() {
      idea. Un evento cuyo envío ya no exista en el cuaderno se descarta sin
      ruido; su actividad pudo borrarse hace meses. */
   const aplicarEventos = (eventos) => {
+    const bajas = aplicarBajas(eventos);
     const porTrk = new Map();
     for (const e of eventos || []) {
       if (!e || !e.trk || !e.at) continue;
       if (!porTrk.has(e.trk)) porTrk.set(e.trk, []);
       porTrk.get(e.trk).push(e);
     }
-    if (!porTrk.size) return 0;
+    if (!porTrk.size) return bajas;
 
     /* Se pide con un minuto de solape, así que los mismos eventos vuelven a
        llegar en cada pasada: sin esta comparación, un contacto acumularía una
@@ -1157,7 +1167,7 @@ export default function CRM() {
          que el correo llegó a un buzón de verdad y alguien lo tenía delante. */
       [...(a.contactIds || []), ...(a.companyIds || [])].forEach((id) => entregados.add(id));
     }
-    if (!cambios.size) return 0;
+    if (!cambios.size) return bajas;
 
     const sellar = (arr) => arr.map((r) => (
       entregados.has(r.id) && peorEstado(r.props.emailStatus, "Entregado") !== r.props.emailStatus
@@ -1189,7 +1199,25 @@ export default function CRM() {
         });
       }
     }
-    return cambios.size;
+    return cambios.size + bajas;
+  };
+
+  /* ── Los que pidieron la baja ──
+     El medidor anota la ficha y nada más; aquí se la marca para que ningún
+     envío masivo ni automatización le vuelva a escribir. Se recorren las dos
+     colecciones porque el identificador no dice si es contacto o empresa. */
+  const aplicarBajas = (eventos) => {
+    const ids = new Set((eventos || []).filter((e) => e && e.tipo === "baja" && e.rid).map((e) => String(e.rid)));
+    if (!ids.size) return 0;
+    const actual = dbRef.current || db || {};
+    const nuevas = [...(actual.contacts || []), ...(actual.companies || [])]
+      .filter((r) => ids.has(r.id) && r.props.emailStatus !== "Dado de baja").length;
+    if (!nuevas) return 0;
+    const sellar = (arr) => arr.map((r) => (
+      ids.has(r.id) ? { ...r, props: { ...r.props, emailStatus: "Dado de baja" } } : r
+    ));
+    setDb((d) => ({ ...d, contacts: sellar(d.contacts), companies: sellar(d.companies) }));
+    return nuevas;
   };
 
   /* ── Los que no llegaron ──
@@ -1415,6 +1443,10 @@ export default function CRM() {
       return { ok: true, texto: `${r.solo ? "WhatsApp enviado a" : "WhatsApp abierto para"} ${titleOf(ent, rec)}` };
     }
 
+    if (noSeEscribe(rec)) {
+      return { ok: false, err: `${titleOf(ent, rec)} está como «${rec.props.emailStatus}»: no se le vuelve a escribir por correo.` };
+    }
+
     const to = String(rec.props.email || "").trim();
     if (!to) return { ok: false, err: "El contacto no tiene correo." };
 
@@ -1444,12 +1476,17 @@ export default function CRM() {
         aperturas: integ.medicion.aperturas, clics: integ.medicion.clics,
       });
     }
+    /* Una automatización es envío masivo a cámara lenta: lleva la baja igual
+       que una campaña. */
+    const baja = puedeDarBaja(integ.medicion) ? await enlaceBaja(integ.medicion, p.recId) : "";
+    const cuerpoEnvio = baja ? pieBajaTexto(cuerpo, baja) : cuerpo;
+    if (baja) html = pieBajaHtml(html || textoAHtml(cuerpo), baja);
     /* Con el identificador de Gmail el barrido lo reconoce en Enviados y no
        lo mete dos veces. Va aparte de `ext`, que es la marca de lo traído de
        fuera: el resumen de envíos cuenta justo lo que no la tiene. */
     let gid = "";
     try {
-      gid = await sendGmail({ to, subject: asunto, body: cuerpo, html, clientId: integ.email.clientId });
+      gid = await sendGmail({ to, subject: asunto, body: cuerpoEnvio, html, baja, clientId: integ.email.clientId });
     } catch (e) {
       return { ok: false, err: (e && e.message) || String(e) };
     }
@@ -4809,8 +4846,9 @@ const cargarLogoSvg = () => {
   return logoSvg;
 };
 
-/* SVG de Claude → JPG de 1200×628 listo para el encabezado. */
-async function svgAJpg(svg, foto) {
+/* SVG de Claude → JPG listo para subir: 1200×628 para el encabezado, o el
+   tamaño que se pida (1080×1350 para Instagram). */
+async function svgAJpg(svg, foto, ancho = 1200, alto = 628) {
   const [fuentes, logo] = await Promise.all([cargarFuentesSvg().catch(() => ""), cargarLogoSvg()]);
   let doc = String(svg)
     .replace(/(xlink:)?href="LOGO"/g, `href="${logo}"`)
@@ -4822,14 +4860,14 @@ async function svgAJpg(svg, foto) {
     img.src = url;
     await img.decode();
     const lienzo = document.createElement("canvas");
-    lienzo.width = 1200; lienzo.height = 628;
+    lienzo.width = ancho; lienzo.height = alto;
     const ctx = lienzo.getContext("2d");
     ctx.fillStyle = "#002B3D";
-    ctx.fillRect(0, 0, 1200, 628);
-    ctx.drawImage(img, 0, 0, 1200, 628);
+    ctx.fillRect(0, 0, ancho, alto);
+    ctx.drawImage(img, 0, 0, ancho, alto);
     const blob = await new Promise((ok) => lienzo.toBlob(ok, "image/jpeg", 0.9));
     if (!blob) throw new Error("No se pudo convertir el diseño en imagen.");
-    return new File([blob], "encabezado.jpg", { type: "image/jpeg" });
+    return new File([blob], ancho === 1200 ? "encabezado.jpg" : "instagram.jpg", { type: "image/jpeg" });
   } catch (e) {
     throw new Error("El diseño que devolvió Claude no se pudo pintar. Pide otro.");
   } finally {
@@ -4946,18 +4984,22 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [verMarca, setVerMarca] = useState(!marca);
   const [ajusteMsg, setAjusteMsg] = useState("");
   const [textosImg, setTextosImg] = useState(m.textosImg || { titular: "", apoyo: "", etiqueta: "" });
-  const [canales, setCanales] = useState(m.canales || { wa: true, correo: false });
+  const [canales, setCanales] = useState(m.canales || { wa: true, correo: false, ig: false });
   const [correo, setCorreo] = useState(m.correo || null);
   const [ctaUrl, setCtaUrl] = useState(m.ctaUrl ?? ((marca.match(/https:\/\/\S+/) || [])[0] || ""));
   const [ajusteCorreo, setAjusteCorreo] = useState("");
-  const [hecho, setHecho] = useState(m.hecho || { wa: false, correo: false });
+  const [hecho, setHecho] = useState(m.hecho || { wa: false, correo: false, ig: false });
+  /* La publicación de Instagram: su imagen vertical (sacada del diseño
+     marcado, `de`), su texto, la subida al puente y, ya publicada, el enlace. */
+  const [ig, setIg] = useState(m.ig || null);
+  const [ajusteIg, setAjusteIg] = useState("");
   const [borradorId, setBorradorId] = useState(m.borradorId || null);
   const [historial, setHistorial] = useState([]);
   const [verHistorial, setVerHistorial] = useState(false);
 
   useEffect(() => {
-    memoriaEstudio = { fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId };
-  }, [fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, borradorId]);
+    memoriaEstudio = { fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId };
+  }, [fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId]);
 
   useEffect(() => { listarBorradores().then(setHistorial).catch(() => {}); }, []);
 
@@ -4970,6 +5012,7 @@ function EstudioView({ db, setDb, say, onListo }) {
         id, actualizado: nowISO(),
         titulo: (draft && draft.name.trim()) || brief.trim().slice(0, 70) || "Sin título",
         fuente, brief, tandas, vista, tandaElegida, elegida, foto, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho,
+        ig: ig && { ...ig, vista: undefined },
         disenos: disenos.map(({ svg, archivo, textos, variante, ronda, para }) => ({ svg, archivo, textos, variante, ronda, para })),
       }));
       setBorradorId(id);
@@ -4983,7 +5026,7 @@ function EstudioView({ db, setDb, say, onListo }) {
   useEffect(() => {
     const a = hechoAntes.current;
     hechoAntes.current = hecho;
-    if ((hecho.wa && !a.wa) || (hecho.correo && !a.correo)) guardar(true);
+    if ((hecho.wa && !a.wa) || (hecho.correo && !a.correo) || (hecho.ig && !a.ig)) guardar(true);
   }, [hecho]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Lo mismo con cada respuesta de Claude: una tanda o un diseño nuevo se
@@ -4998,7 +5041,7 @@ function EstudioView({ db, setDb, say, onListo }) {
   }, [tandas.length, disenos.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const abrir = (b) => {
-    const h = b.hecho || { wa: false, correo: false };
+    const h = { wa: false, correo: false, ig: false, ...b.hecho };
     hechoAntes.current = h;
     /* Los borradores de antes del historial traen una sola tanda suelta. */
     const ts = b.tandas || (b.propuestas && b.propuestas.length ? [{ at: b.actualizado, fuente: b.fuente, brief: b.brief, propuestas: b.propuestas }] : []);
@@ -5009,9 +5052,10 @@ function EstudioView({ db, setDb, say, onListo }) {
     setTandas(ts); setVista(b.vista ?? ts.length - 1); setTandaElegida(te); setElegida(b.elegida ?? -1); setFoto(b.foto || "");
     setDisenos(ds);
     setDiseno(b.diseno ?? -1); setDraft(b.draft || null); setSubida(b.subida || null);
-    setTextosImg(b.textosImg || { titular: "", apoyo: "", etiqueta: "" }); setCanales(b.canales || { wa: true, correo: false });
+    setTextosImg(b.textosImg || { titular: "", apoyo: "", etiqueta: "" }); setCanales({ wa: true, correo: false, ig: false, ...b.canales });
     setCorreo(b.correo || null); setCtaUrl(b.ctaUrl || ""); setHecho(h);
-    setAjuste(""); setAjusteMsg(""); setAjusteCorreo(""); setErr(""); setVerHistorial(false);
+    setIg(b.ig ? { ...b.ig, vista: b.ig.archivo ? URL.createObjectURL(b.ig.archivo) : "" } : null);
+    setAjuste(""); setAjusteMsg(""); setAjusteCorreo(""); setAjusteIg(""); setErr(""); setVerHistorial(false);
   };
 
   const quitar = async (b) => {
@@ -5025,8 +5069,8 @@ function EstudioView({ db, setDb, say, onListo }) {
   const empezarOtra = () => {
     memoriaEstudio = null;
     setTandas([]); setVista(-1); setTandaElegida(-1); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
-    setCorreo(null); setHecho({ wa: false, correo: false }); setBrief(""); setFoto(""); setBorradorId(null);
-    hechoAntes.current = { wa: false, correo: false };
+    setCorreo(null); setIg(null); setHecho({ wa: false, correo: false, ig: false }); setBrief(""); setFoto(""); setBorradorId(null);
+    hechoAntes.current = { wa: false, correo: false, ig: false };
     cuentas.current = "0/0";
   };
 
@@ -5054,7 +5098,7 @@ function EstudioView({ db, setDb, say, onListo }) {
 
   const elegir = (i) => {
     const ultimo = disenos.reduce((u, d, j) => (d.para === `${vista}:${i}` ? j : u), -1);
-    setTandaElegida(vista); setElegida(i); setDiseno(ultimo); setSubida(null); setCorreo(null); setHecho({ wa: false, correo: false });
+    setTandaElegida(vista); setElegida(i); setDiseno(ultimo); setSubida(null); setCorreo(null); setIg(null); setHecho({ wa: false, correo: false, ig: false });
     const im = propuestas[i].imagen || {};
     setTextosImg({ titular: im.titular || "", apoyo: im.apoyo || "", etiqueta: im.etiqueta || "" });
     setDraft({ id: uid(), name: propuestas[i].titulo, subject: "", body: propuestas[i].mensaje, html: "", meta: null });
@@ -5134,6 +5178,70 @@ function EstudioView({ db, setDb, say, onListo }) {
     setBusy("");
   };
 
+  /* ── Instagram ──
+     La imagen sale del diseño marcado en el paso 3, recompuesta en vertical;
+     el texto, del mensaje elegido. Las dos cosas se piden a la vez y lo que
+     llegue se queda, aunque la otra falle. */
+  const propuestaActual = () => ({ ...p, mensaje: draft.body, imagen: { ...(p.imagen || {}), ...textosImg } });
+  const imagenIg = async (r) => {
+    const archivo = await svgAJpg(r.svg, foto, 1080, 1350);
+    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), subida: null };
+  };
+
+  const prepararIg = async (soloImagen) => {
+    setBusy("ig"); setErr("");
+    try {
+      const [im, tx] = await Promise.allSettled([
+        pedirEstudio({ accion: "adaptarInstagram", svg: disenos[diseno].svg, conFoto: Boolean(foto), marca }).then(imagenIg),
+        soloImagen ? Promise.resolve(null) : pedirEstudio({ accion: "instagram", propuesta: propuestaActual(), marca }),
+      ]);
+      setIg((x) => ({
+        texto: "", ...x,
+        ...(im.status === "fulfilled" ? { ...im.value, de: diseno } : {}),
+        ...(tx.status === "fulfilled" && tx.value ? { texto: tx.value.texto } : {}),
+      }));
+      const fallo = [im, tx].find((h) => h.status === "rejected");
+      if (fallo) throw fallo.reason;
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const ajustarIgImagen = async () => {
+    setBusy("igImagen"); setErr("");
+    try {
+      const r = await pedirEstudio({ accion: "imagen", propuesta: propuestaActual(), marca, conFoto: Boolean(foto), ajuste: ajusteIg.trim(), anterior: ig.svg });
+      const nueva = await imagenIg(r);
+      setIg((x) => ({ ...x, ...nueva }));
+      setAjusteIg("");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  const ajustarIgTexto = async () => {
+    setBusy("igTexto"); setErr("");
+    try {
+      const r = await pedirEstudio({ accion: "instagram", propuesta: propuestaActual(), marca, anterior: ig.texto, instruccion: ajusteIg.trim() });
+      setIg((x) => ({ ...x, texto: r.texto }));
+      setAjusteIg("");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
+  /* Esto sí sale en el momento y a la vista de todos, así que se pregunta. */
+  const publicarIg = async () => {
+    if (!window.confirm("Se publica ahora mismo en el Instagram de la marca, a la vista de todos. ¿Seguir?")) return;
+    setBusy("igPublicar"); setErr("");
+    try {
+      const sub = ig.subida || await subirImagenWa({ base: pu.base, clave: pu.clave, archivo: ig.archivo });
+      setIg((x) => ({ ...x, subida: sub }));
+      const r = await publicarInstagram({ base: pu.base, clave: pu.clave, imagen: sub.id, texto: ig.texto.trim() });
+      setIg((x) => ({ ...x, subida: sub, publicada: { id: r.id, permalink: r.permalink, en: nowISO() } }));
+      setHecho((h) => ({ ...h, ig: true }));
+      say("Publicada en Instagram.");
+    } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
+  };
+
   const elegirFoto = async (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
@@ -5172,7 +5280,7 @@ function EstudioView({ db, setDb, say, onListo }) {
               <div style={{ display: "flex", flexDirection: "column" }}>
                 {historial.map((b) => {
                   const h = b.hecho || {};
-                  const estado = [h.wa && "Enviada a Meta", h.correo && "Correo guardado"].filter(Boolean).join(" · ") || "Borrador";
+                  const estado = [h.wa && "Enviada a Meta", h.correo && "Correo guardado", h.ig && "Publicada en Instagram"].filter(Boolean).join(" · ") || "Borrador";
                   const nT = b.tandas ? b.tandas.length : (b.propuestas && b.propuestas.length ? 1 : 0);
                   const nD = (b.disenos || []).length;
                   const cuanto = [nT && `${nT} ${nT === 1 ? "tanda" : "tandas"}`, nD && `${nD} ${nD === 1 ? "diseño" : "diseños"}`].filter(Boolean).join(", ");
@@ -5345,8 +5453,8 @@ function EstudioView({ db, setDb, say, onListo }) {
             {tituloPaso(4, "Las plantillas")}
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <Field def={{ label: "Nombre de la pieza", type: "text" }} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
-              <div style={{ display: "flex", gap: 16, fontFamily: "var(--ui)", fontSize: 13 }}>
-                {[["wa", "WhatsApp (aprobación de Meta)"], ["correo", "Correo de marketing"]].map(([k, l]) => (
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontFamily: "var(--ui)", fontSize: 13 }}>
+                {[["wa", "WhatsApp (aprobación de Meta)"], ["correo", "Correo de marketing"], ["ig", "Instagram (publicación)"]].map(([k, l]) => (
                   <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
                     <input type="checkbox" checked={canales[k]} onChange={(e) => setCanales((c) => ({ ...c, [k]: e.target.checked }))} style={{ accentColor: C.jade }} />{l}
                   </label>
@@ -5402,7 +5510,60 @@ function EstudioView({ db, setDb, say, onListo }) {
                 </div>
               )}
 
-              {(hecho.wa || hecho.correo) && (
+              {canales.ig && (
+                <div style={{ background: "#F4F7F2", border: `1px solid ${C.line}`, borderRadius: 7, padding: "11px 12px", display: "flex", flexDirection: "column", gap: 9 }}>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, letterSpacing: ".02em" }}>VERSIÓN PARA INSTAGRAM</div>
+                  {hecho.ig && ig && ig.publicada ? (
+                    <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.jade }}>
+                      ✓ Publicada en Instagram{ig.publicada.en ? ` el ${new Date(ig.publicada.en).toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" })}` : ""}.
+                      {ig.publicada.permalink && <> <a href={ig.publicada.permalink} target="_blank" rel="noopener noreferrer" style={{ color: C.blue, textDecoration: "none" }}>Ver publicación ↗</a></>}
+                    </div>
+                  ) : diseno < 0 ? (
+                    <div style={nota}>Marca primero un diseño en el paso 3: la publicación sale de esa imagen, recompuesta en vertical (1080×1350).</div>
+                  ) : !ig || !ig.archivo ? (
+                    <div>
+                      <Btn size="sm" variant="solid" Icon={Instagram} disabled={Boolean(busy)} onClick={() => prepararIg(Boolean(ig && ig.texto))}>
+                        {busy === "ig" ? "Preparando…" : "Preparar la versión para Instagram"}
+                      </Btn>
+                      <div style={{ ...nota, marginTop: 6 }}>Claude pasa el diseño marcado a formato vertical y escribe el texto con hashtags. Tarda alrededor de un minuto.</div>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+                        <img src={ig.vista} alt="Imagen para Instagram" style={{ width: 240, maxWidth: "100%", borderRadius: 5, border: `1px solid ${C.line}` }} />
+                        <div style={{ flex: "1 1 280px", display: "flex", flexDirection: "column", gap: 4 }}>
+                          <textarea className="crm-in" rows={12} value={ig.texto} title="Texto de la publicación" placeholder="Texto de la publicación"
+                            onChange={(e) => setIg({ ...ig, texto: e.target.value })}
+                            style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: 12.5, resize: "vertical" }} />
+                          <div style={{ ...nota, color: ig.texto.length > 2200 ? C.clay : C.faint }}>{ig.texto.length} / 2.200 caracteres · los enlaces no se pueden pulsar en Instagram</div>
+                        </div>
+                      </div>
+                      {ig.de !== diseno && (
+                        <div style={{ ...nota, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          Esta imagen salió de otro diseño del paso 3.
+                          <Btn size="sm" variant="outline" Icon={RefreshCw} disabled={Boolean(busy)} onClick={() => prepararIg(true)}>{busy === "ig" ? "Rehaciendo…" : "Rehacerla con el marcado"}</Btn>
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <input className="crm-in" value={ajusteIg} onChange={(e) => setAjusteIg(e.target.value)} placeholder="Pídele un cambio, p. ej. logo más grande, menos hashtags, primera línea más directa"
+                          style={{ ...inputStyle, flex: 1, minWidth: 240, padding: "6px 9px", fontSize: 12.5 }} />
+                        <Btn variant="outline" Icon={RefreshCw} disabled={Boolean(busy) || !ajusteIg.trim()} onClick={ajustarIgImagen}>{busy === "igImagen" ? "Ajustando…" : "Ajustar imagen"}</Btn>
+                        <Btn variant="outline" Icon={Sparkles} disabled={Boolean(busy) || !ajusteIg.trim()} onClick={ajustarIgTexto}>{busy === "igTexto" ? "Ajustando…" : "Ajustar texto"}</Btn>
+                      </div>
+                      <div>
+                        <Btn variant="solid" Icon={Instagram} disabled={Boolean(busy) || !pu.base || !pu.clave || !ig.texto.trim() || ig.texto.length > 2200} onClick={publicarIg}>
+                          {busy === "igPublicar" ? "Publicando…" : "Publicar en Instagram"}
+                        </Btn>
+                        <div style={{ ...nota, marginTop: 6 }}>
+                          {!pu.base || !pu.clave ? "Falta configurar el puente en Conexiones para poder publicar." : "Sale publicada al instante en el perfil de Instagram vinculado a la página de Facebook."}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {(hecho.wa || hecho.correo || hecho.ig) && (
                 <div style={{ display: "flex", gap: 8 }}>
                   <Btn variant="outline" onClick={onListo}>Ver en Plantillas</Btn>
                   <Btn variant="ghost" Icon={Plus} onClick={empezarOtra}>Empezar otra pieza</Btn>
@@ -6742,6 +6903,12 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
               onChange={(v) => patch("email", { signature: v })} />
             <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>Se agrega al final del mensaje, separada por una línea. {conMail} de {gente.length} registros tienen correo.</div></Prose>
           </div>
+
+          <div style={{ borderTop: "1px solid " + C.line, paddingTop: 14, marginTop: 14 }}>
+            <Field def={{ label: "Tope de correos por día", type: "number" }} value={integ.email.topeDiario}
+              onChange={(v) => patch("email", { topeDiario: v })} />
+            <Prose><div style={{ marginTop: 6, fontSize: 11.5, color: C.faint }}>Cuenta todo lo que sale de la cuenta en el día. Gmail deja unos 500 (Workspace, 2.000), pero mandar cerca de ese tope a diario es lo que lleva al bloqueo. Con una cuenta nueva, empieza por 20 o 30 y súbelo poco a poco.</div></Prose>
+          </div>
         </Card>
 
         {/* ── Lo que llega ── */}
@@ -6864,6 +7031,7 @@ function ConnectionsView({ db, setDb, say, onLeads, onBuzon }) {
               <Estado ok>Medición de correos</Estado>
               <Estado ok={salud.meta?.leads} falta={<Mono>META_TOKEN</Mono>}>Leads de Meta</Estado>
               <Estado ok={salud.meta?.metricas} falta={<Mono>META_AD_ACCOUNT</Mono>}>Métricas de campaña de Meta</Estado>
+              {salud.meta && "instagram" in salud.meta && <Estado ok={salud.meta.instagram} falta={<><Mono>META_TOKEN</Mono> y <Mono>META_PAGE_ID</Mono></>}>Publicar en Instagram desde el Estudio</Estado>}
               {salud.whatsapp?.proveedor === "twilio" ? <>
                 <Estado ok={salud.whatsapp?.enviar} falta={<><Mono>TWILIO_AUTH_TOKEN</Mono> y <Mono>TWILIO_WA_FROM</Mono></>}>Envío de WhatsApp por Twilio</Estado>
                 <Estado ok={salud.whatsapp?.plantillas} falta={<Mono>TWILIO_AUTH_TOKEN</Mono>}>Plantillas aprobadas de WhatsApp (Twilio)</Estado>
@@ -7794,7 +7962,12 @@ function BulkEditModal({ db, objKind, ids, onClose, onApply }) {
    camino, el historial refleja lo que de verdad salió.
    ──────────────────────────────────────────────────────────── */
 const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
-const PAUSA_ENVIO = 500;
+/* Entre un correo y otro, entre 20 y 60 segundos al azar. Gmail no castiga el
+   volumen sino la forma: cien correos en un minuto, siempre al mismo ritmo, es
+   la huella de un programa, y una persona no escribe así. */
+const PAUSA_MIN = 20_000;
+const PAUSA_MAX = 60_000;
+const pausaAlAzar = () => PAUSA_MIN + Math.random() * (PAUSA_MAX - PAUSA_MIN);
 
 /* ── Filtros por propiedad ──
    A quién le llega un masivo se decide por lo que dice la ficha: "Tipo es
@@ -8040,6 +8213,13 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
 
   const [done, setDone] = useState(() => new Set());
   const [busy, setBusy] = useState(false);
+  /* Cómo va una tanda larga: con 20 a 60 segundos entre correos, cien tardan
+     casi una hora y hay que poder verlo y pararlo. */
+  const [marcha, setMarcha] = useState(null);
+  const parar = useRef(false);
+  /* Cerrar la ventana corta la tanda: seguir mandando sin nada a la vista
+     sería un envío que nadie puede ver ni parar. */
+  useEffect(() => () => { parar.current = true; }, []);
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState("");
   const [copiedHtml, setCopiedHtml] = useState("");
@@ -8094,8 +8274,12 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
   const porWa = !esCorreo && integ.whatsapp.modo === "api";
 
   const destOf = (r) => (esCorreo ? String(r.props.email || "").trim() : toE164(r.props.phone, cc));
-  const sendable = recipients.filter((r) => destOf(r));
-  const missingChannel = recipients.length - sendable.length;
+  const conDestino = recipients.filter((r) => destOf(r));
+  const missingChannel = recipients.length - conDestino.length;
+  /* Los que rebotaron o pidieron la baja se quedan fuera aunque sigan
+     marcados: escribirles otra vez es lo que más castiga Gmail. */
+  const vetados = esCorreo ? conDestino.filter(noSeEscribe) : [];
+  const sendable = esCorreo ? conDestino.filter((r) => !noSeEscribe(r)) : conDestino;
   const pending = sendable.filter((r) => !done.has(r.id));
 
   const conDato = coinciden.filter((r) => destOf(r));
@@ -8194,21 +8378,45 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
   /* Envío real por la API de Gmail, uno tras otro. Si uno falla se detiene ahí
      y se dice cuántos alcanzaron a salir: seguir a ciegas dejaría el historial
      mintiendo sobre lo que pasó. */
+  /* Lo que ya salió hoy desde la cuenta, mande quien lo mande: lo traído de
+     Enviados cuenta igual, porque el tope de Gmail es por cuenta. */
+  const tope = integ.email.topeDiario;
+  const hoy = (db.activities || []).filter((a) => a.type === "email" && a.dir !== "in" && isToday(a.at)).length;
+  const quedanHoy = Math.max(0, tope - hoy);
+
   const enviarTodo = async () => {
-    const cola = pending;
+    const cola = pending.slice(0, quedanHoy);
+    if (!cola.length) {
+      setErr(`Hoy ya salieron ${hoy} correos y el tope es ${tope}. Sigue mañana, o sube el tope en Conexiones si sabes lo que haces.`);
+      return;
+    }
     setErr(""); setBusy(true);
+    parar.current = false;
+    const baja = puedeDarBaja(medicion);
     let ok = 0;
     for (let i = 0; i < cola.length; i++) {
       const r = cola[i];
       try {
-        /* Gmail cuenta los envíos por segundo, no sólo por día: mandar la lista
-           entera de corrido es justo lo que dispara "User-rate limit exceeded"
-           y deja la tanda a medias. Medio segundo entre uno y otro se queda
-           holgadamente por debajo de su tope y ni se nota en una tanda de
-           doscientos. Si aun así frena, sendGmail espera y reintenta solo. */
-        if (i) await pausa(PAUSA_ENVIO);
+        /* La espera va antes de cada correo menos el primero, y se puede
+           cortar en medio: nadie debería esperar un minuto a que "Detener"
+           haga caso. Si aun así Gmail frena, sendGmail espera y reintenta. */
+        if (i) {
+          const fin = Date.now() + pausaAlAzar();
+          while (Date.now() < fin && !parar.current) {
+            setMarcha({ ok, total: cola.length, siguienteEn: Math.ceil((fin - Date.now()) / 1000) });
+            await pausa(Math.min(1000, fin - Date.now()));
+          }
+        }
+        if (parar.current) {
+          setErr(`Detenido: se enviaron ${ok} de ${cola.length}. Los demás siguen pendientes.`);
+          break;
+        }
+        setMarcha({ ok, total: cola.length, siguienteEn: 0 });
         const { trk, html: cuerpoHtml } = await prepararEnvio(r);
-        await sendGmail({ to: destOf(r), subject: asuntoDe(r), body: cuerpoDe(r), html: cuerpoHtml, clientId: integ.email.clientId });
+        const enlace = baja ? await enlaceBaja(medicion, r.id) : "";
+        const texto = enlace ? pieBajaTexto(cuerpoDe(r), enlace) : cuerpoDe(r);
+        const conPie = enlace ? pieBajaHtml(cuerpoHtml || textoAHtml(cuerpoDe(r)), enlace) : cuerpoHtml;
+        await sendGmail({ to: destOf(r), subject: asuntoDe(r), body: texto, html: conPie, baja: enlace, clientId: integ.email.clientId });
         marcar(r, trk);
         ok++;
       } catch (e) {
@@ -8216,6 +8424,10 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
         break;
       }
     }
+    if (ok === cola.length && cola.length < pending.length) {
+      setErr(`Se enviaron ${ok} y se llegó al tope de ${tope} correos por día. Los ${pending.length - ok} que faltan quedan pendientes para mañana.`);
+    }
+    setMarcha(null);
     setBusy(false);
   };
 
@@ -8306,9 +8518,13 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
     if (porApi && !gmail.connected) {
       return <Btn variant="solid" Icon={ShieldCheck} disabled={busy || !integ.email.clientId} onClick={conectarAqui}>{busy ? "Autorizando…" : "Conectar Gmail"}</Btn>;
     }
+    if (porApi && busy && marcha) {
+      return <Btn variant="outline" Icon={Pause} onClick={() => { parar.current = true; }}>Detener</Btn>;
+    }
     if (porApi) {
+      const van = Math.min(pending.length, quedanHoy);
       return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
-        onClick={enviarTodo}>{busy ? "Enviando…" : `Enviar ${pending.length} por Gmail`}</Btn>;
+        onClick={enviarTodo}>{busy ? "Enviando…" : `Enviar ${van} por Gmail`}</Btn>;
     }
     if (porWa) {
       return <Btn variant="solid" Icon={Send} disabled={sinTexto || busy || !pending.length}
@@ -8382,6 +8598,26 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
           {missingChannel > 0 && (
             <div style={{ background: C.claySoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>
               {missingChannel} destinatario(s) no tienen {esCorreo ? "correo" : "teléfono"}. Se omiten del envío; compléta{missingChannel === 1 ? "lo" : "los"} para poder contactarlos.
+            </div>
+          )}
+
+          {vetados.length > 0 && (
+            <div style={{ background: C.claySoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: C.clay }}>
+              {vetados.length} destinatario(s) rebotaron o pidieron la baja. Se omiten: escribirles otra vez es lo que más castiga Gmail.
+            </div>
+          )}
+
+          {porApi && gmail.connected && !marcha && pending.length > 0 && (
+            <div style={{ background: pending.length > quedanHoy ? C.amberSoft : C.blueSoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: pending.length > quedanHoy ? C.amber : C.blue, lineHeight: 1.55 }}>
+              Sale uno cada 20 a 60 segundos, para que Gmail no lo tome por un robot: {Math.min(pending.length, quedanHoy)} tardan unos {Math.max(1, Math.round(Math.min(pending.length, quedanHoy) * 40 / 60))} min. Deja esta ventana abierta.
+              {pending.length > quedanHoy && ` Hoy ya salieron ${hoy} de ${tope}: los ${pending.length - quedanHoy} que no caben quedan para mañana.`}
+              {!puedeDarBaja(medicion) && " Sin medidor configurado los correos salen sin enlace de baja."}
+            </div>
+          )}
+
+          {marcha && (
+            <div style={{ background: C.blueSoft, borderRadius: 6, padding: "8px 10px", fontFamily: "var(--ui)", fontSize: 12, color: C.blue, lineHeight: 1.55 }}>
+              Enviados {marcha.ok} de {marcha.total}{marcha.siguienteEn ? ` · el siguiente sale en ${marcha.siguienteEn} s` : " · enviando…"}. No cierres esta ventana.
             </div>
           )}
 

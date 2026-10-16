@@ -118,6 +118,8 @@ Ya con eso, **Generar token** y marca:
 | `pages_manage_ads` | leer los leads a nivel de anuncio |
 | `ads_management` | de qué campaña vino cada lead, y las métricas |
 | `whatsapp_business_messaging` | sólo si vas a mandar WhatsApp |
+| `instagram_basic` | sólo para publicar desde el Estudio: encontrar la cuenta de Instagram |
+| `instagram_content_publish` | sólo para publicar desde el Estudio: publicar |
 
 Los dos de anuncios no son imprescindibles: sin ellos los leads entran igual,
 pero sin nombre de campaña, y el puente lo dice en un aviso en vez de fallar.
@@ -131,6 +133,24 @@ Y en `wrangler.toml`, que no lleva secretos sino identificadores:
 `META_PAGE_ID`, `META_AD_ACCOUNT` y, para WhatsApp, `WA_PHONE_ID` — que es el
 **identificador** del número remitente, no el número— y `WA_WABA_ID`, el de la
 cuenta de WhatsApp Business, para leer las plantillas aprobadas.
+
+### Publicar en Instagram desde el Estudio
+
+No lleva un token aparte: se publica con el de la página, que el puente ya
+saca de `META_TOKEN`. Hacen falta tres cosas:
+
+1. Que la cuenta de Instagram sea **profesional** (de empresa o de creador) y
+   esté **vinculada a la página** de `META_PAGE_ID` (la página → Configuración →
+   Cuentas vinculadas → Instagram).
+2. Que el usuario de sistema la tenga asignada: **Asignar activos → Cuentas de
+   Instagram**.
+3. Que el token lleve `instagram_basic` e `instagram_content_publish`. Si el que
+   tienes es de antes, genera otro con esos dos además de los de arriba y
+   vuelve a guardarlo con `npx wrangler secret put META_TOKEN`.
+
+El puente encuentra solo la cuenta de Instagram a partir de la página. Si
+alguna vez hiciera falta forzarla, pon su identificador como `IG_USER_ID` en
+`wrangler.toml`.
 
 ### Recibir lo que te escriben por WhatsApp
 

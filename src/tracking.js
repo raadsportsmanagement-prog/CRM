@@ -89,6 +89,30 @@ export async function enlaceClic(base, clave, trk, destino) {
 
 export const pixelUrl = (base, trk) => `${base}/a/${trk}.gif`;
 
+/* ── Darse de baja ──
+   Basta con la dirección y la clave del medidor: no hace falta medir nada. El
+   identificador es el de la ficha y no el del envío, porque lo que se da de
+   baja es la persona, no un correo suelto. Firmado, para que nadie pueda dar de
+   baja a otro cambiando un número en la dirección. */
+export const puedeDarBaja = (m) => Boolean(m && m.base && m.clave);
+
+export async function enlaceBaja({ base, clave }, recId) {
+  const raiz = String(base || "").replace(/\/+$/, "");
+  const s = await firmar(clave, `baja|${recId}`);
+  return `${raiz}/b/${encodeURIComponent(recId)}?s=${s}`;
+}
+
+/* El pie con la baja, en las dos versiones del mensaje. El enlace empieza por
+   la dirección del medidor, así que marcarHtml no lo envuelve como un clic. */
+export const pieBajaTexto = (texto, url) =>
+  `${texto}\n\n—\nSi prefieres no recibir más correos como éste, date de baja aquí: ${url}`;
+
+export function pieBajaHtml(html, url) {
+  const pie = `<p style="font:12px/1.5 Arial,Helvetica,sans-serif;color:#6B7471;margin:24px 0 0">` +
+    `Si prefieres no recibir más correos como éste, <a href="${url}" style="color:#6B7471">date de baja aquí</a>.</p>`;
+  return /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${pie}</body>`) : html + pie;
+}
+
 /* Se miden los enlaces normales y nada más. Un `mailto:` o un `tel:` no se
    abren en un navegador que pueda pasar por el medidor, y un ancla `#` vive
    dentro del propio correo. Los que ya apuntan al medidor se dejan quietos:
