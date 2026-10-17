@@ -67,17 +67,25 @@ const emailKey = (v) => String(v || "").trim().toLowerCase();
    con o sin indicativo, con espacios o con guiones. */
 const telKey = (v) => String(v || "").replace(/\D/g, "").slice(-10);
 
-function buscarContacto(contacts, ev) {
+/* La ficha del CRM que corresponde a lo que el evento dice de la persona
+   (ref, correo, teléfono), sin contar `salvo`. Una ficha ya ligada a otro
+   atleta no se reasigna aunque coincida el correo o el teléfono: pasa con
+   hermanos que comparten el del papá. */
+function porIdentidad(contacts, ev, salvo) {
   const p = ev.persona || {};
-  /* Una ficha ya ligada a otro atleta no se reasigna aunque coincida el
-     correo o el teléfono: pasa con hermanos que comparten el del papá. */
-  const libres = contacts.filter((c) => !(c.props && c.props.appId) || c.props.appId === ev.atletaId);
-  return contacts.find((c) => c.props && c.props.appId === ev.atletaId)
-    || (ev.ref && libres.find((c) => c.id === ev.ref))
+  const libres = contacts.filter((c) => c.id !== salvo && (!(c.props && c.props.appId) || c.props.appId === ev.atletaId));
+  return (ev.ref && libres.find((c) => c.id === ev.ref))
     || (p.email && libres.find((c) => emailKey(c.props && c.props.email) === emailKey(p.email)))
     || (telKey(p.telefono).length >= 7 && libres.find((c) => telKey(c.props && c.props.phone) === telKey(p.telefono)))
     || null;
 }
+
+/* Lo que el Companion dice al pedir un asesor, en palabras. */
+const MOTIVO_TRASPASO = {
+  NoPublishedAnswer: "el Companion no tenía la respuesta",
+  AthleteAskedForPerson: "pidió hablar con una persona",
+  SensitiveMatter: "es un tema delicado",
+};
 
 const subirEstado = (actual, nuevo) => ((RANGO_ESTADO[nuevo] || 0) > (RANGO_ESTADO[actual] || 0) ? nuevo : actual || nuevo);
 
@@ -86,8 +94,9 @@ export function aplicarEventosCatch(db, eventos) {
   const app = db.catchApp || {};
   const vistos = new Set(Array.isArray(app.vistos) ? app.vistos : []);
   const contacts = [...(db.contacts || [])];
+  let activities = db.activities || [];
   const nuevasActs = [];
-  const res = { aplicados: 0, repetidos: 0, invalidos: 0, fichasNuevas: 0 };
+  const res = { aplicados: 0, repetidos: 0, invalidos: 0, fichasNuevas: 0, fusionadas: 0 };
 
   const tocar = (i, props) => { contacts[i] = { ...contacts[i], props: { ...contacts[i].props, ...props } }; };
 
@@ -98,7 +107,26 @@ export function aplicarEventosCatch(db, eventos) {
     if (vistos.has(ev.id)) { res.repetidos++; continue; }
     vistos.add(ev.id);
 
-    let c = buscarContacto(contacts, ev);
+    let c = contacts.find((x) => x.props && x.props.appId === ev.atletaId) || null;
+    const real = porIdentidad(contacts, ev, c && c.id);
+    if (c && real && c.props.appProvisional) {
+      /* El registro conversacional habla antes de saber quién es: los
+         primeros turnos crean una ficha provisional, y cuando llega el ref o
+         el correo se descubre que la persona ya estaba en el CRM. Se pasa
+         todo a la ficha de siempre y la provisional desaparece. */
+      const viejo = c.id;
+      const deApp = Object.fromEntries(Object.entries(c.props).filter(([k]) => k.startsWith("app") && k !== "appProvisional"));
+      const pi = contacts.findIndex((x) => x.id === real.id);
+      contacts[pi] = { ...real, props: { ...real.props, ...deApp } };
+      contacts.splice(contacts.findIndex((x) => x.id === viejo), 1);
+      const pasar = (a) => ((a.contactIds || []).includes(viejo) ? { ...a, contactIds: a.contactIds.map((x) => (x === viejo ? real.id : x)) } : a);
+      activities = activities.map(pasar);
+      nuevasActs.splice(0, nuevasActs.length, ...nuevasActs.map(pasar));
+      res.fusionadas++;
+      c = contacts.find((x) => x.id === real.id);
+    } else if (!c) {
+      c = real;
+    }
     if (!c) {
       const p = ev.persona || {};
       c = {
@@ -107,7 +135,7 @@ export function aplicarEventosCatch(db, eventos) {
           firstName: p.nombre || "Atleta de Catch", lastName: p.apellido || "",
           email: p.email || "", phone: p.telefono || "",
           leadSource: "App Catch", leadStatus: "Nuevo", type: "Estudiante",
-          createdAt: ev.at, lastActivityAt: ev.at,
+          createdAt: ev.at, lastActivityAt: ev.at, appProvisional: true,
         },
       };
       contacts.unshift(c);
@@ -156,26 +184,26 @@ export function aplicarEventosCatch(db, eventos) {
         contactIds: [c.id],
       });
     } else if (ev.tipo === "traspaso") {
-      tocar(i, { ...base, appTraspaso: ev.abierto ? ev.motivo : "" });
+      tocar(i, { ...base, appTraspaso: ev.abierto ? MOTIVO_TRASPASO[ev.motivo] || ev.motivo : "" });
       /* Un traspaso abierto se anota como algo recibido: así enciende el
          contador de Mensajes y alguien lo ve. */
       nuevasActs.push({
         id: uid(), ext: `catch:${ev.id}`, type: "app", dir: ev.abierto ? "in" : "out", at: ev.at,
         subject: ev.abierto ? "El Companion pide un asesor" : "El asesor cerró el traspaso",
-        body: ev.abierto ? `Motivo: ${ev.motivo}` : "", autor: "Sistema", canal: "InApp",
+        body: ev.abierto ? `Motivo: ${MOTIVO_TRASPASO[ev.motivo] || ev.motivo}` : "", autor: "Sistema", canal: "InApp",
         contactIds: [c.id],
       });
     }
     res.aplicados++;
   }
 
-  const yaHay = new Set((db.activities || []).map((a) => a.ext).filter(Boolean));
+  const yaHay = new Set(activities.map((a) => a.ext).filter(Boolean));
   const entran = nuevasActs.filter((a) => !yaHay.has(a.ext));
   return {
     db: {
       ...db,
       contacts,
-      activities: [...entran.sort((a, b) => (a.at < b.at ? 1 : -1)), ...(db.activities || [])],
+      activities: [...entran.sort((a, b) => (a.at < b.at ? 1 : -1)), ...activities],
       catchApp: { ...app, vistos: [...vistos].slice(-VISTOS_MAX), ultimoAt: new Date().toISOString() },
     },
     res,

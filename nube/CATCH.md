@@ -65,6 +65,13 @@ tenía.
 
 Una ficha ya ligada a otro atleta nunca se reasigna por correo o teléfono.
 
+En el registro conversacional, los primeros turnos llegan antes de saber quién
+es la persona. Esos turnos crean una ficha provisional. Cuando un evento
+posterior trae el `ref`, el correo o el teléfono de alguien que ya estaba en el
+CRM, la ficha provisional se fusiona con esa: se pasan los datos de la app y la
+conversación, y la provisional desaparece. Por eso conviene mandar `persona` (o
+el evento `registro` con `ref`) en cuanto se conozcan.
+
 ### Respuestas
 
 - `200 {"ok":true,"aplicados":n,"repetidos":n,"invalidos":n,"fichasNuevas":n}`
