@@ -829,6 +829,43 @@ async function firmaMeta(secreto, cuerpo) {
   return "sha256=" + [...new Uint8Array(s)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/* ════════════════════════════════════════════════════════════
+   La app Catch
+   Catch le avisa al CRM cuando alguien se registra, cambia de etapa o habla
+   con el Companion. Llega aquí porque el puente es público y el CRM está
+   detrás de Cloudflare Access. Se revisa la firma y se entrega al CRM por el
+   service binding CRM (ver wrangler.toml); aquí no se guarda nada.
+
+   La firma: X-Catch-Firma = "sha256=" + HMAC-SHA256(CATCH_SECRETO,
+   X-Catch-Tiempo + "." + cuerpo), en hex. El tiempo (segundos Unix) entra en
+   lo firmado y debe estar a menos de cinco minutos, para que un lote
+   capturado no se pueda volver a mandar después. El contrato está en
+   nube/CATCH.md.
+   ════════════════════════════════════════════════════════════ */
+
+async function catchEventos(req, env) {
+  if (!env.CATCH_SECRETO) return json({ error: "Falta CATCH_SECRETO en el puente." }, 503);
+  if (!env.CRM) return json({ error: "Falta el service binding CRM en el puente." }, 503);
+  const tiempo = req.headers.get("x-catch-tiempo") || "";
+  if (!/^\d{10}$/.test(tiempo) || Math.abs(Date.now() / 1000 - Number(tiempo)) > 300) {
+    return json({ error: "X-Catch-Tiempo falta o está fuera de los cinco minutos." }, 401);
+  }
+  const crudo = await req.text();
+  if (crudo.length > 2_000_000) return json({ error: "Lote demasiado grande." }, 413);
+  if (!igual(req.headers.get("x-catch-firma") || "", await firmaMeta(env.CATCH_SECRETO, `${tiempo}.${crudo}`))) {
+    return json({ error: "Firma inválida." }, 401);
+  }
+  let cuerpo;
+  try { cuerpo = JSON.parse(crudo); } catch (_) { return json({ error: "JSON ilegible." }, 400); }
+  try {
+    const r = await env.CRM.eventosCatch(cuerpo);
+    return json(r, r.ok ? 200 : 400);
+  } catch (e) {
+    /* 503 para que Catch reintente: el lote no se aplicó. */
+    return json({ error: `El CRM no pudo guardar el lote (${(e && e.message) || e}).` }, 503);
+  }
+}
+
 function textoDeMensaje(m) {
   const pie = (x) => (x && x.caption ? ` ${x.caption}` : "");
   switch (m.type) {
@@ -1535,6 +1572,12 @@ export default {
        sin clave, como el webhook. */
     const img = ruta.match(/^\/wa\/imagen\/([a-f0-9]{32})$/);
     if (img && (req.method === "GET" || req.method === "HEAD")) return servirImagen(env, img[1]);
+
+    /* Catch firma sus avisos con CATCH_SECRETO; no lleva la clave del CRM. */
+    if (ruta === "/catch/eventos") {
+      if (req.method !== "POST") return new Response("", { status: 405 });
+      return catchEventos(req, env);
+    }
 
     /* Lo mismo para Twilio, que se protege con su propia firma. */
     if (ruta === "/wa/twilio") {

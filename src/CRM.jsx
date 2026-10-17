@@ -32,6 +32,7 @@ import {
   coleccionDe, buscarFicha,
 } from "./automations.js";
 import { ANOS, GRUPOS, DIVISIONES, analizarRoster } from "./drafts.js";
+import { PERFIL_BASE, CRITERIOS_JEV } from "./tendencias.js";
 import {
   ETAPAS_AGENTE, HUMANO, agenteVacio, normalizaAgente, normalizeAgentes, normalizeAgentesChat, agentesDeBase,
 } from "./agentes.js";
@@ -63,6 +64,9 @@ const CHANNEL = {
   email: { label: "Correo", color: C.blue, soft: C.blueSoft, Icon: Mail },
   call: { label: "Llamada", color: C.amber, soft: C.amberSoft, Icon: Phone },
   note: { label: "Nota", color: C.mute, soft: "#E6E9E3", Icon: FileText },
+  /* Lo que se habla dentro de la app Catch con el Companion (o un asesor).
+     Llega solo desde Catch (nube/catch.js); desde aquí no se responde. */
+  app: { label: "App Catch", color: "#0b6b78", soft: "#D5EEF1", Icon: Bot },
 };
 
 const STAGES = [
@@ -97,7 +101,12 @@ const noSeEscribe = (r) => {
   const e = (r && r.props && r.props.emailStatus) || "";
   return e === "Rebotado" || e === "Dado de baja";
 };
-const LEAD_SOURCE = ["Meta Lead Ads", "Google Lead Form", "Facebook", "Instagram", "WhatsApp", "Sitio web", "Referido", "Evento", "Carga masiva", "Manual", "Llamada entrante"];
+const LEAD_SOURCE = ["Meta Lead Ads", "Google Lead Form", "Facebook", "Instagram", "WhatsApp", "Sitio web", "Referido", "Evento", "Carga masiva", "Manual", "Llamada entrante", "App Catch"];
+/* Lo que la app Catch cuenta de cada persona (ver nube/catch.js). Nadie lo
+   escribe a mano: lo pone Catch cuando se registra, completa el perfil, paga
+   o sube de etapa. */
+const ESTADOS_APP = ["Sin registro", "Registrado", "Perfil completo", "Activo"];
+const ETAPAS_CATCH = ["Sembrando", "Al mundo", "El sueño", "Más alto", "1er cierre", "La meta"];
 
 const BASE_SCHEMA = {
   contact: [
@@ -113,6 +122,13 @@ const BASE_SCHEMA = {
     { key: "type", label: "Tipo", type: "select", options: ["Prospecto", "Estudiante", "Acudiente", "Docente", "Cliente", "Aliado", "Otro"], system: true, col: false },
     { key: "lastActivityAt", label: "Última actividad", type: "datetime", system: true, readOnly: true, col: true },
     { key: "createdAt", label: "Fecha de creación", type: "datetime", system: true, readOnly: true, col: false },
+    { key: "appEstado", label: "Estado en la app", type: "select", options: ESTADOS_APP, system: true, readOnly: true, col: true },
+    { key: "appEtapa", label: "Etapa en la app", type: "select", options: ETAPAS_CATCH, system: true, readOnly: true, col: true },
+    { key: "appRegistroAt", label: "Registro en la app", type: "datetime", system: true, readOnly: true, col: false },
+    { key: "appCanal", label: "Se registró desde", type: "text", system: true, readOnly: true, col: false },
+    { key: "appCampana", label: "Envío que lo trajo", type: "text", system: true, readOnly: true, col: false },
+    { key: "appTraspaso", label: "Pide asesor", type: "text", system: true, readOnly: true, col: false },
+    { key: "appId", label: "Id en la app", type: "text", system: true, readOnly: true, col: false },
   ],
   company: [
     { key: "name", label: "Nombre", type: "text", system: true, col: true, required: true },
@@ -206,6 +222,28 @@ function parseCSV(text) {
 /* enHtml: dentro de una plantilla HTML las variables se escapan antes de
    entrar. Una institución llamada "Ríos & Cía." no debe poder abrir una
    etiqueta ni romper un atributo del diseño. */
+/* ── Enlaces a la app Catch ──
+   Todo enlace a la app que sale hacia un contacto lleva su id (ref) y de
+   dónde viene (utm). Catch lo guarda al registrarse y lo devuelve en el
+   evento de registro: así el CRM sabe quién se registró y desde qué envío.
+   {{registro}} pone el enlace de registro ya armado. */
+const APP_CATCH = "https://app.catchrsm.com";
+const APP_REGISTRO = `${APP_CATCH}/register`;
+const RE_APP = /https:\/\/app\.catchrsm\.com[^\s"'<>)]*/g;
+const conParams = (url, params, enHtml) => {
+  let u;
+  try { u = new URL(url.replace(/&amp;/g, "&")); } catch (_) { return url; }
+  for (const [k, v] of Object.entries(params)) if (v && !u.searchParams.has(k)) u.searchParams.set(k, v);
+  const s = u.toString();
+  return enHtml ? s.replace(/&/g, "&amp;") : s;
+};
+const marcarEnlacesApp = (texto, params, enHtml) => String(texto || "").replace(RE_APP, (m) => {
+  /* El punto o la coma que cierra la frase no son parte del enlace. */
+  const [, url, cola] = m.match(/^(.*?)([.,;:!?]*)$/);
+  return conParams(url, params, enHtml) + cola;
+});
+const refDe = (rec, kind) => (kind === "contact" && rec && rec.id ? { ref: rec.id, utm_source: "crm" } : { utm_source: "crm" });
+
 const applyTemplate = (text, rec, kind, enHtml) => {
   const p = rec.props || {};
   const map = {
@@ -215,12 +253,14 @@ const applyTemplate = (text, rec, kind, enHtml) => {
     empresa: p.name || p.institution || "",
     correo: p.email || "",
     telefono: p.phone || "",
+    registro: conParams(APP_REGISTRO, refDe(rec, kind), false),
   };
-  return String(text || "").replace(/\{\{\s*([a-zA-ZñÑáéíóú_]+)\s*\}\}/g, (m, k) => {
+  const lleno = String(text || "").replace(/\{\{\s*([a-zA-ZñÑáéíóú_]+)\s*\}\}/g, (m, k) => {
     const v = map[norm(k)];
     if (v == null) return m;
     return enHtml ? escapeHtml(v) : v;
   });
+  return marcarEnlacesApp(lleno, refDe(rec, kind), enHtml);
 };
 
 /* ── Plantillas de WhatsApp aprobadas en Meta ──
@@ -272,7 +312,7 @@ const revisionAbierta = (r) => Boolean(r) && r.estado !== "APPROVED" && r.estado
 
 /* Las variables que el CRM sabe llenar —las de applyTemplate—. Una plantilla
    que pida otra cosa saldría con el {{hueco}} a la vista, así que no se manda. */
-const VARS_META = ["nombre", "apellido", "institucion", "empresa", "correo", "telefono"];
+const VARS_META = ["nombre", "apellido", "institucion", "empresa", "correo", "telefono", "registro"];
 
 /* Meta pide un ejemplo por variable para revisarla. Van inventados a
    propósito: lo que se le manda a revisión no tiene por qué llevar datos de
@@ -280,6 +320,7 @@ const VARS_META = ["nombre", "apellido", "institucion", "empresa", "correo", "te
 const EJEMPLOS_META = {
   nombre: "Ana", apellido: "Gómez", institucion: "Club Deportivo Los Andes",
   empresa: "Club Deportivo Los Andes", correo: "ana@ejemplo.com", telefono: "3001234567",
+  registro: `${APP_REGISTRO}?ref=ejemplo`,
 };
 
 const nombreParaMeta = (txt) => String(txt || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -1651,6 +1692,9 @@ export default function CRM() {
   const sinLeer = contarSinLeer(db);
   const porAtender = (db.autoCola || []).filter((x) => x.estado === "listo").length;
   const plantillasNuevas = db.templates.whatsapp.filter((t) => t.revision && t.revision.nueva).length;
+  /* Sólo las que JEV recomienda producir y nadie ha mirado: las demás
+     pueden esperar sin encender nada. */
+  const tendenciasNuevas = ((db.tendencias && db.tendencias.items) || []).filter((x) => (x.estado || "nueva") === "nueva" && x.jev && x.jev.decision === "producir").length;
 
   const NAV = [
     { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
@@ -1661,6 +1705,7 @@ export default function CRM() {
     { key: "drafts", label: "Drafts", Icon: Trophy },
     { key: "activities", label: "Actividades", Icon: Activity },
     { key: "templates", label: "Plantillas", Icon: MessageSquare },
+    { key: "trends", label: "Tendencias", Icon: Newspaper },
     { key: "studio", label: "Estudio", Icon: Palette },
     { key: "automations", label: "Automatizaciones", Icon: Zap },
     { key: "connections", label: "Conexiones", Icon: Plug },
@@ -1692,7 +1737,7 @@ export default function CRM() {
           </div>
           {NAV.map(({ key, label, Icon }) => {
             const on = view === key;
-            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : 0;
+            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : key === "trends" ? tendenciasNuevas : 0;
             return (
               <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
                 style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
@@ -1734,6 +1779,7 @@ export default function CRM() {
               onImport={importActivities} onBuzon={marcarBuzon} onEventos={aplicarEventos} onRebotes={aplicarRebotes}
               onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
           )}
+          {view === "trends" && <TendenciasView db={db} setDb={setDb} say={say} onEstudio={() => setView("studio")} />}
           {view === "studio" && <EstudioView db={db} setDb={setDb} say={say} onListo={() => setView("templates")} />}
           {view === "templates" && <TemplatesView db={db} setDb={setDb} say={say}
             onEnviar={(plantillaId) => setModal({ kind: "send", channel: "whatsapp", objKind: "contact", ids: db.contacts.map((c) => c.id), plantillaId })} />}
@@ -3058,7 +3104,7 @@ function ActivitiesView({ db, setModal, setDetail, say, onImport, onBuzon, onEve
    la diferencia es que ahora cada una sabe hacia dónde iba.
    ──────────────────────────────────────────────────────────── */
 
-const ES_MENSAJE = (a) => a && (a.type === "whatsapp" || a.type === "email");
+const ES_MENSAJE = (a) => a && (a.type === "whatsapp" || a.type === "email" || a.type === "app");
 
 /* Lo ya guardado, por su identificador de fuera. Un correo que el CRM mandó
    por la API guarda su identificador de Gmail, y el barrido lo vuelve a ver en
@@ -4331,7 +4377,7 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 3, justifyContent: mio ? "flex-end" : "flex-start", fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>
                       <ch.Icon size={10} color={ch.color} />
-                      <span>{mio ? "Enviado" : "Recibido"}</span>
+                      <span>{a.type === "app" ? `${a.autor || "App"}${a.canal === "WhatsApp" ? " · por WhatsApp" : " · en la app"}` : mio ? "Enviado" : "Recibido"}</span>
                       <span>·</span>
                       <span>{horaDe(a.at)}</span>
                     </div>
@@ -4958,6 +5004,188 @@ const guardarBorrador = async (b) => {
   return todos.slice(0, BORRADORES_MAX);
 };
 const borrarBorrador = (id) => enBorradores("readwrite", (s) => s.delete(id));
+
+/* ────────────────────────────────────────────────────────────
+   Tendencias
+   Lo que Claude encontró cada mañana, con la nota de JEV (ver
+   nube/tendencias.js). Aquí una persona decide: aprueba, descarta o lleva la
+   noticia al Estudio, que arranca con la idea ya escrita.
+   ──────────────────────────────────────────────────────────── */
+
+async function pedirTendencias(cuerpo) {
+  const r = await fetch("/api/tendencias", {
+    method: "POST", redirect: "manual", credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Origen": "tendencias" },
+    body: JSON.stringify(cuerpo),
+  });
+  if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+  if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("Tendencias sólo funciona en la versión publicada del CRM.");
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
+  return data;
+}
+
+const DECISION_JEV = {
+  producir: { label: "Producir", color: C.jade, soft: C.jadeSoft },
+  guardar: { label: "Guardar", color: C.amber, soft: C.amberSoft },
+  descartar: { label: "Descartar", color: C.clay, soft: C.claySoft },
+};
+const ESTADOS_TENDENCIA = [
+  ["nueva", "Por decidir"], ["aprobada", "Aprobadas"], ["usada", "En el Estudio"], ["descartada", "Descartadas"],
+];
+
+const briefDeTendencia = (n) => [
+  `Noticia: ${n.titulo}${n.medio || n.fecha ? ` (${[n.medio, n.fecha].filter(Boolean).join(", ")})` : ""}`,
+  n.resumen,
+  `Fuente: ${n.url}`,
+  n.jev && n.jev.angulo ? `Ángulo: ${n.jev.angulo}` : "",
+  n.jev && n.jev.gancho ? `Primera línea sugerida: ${n.jev.gancho}` : "",
+  "Objetivo: que la persona se registre en la app Catch con su enlace {{registro}}.",
+].filter(Boolean).join("\n");
+
+function TendenciasView({ db, setDb, say, onEstudio }) {
+  const t = db.tendencias || {};
+  const items = Array.isArray(t.items) ? t.items : [];
+  const corridas = Array.isArray(t.corridas) ? t.corridas : [];
+  const ultima = corridas[0];
+  const [estado, setEstado] = useState("nueva");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [verPerfil, setVerPerfil] = useState(false);
+
+  const cambiarTendencias = (f) => setDb((d) => ({ ...d, tendencias: f(d.tendencias || {}) }));
+  const decidir = (id, nuevo) => cambiarTendencias((tt) => ({
+    ...tt, items: (tt.items || []).map((x) => (x.id === id ? { ...x, estado: nuevo, decididoAt: nowISO() } : x)),
+  }));
+
+  const buscar = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await pedirTendencias({ accion: "correr" });
+      say(r.nuevas ? `JEV calificó ${r.nuevas} noticia(s) nueva(s)` : "No apareció nada nuevo esta vez");
+      setEstado("nueva");
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const alEstudio = (n) => {
+    memoriaEstudio = { ...(memoriaEstudio || {}), fuente: "idea", brief: briefDeTendencia(n) };
+    decidir(n.id, "usada");
+    onEstudio();
+  };
+
+  const lista = items.filter((x) => (x.estado || "nueva") === estado)
+    .sort((a, b) => ((b.jev && b.jev.total) || 0) - ((a.jev && a.jev.total) || 0));
+  const cuenta = (k) => items.filter((x) => (x.estado || "nueva") === k).length;
+  const fecha = (iso) => (iso ? new Date(iso).toLocaleString("es-CO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "");
+
+  return (
+    <div>
+      <Header eyebrow="Contenido" title="Tendencias"
+        right={<>
+          <Btn variant="outline" Icon={Pencil} onClick={() => setVerPerfil((v) => !v)}>Perfil de investigación</Btn>
+          <Btn variant="solid" Icon={Sparkles} disabled={busy} onClick={buscar}>{busy ? "Buscando y calificando…" : "Buscar ahora"}</Btn>
+        </>} />
+      <div style={{ padding: "18px 28px 40px", maxWidth: 980 }}>
+        <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.6, marginBottom: 14 }}>
+          Cada mañana a las 6:00 Claude busca noticias con el perfil de investigación y JEV califica cada una de 0 a 100. Tú decides cuáles pasan al Estudio.
+          {ultima && (
+            <div style={{ marginTop: 4, color: ultima.error ? C.clay : C.mute }}>
+              Última búsqueda: {fecha(ultima.at)} ({ultima.quien === "cron" ? "automática" : ultima.quien}) · {ultima.error ? `falló: ${ultima.error}` : `${ultima.n} nueva(s)`}
+            </div>
+          )}
+          {busy && <div style={{ marginTop: 4 }}>Suele tardar entre uno y tres minutos: Claude lee varias fuentes antes de que JEV califique.</div>}
+          {err && <div style={{ marginTop: 4, color: C.clay }}>{err}</div>}
+        </div>
+
+        {verPerfil && (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 6 }}>PERFIL DE INVESTIGACIÓN</div>
+            <textarea className="crm-in" rows={14} value={t.perfil ?? PERFIL_BASE}
+              onChange={(e) => cambiarTendencias((tt) => ({ ...tt, perfil: e.target.value }))}
+              style={{ ...inputStyle, fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+              <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, flex: 1 }}>
+                Mismo formato que el skill content-researcher: propósito, audiencia, ángulos e ignorar. Se guarda solo.
+              </span>
+              <Btn size="sm" variant="ghost" Icon={RotateCcw} onClick={() => cambiarTendencias((tt) => ({ ...tt, perfil: PERFIL_BASE }))}>Volver al de base</Btn>
+            </div>
+            <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 12, lineHeight: 1.7 }}>
+              <b>Cómo califica JEV:</b> {Object.values(CRITERIOS_JEV).map((c) => `${c.nombre} (${c.peso})`).join(" · ")}.
+              Desde 70 recomienda producir, desde 50 guardar, y un riesgo alto la descarta.
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 7, marginBottom: 14, flexWrap: "wrap" }}>
+          {ESTADOS_TENDENCIA.map(([k, l]) => (
+            <button key={k} onClick={() => setEstado(k)} className="crm-btn"
+              style={{ border: `1px solid ${estado === k ? C.jade : C.line}`, background: estado === k ? C.jade : C.panel, color: estado === k ? "#fff" : C.mute, borderRadius: 999, padding: "5px 13px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>
+              {l} <span style={{ fontFamily: "var(--mono)", fontSize: 11, opacity: 0.8 }}>{cuenta(k)}</span>
+            </button>
+          ))}
+        </div>
+
+        {!lista.length && (
+          <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.mute, padding: "30px 0" }}>
+            {items.length ? "Nada en esta pestaña." : "Todavía no hay tendencias. Pulsa «Buscar ahora» o espera a la búsqueda de mañana."}
+          </div>
+        )}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {lista.map((n) => {
+            const j = n.jev || {};
+            const d = DECISION_JEV[j.decision] || DECISION_JEV.guardar;
+            return (
+              <div key={n.id} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16, display: "flex", gap: 16 }}>
+                <div style={{ flexShrink: 0, width: 58, textAlign: "center" }}>
+                  <div style={{ width: 52, height: 52, borderRadius: 999, background: d.soft, color: d.color, display: "grid", placeItems: "center", fontFamily: "var(--display)", fontSize: 19, fontWeight: 700, margin: "0 auto" }}>{j.total ?? "–"}</div>
+                  <div style={{ fontFamily: "var(--mono)", fontSize: 9.5, color: C.faint, marginTop: 4, letterSpacing: ".06em" }}>JEV</div>
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 4 }}>
+                    <Pill color={d.color} soft={d.soft}>{d.label}</Pill>
+                    {j.riesgo && j.riesgo !== "ninguno" && <Pill color={j.riesgo === "alto" ? C.clay : C.amber} soft={j.riesgo === "alto" ? C.claySoft : C.amberSoft}>Riesgo {j.riesgo}</Pill>}
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{[n.medio, n.fecha, n.tema].filter(Boolean).join(" · ")}</span>
+                  </div>
+                  <a href={n.url} target="_blank" rel="noopener noreferrer" style={{ fontFamily: "var(--display)", fontSize: 15.5, fontWeight: 600, color: C.ink, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 5 }}>
+                    {n.titulo} <ExternalLink size={12} color={C.faint} />
+                  </a>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.55, marginTop: 4 }}>{n.resumen}</div>
+                  {j.angulo && <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.ink, marginTop: 8 }}><b>Ángulo:</b> {j.angulo}</div>}
+                  {j.gancho && <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.jade, marginTop: 3, fontStyle: "italic" }}>“{j.gancho}”</div>}
+                  {j.porque && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, marginTop: 3 }}>{j.porque}</div>}
+                  {j.puntajes && (
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 10 }}>
+                      {Object.entries(CRITERIOS_JEV).map(([k, c]) => (
+                        <div key={k} title={`${c.nombre}: ${j.puntajes[k]}/5 (pesa ${c.peso})`} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                          <span style={{ fontFamily: "var(--ui)", fontSize: 11, color: C.mute }}>{c.nombre}</span>
+                          <span style={{ display: "inline-flex", gap: 2 }}>
+                            {[1, 2, 3, 4, 5].map((i) => <span key={i} style={{ width: 6, height: 10, borderRadius: 1.5, background: i <= j.puntajes[k] ? d.color : C.line }} />)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 7, marginTop: 12, flexWrap: "wrap" }}>
+                    <Btn size="sm" variant="solid" Icon={Palette} onClick={() => alEstudio(n)}>Llevar al Estudio</Btn>
+                    {(n.estado || "nueva") === "nueva" && <Btn size="sm" variant="outline" Icon={Check} onClick={() => { decidir(n.id, "aprobada"); say("Aprobada"); }}>Aprobar</Btn>}
+                    {(n.estado || "nueva") !== "descartada"
+                      ? <Btn size="sm" variant="ghost" Icon={X} onClick={() => decidir(n.id, "descartada")}>Descartar</Btn>
+                      : <Btn size="sm" variant="ghost" Icon={RotateCcw} onClick={() => decidir(n.id, "nueva")}>Volver a por decidir</Btn>}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function EstudioView({ db, setDb, say, onListo }) {
   const pu = db.integrations.puente;
@@ -8306,16 +8534,30 @@ function SendModal({ db, channel, kind, ids, listaId, plantillaId, onClose, onSe
   /* Enlazada a Meta, por WhatsApp sale la plantilla aprobada y no lo escrito
      aquí: Meta no deja cambiarle ni una coma. */
   const metaT = !esCorreo && t && t.meta ? t.meta : null;
-  const plantillaDe = (r) => (metaT ? plantillaWaPara(metaT, r, kind) : null);
+  /* Los enlaces a la app salen además con el canal y el envío, para que el
+     registro que traigan se le cuente a este envío. */
+  const campana = { utm_medium: esCorreo ? "email" : "whatsapp", utm_campaign: lote };
+  const plantillaDe = (r) => {
+    if (!metaT) return null;
+    const pw = plantillaWaPara(metaT, r, kind);
+    if (pw.err) return pw;
+    const v = pw.variables;
+    return {
+      ...pw,
+      texto: marcarEnlacesApp(pw.texto, campana),
+      variables: Array.isArray(v) ? v.map((x) => marcarEnlacesApp(x, campana))
+        : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, marcarEnlacesApp(x, campana)])),
+    };
+  };
 
   const cuerpoDe = (r) => {
     if (metaT) { const pw = plantillaDe(r); return pw.err ? metaT.cuerpo : pw.texto; }
-    const escrito = applyTemplate(body, r, kind);
-    const txt = escrito.trim() || (conHtml ? htmlToText(applyTemplate(html, r, kind, true)) : escrito);
+    const escrito = marcarEnlacesApp(applyTemplate(body, r, kind), campana);
+    const txt = escrito.trim() || (conHtml ? htmlToText(marcarEnlacesApp(applyTemplate(html, r, kind, true), campana, true)) : escrito);
     return esCorreo ? withSignature(txt, integ.email.signature) : txt;
   };
 
-  const htmlDe = (r) => (conHtml ? withSignatureHtml(applyTemplate(html, r, kind, true), integ.email.signature) : "");
+  const htmlDe = (r) => (conHtml ? withSignatureHtml(marcarEnlacesApp(applyTemplate(html, r, kind, true), campana, true), integ.email.signature) : "");
   const asuntoLog = (r) => (esCorreo ? asuntoDe(r) : t ? `WhatsApp · ${t.name}` : "Mensaje de WhatsApp");
 
   /* Medir exige que el CRM arme el mensaje, y eso sólo pasa con "Gmail

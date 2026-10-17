@@ -34,5 +34,9 @@
     "ACCESS_AUD": "f77abf9451e89957aab1122906de15f8f91c772104433288ecec3f7d4b2dae7e"
   },
 
+  /* Tendencias: a las 6:00 de Bogotá (11:00 UTC) Claude busca y JEV califica.
+     Ver nube/tendencias.js. */
+  "triggers": { "crons": ["0 11 * * *"] },
+
   "observability": { "enabled": true }
 }

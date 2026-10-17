@@ -62,19 +62,19 @@ const tocaA = (a, tipo, id) =>
 /* Leer, cambiar y guardar el cuaderno. Entre leer y guardar alguien pudo
    escribir desde la app; el almacén lo detecta por el número de versión y
    entonces se vuelve a leer y se aplica el cambio sobre lo nuevo. */
-async function leerDb(cuaderno) {
+export async function leerDb(cuaderno) {
   const r = await cuaderno.leer(CLAVE_PRINCIPAL);
   if (!r) return { db: null, rev: 0 };
   return { db: JSON.parse(r.texto), rev: r.rev };
 }
 
-async function cambiarDb(cuaderno, quien, cambio) {
+export async function cambiarDb(cuaderno, quien, cambio, firma = `${quien} vía Claude`) {
   for (let intento = 0; intento < 4; intento += 1) {
     const { db, rev } = await leerDb(cuaderno);
     if (!db) throw new Error("El cuaderno está vacío: abre el CRM una vez antes de usarlo desde Claude.");
     const res = cambio(db);
     if (res.error) return res;
-    const r = await cuaderno.escribirSi(CLAVE_PRINCIPAL, JSON.stringify(res.db), `${quien} vía Claude`, rev);
+    const r = await cuaderno.escribirSi(CLAVE_PRINCIPAL, JSON.stringify(res.db), firma, rev);
     if (r.ok) return res;
   }
   throw new Error("El cuaderno cambió varias veces seguidas mientras se guardaba. Inténtalo de nuevo.");

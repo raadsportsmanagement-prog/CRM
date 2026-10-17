@@ -18,11 +18,13 @@
    el Worker no responde nada: cerrado por defecto.
    ──────────────────────────────────────────────────────────── */
 
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { atenderMcp } from "./mcp.js";
 import { atenderClaude } from "./claude.js";
 import { atenderEstudio } from "./estudio.js";
 import { atenderDrafts } from "./drafts.js";
+import { atenderTendencias, tendenciasProgramadas } from "./tendencias.js";
+import { recibirEventosCatch } from "./catch.js";
 
 /* Las claves que guarda la app empiezan todas así; cualquier otra cosa se
    rechaza para que el almacén no sirva de depósito de lo que sea. */
@@ -285,6 +287,10 @@ export default {
       if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
       return atenderDrafts(req, env);
     }
+    if (url.pathname === "/api/tendencias") {
+      if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
+      return atenderTendencias(req, env, cuaderno, quien);
+    }
 
     const m = url.pathname.match(/^\/api\/kv\/(.+)$/);
     if (m) {
@@ -314,4 +320,20 @@ export default {
 
     return json({ error: "No existe" }, 404);
   },
+
+  /* Cada mañana (ver "triggers" en wrangler.jsonc): buscar tendencias y que
+     JEV las califique, para que estén listas al abrir el CRM. */
+  async scheduled(evento, env, ctx) {
+    ctx.waitUntil(tendenciasProgramadas(env, env.CUADERNO.getByName("principal")));
+  },
 };
+
+/* La puerta de servicio: sólo la alcanza otro Worker de la misma cuenta que
+   la tenga declarada como service binding (el puente, crm-medidor). No tiene
+   dirección pública ni pasa por Access, así que el puente es quien revisa la
+   firma de Catch antes de llamar aquí. */
+export class Puerta extends WorkerEntrypoint {
+  async eventosCatch(cuerpo) {
+    return recibirEventosCatch(this.env.CUADERNO.getByName("principal"), cuerpo);
+  }
+}

@@ -20,6 +20,15 @@ workers_dev = true
 binding = "EVENTOS"
 id = "c7e35f61a51d49aeab9eed36a352dac4"
 
+# La app Catch: los avisos que llegan a /catch/eventos se entregan al CRM por
+# aquí, sin pasar por Cloudflare Access. "Puerta" es la clase de
+# nube/worker.js. El secreto con que Catch firma va aparte:
+#   npx wrangler secret put CATCH_SECRETO --config wrangler.toml
+[[services]]
+binding = "CRM"
+service = "crm-raad"
+entrypoint = "Puerta"
+
 # La clave NO va en este archivo: este archivo entra al repositorio.
 # Se guarda cifrada en Cloudflare con:
 #   npx wrangler secret put CLAVE
