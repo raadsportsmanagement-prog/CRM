@@ -16,6 +16,9 @@
     "run_worker_first": ["/api/*", "/mcp"]
   },
 
+  /* Workers AI: genera las fotos con personas del Estudio (FLUX.2). */
+  "ai": { "binding": "AI" },
+
   "durable_objects": {
     "bindings": [{ "name": "CUADERNO", "class_name": "Cuaderno" }]
   },

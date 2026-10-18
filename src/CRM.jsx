@@ -33,6 +33,7 @@ import {
 } from "./automations.js";
 import { ANOS, GRUPOS, DIVISIONES, analizarRoster } from "./drafts.js";
 import { PERFIL_BASE, CRITERIOS_JEV } from "./tendencias.js";
+import { PERFIL_MARCA_BASE } from "./marca.js";
 import {
   ETAPAS_AGENTE, HUMANO, agenteVacio, normalizaAgente, normalizeAgentes, normalizeAgentesChat, agentesDeBase,
 } from "./agentes.js";
@@ -4864,6 +4865,24 @@ const aDataUrl = (blob) => new Promise((ok, mal) => {
   r.readAsDataURL(blob);
 });
 
+/* Una foto subida, a lo sumo de 1600 px de lado y en JPG: así cabe en lo que
+   Claude puede mirar y no infla el borrador. */
+const achicarFoto = async (archivo) => {
+  const img = new Image();
+  const url = URL.createObjectURL(archivo);
+  try {
+    img.src = url;
+    await img.decode();
+    const k = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+    const lienzo = document.createElement("canvas");
+    lienzo.width = Math.round(img.naturalWidth * k); lienzo.height = Math.round(img.naturalHeight * k);
+    lienzo.getContext("2d").drawImage(img, 0, 0, lienzo.width, lienzo.height);
+    return lienzo.toDataURL("image/jpeg", 0.88);
+  } catch (_) {
+    throw new Error("No se pudo leer la foto.");
+  } finally { URL.revokeObjectURL(url); }
+};
+
 /* Las dos familias que se le permiten a Claude, bajadas una vez por sesión.
    Sólo el subconjunto latino: es el que trae tildes y eñes. */
 let fuentesSvg = null;
@@ -5189,7 +5208,9 @@ function TendenciasView({ db, setDb, say, onEstudio }) {
 
 function EstudioView({ db, setDb, say, onListo }) {
   const pu = db.integrations.puente;
-  const marca = (db.estudio && db.estudio.marca) || "";
+  /* Como el perfil de Tendencias: sin editar, va el de base; vaciarlo a
+     propósito se respeta. */
+  const marca = (db.estudio && db.estudio.marca) ?? PERFIL_MARCA_BASE;
   const m = memoriaEstudio || {};
   const [fuente, setFuente] = useState(m.fuente || "idea");
   const [brief, setBrief] = useState(m.brief || "");
@@ -5202,6 +5223,8 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [tandaElegida, setTandaElegida] = useState(m.tandaElegida ?? -1);
   const [elegida, setElegida] = useState(m.elegida ?? -1);
   const [foto, setFoto] = useState(m.foto || "");
+  /* Las fotos generadas para esta pieza, para poder cambiar entre ellas. */
+  const [fotosIA, setFotosIA] = useState(m.fotosIA || []);
   const [disenos, setDisenos] = useState(m.disenos || []);
   const [diseno, setDiseno] = useState(m.diseno ?? -1);
   const [ajuste, setAjuste] = useState("");
@@ -5226,8 +5249,8 @@ function EstudioView({ db, setDb, say, onListo }) {
   const [verHistorial, setVerHistorial] = useState(false);
 
   useEffect(() => {
-    memoriaEstudio = { fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId };
-  }, [fuente, brief, tandas, vista, tandaElegida, elegida, foto, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId]);
+    memoriaEstudio = { fuente, brief, tandas, vista, tandaElegida, elegida, foto, fotosIA, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId };
+  }, [fuente, brief, tandas, vista, tandaElegida, elegida, foto, fotosIA, disenos, diseno, draft, subida, textosImg, canales, correo, ctaUrl, hecho, ig, borradorId]);
 
   useEffect(() => { listarBorradores().then(setHistorial).catch(() => {}); }, []);
 
@@ -5297,7 +5320,7 @@ function EstudioView({ db, setDb, say, onListo }) {
   const empezarOtra = () => {
     memoriaEstudio = null;
     setTandas([]); setVista(-1); setTandaElegida(-1); setElegida(-1); setDisenos([]); setDiseno(-1); setDraft(null); setSubida(null);
-    setCorreo(null); setIg(null); setHecho({ wa: false, correo: false, ig: false }); setBrief(""); setFoto(""); setBorradorId(null);
+    setCorreo(null); setIg(null); setHecho({ wa: false, correo: false, ig: false }); setBrief(""); setFoto(""); setFotosIA([]); setBorradorId(null);
     hechoAntes.current = { wa: false, correo: false, ig: false };
     cuentas.current = "0/0";
   };
@@ -5365,19 +5388,45 @@ function EstudioView({ db, setDb, say, onListo }) {
     say("Plantilla de correo guardada en Plantillas → Correo de marketing.");
   };
 
-  const disenar = async (variante, previo) => {
+  /* Claude ve la foto antes de componer, para no taparle la cara a nadie. Cada
+     diseño recuerda con qué foto se hizo: ajustarlo o pasarlo a Instagram usa
+     esa, aunque después se elija otra. */
+  const disenar = async (variante, previo, conFoto = previo ? previo.foto ?? foto : foto) => {
     const r = await pedirEstudio({
-      accion: "imagen", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje, imagen: { ...(p.imagen || {}), ...textosImg } }, marca, conFoto: Boolean(foto), variante,
+      accion: "imagen", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje, imagen: { ...(p.imagen || {}), ...textosImg } }, marca, foto: conFoto, variante,
       ...(previo ? { ajuste: ajuste.trim() || "Pon los textos indicados en lugar de los actuales.", anterior: previo.svg } : {}),
     });
-    const archivo = await svgAJpg(r.svg, foto);
-    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), textos: { ...textosImg }, variante, para: clave, ronda: sigRonda };
+    const archivo = await svgAJpg(r.svg, conFoto);
+    return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), textos: { ...textosImg }, variante, foto: conFoto, para: clave, ronda: sigRonda };
+  };
+
+  /* Dos fotos con personas generadas a partir de la pieza; la primera queda
+     elegida si no había ninguna. */
+  const crearFotos = async () => {
+    const r = await pedirEstudio({ accion: "fotos", propuesta: { ...p, mensaje: draft ? draft.body : p.mensaje, imagen: { ...(p.imagen || {}), ...textosImg } }, marca });
+    const nuevas = (r.fotos || []).map((f) => f.foto);
+    setFotosIA((xs) => [...nuevas, ...xs].slice(0, 8));
+    return nuevas[0];
+  };
+
+  const generarFotos = async () => {
+    setBusy("fotos"); setErr("");
+    try { setFoto(await crearFotos()); } catch (e) { setErr((e && e.message) || String(e)); }
+    setBusy("");
   };
 
   const disenarDos = async () => {
     setBusy("disenar"); setErr(""); setSubida(null);
     try {
-      const hechos = await Promise.allSettled([disenar(0), disenar(1)]);
+      /* Siempre con una persona: si todavía no hay foto, se crea primero. */
+      let conFoto = foto;
+      if (!conFoto) {
+        setBusy("fotos");
+        conFoto = await crearFotos();
+        setFoto(conFoto);
+        setBusy("disenar");
+      }
+      const hechos = await Promise.allSettled([disenar(0, null, conFoto), disenar(1, null, conFoto)]);
       const buenos = hechos.filter((h) => h.status === "fulfilled").map((h) => h.value);
       if (!buenos.length) throw hechos[0].reason;
       setDiseno(disenos.length);
@@ -5410,9 +5459,10 @@ function EstudioView({ db, setDb, say, onListo }) {
      La imagen sale del diseño marcado en el paso 3, recompuesta en vertical;
      el texto, del mensaje elegido. Las dos cosas se piden a la vez y lo que
      llegue se queda, aunque la otra falle. */
+  const fotoDiseno = () => (disenos[diseno] && disenos[diseno].foto) ?? foto;
   const propuestaActual = () => ({ ...p, mensaje: draft.body, imagen: { ...(p.imagen || {}), ...textosImg } });
   const imagenIg = async (r) => {
-    const archivo = await svgAJpg(r.svg, foto, 1080, 1350);
+    const archivo = await svgAJpg(r.svg, fotoDiseno(), 1080, 1350);
     return { svg: r.svg, archivo, vista: URL.createObjectURL(archivo), subida: null };
   };
 
@@ -5420,7 +5470,7 @@ function EstudioView({ db, setDb, say, onListo }) {
     setBusy("ig"); setErr("");
     try {
       const [im, tx] = await Promise.allSettled([
-        pedirEstudio({ accion: "adaptarInstagram", svg: disenos[diseno].svg, conFoto: Boolean(foto), marca }).then(imagenIg),
+        pedirEstudio({ accion: "adaptarInstagram", svg: disenos[diseno].svg, foto: fotoDiseno(), marca }).then(imagenIg),
         soloImagen ? Promise.resolve(null) : pedirEstudio({ accion: "instagram", propuesta: propuestaActual(), marca }),
       ]);
       setIg((x) => ({
@@ -5437,7 +5487,7 @@ function EstudioView({ db, setDb, say, onListo }) {
   const ajustarIgImagen = async () => {
     setBusy("igImagen"); setErr("");
     try {
-      const r = await pedirEstudio({ accion: "imagen", propuesta: propuestaActual(), marca, conFoto: Boolean(foto), ajuste: ajusteIg.trim(), anterior: ig.svg });
+      const r = await pedirEstudio({ accion: "imagen", propuesta: propuestaActual(), marca, foto: fotoDiseno(), ajuste: ajusteIg.trim(), anterior: ig.svg });
       const nueva = await imagenIg(r);
       setIg((x) => ({ ...x, ...nueva }));
       setAjusteIg("");
@@ -5475,7 +5525,7 @@ function EstudioView({ db, setDb, say, onListo }) {
     e.target.value = "";
     if (!f) return;
     if (!f.type.startsWith("image/")) { setErr("Tiene que ser una imagen."); return; }
-    setFoto(await aDataUrl(f));
+    try { setFoto(await achicarFoto(f)); } catch (e2) { setErr((e2 && e2.message) || String(e2)); }
   };
 
   const paso = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18, marginBottom: 16 };
@@ -5559,10 +5609,15 @@ function EstudioView({ db, setDb, say, onListo }) {
           {verMarca && (
             <div style={{ marginTop: 12 }}>
               <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: C.mute, marginBottom: 5 }}>SOBRE LA MARCA</div>
-              <textarea className="crm-in" value={marca} onChange={(e) => ponerMarca(e.target.value)} rows={5}
-                placeholder="Qué es Catch, para quién es, qué ofrece la app, el enlace de registro, cómo hablamos, qué nunca decimos…"
-                style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: 12.5, resize: "vertical" }} />
-              <div style={nota}>Se guarda solo y Claude lo lee en cada pieza. Colores y logo ya los conoce.</div>
+              <textarea className="crm-in" value={marca} onChange={(e) => ponerMarca(e.target.value)} rows={14}
+                placeholder="Propósito, audiencias, qué ofrece Catch, cómo hablamos, qué nunca decimos y la llamada a la acción…"
+                style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+                <span style={{ ...nota, flex: 1 }}>
+                  Es el perfil del especialista en marketing: Claude lo sigue en cada pieza. Lo que sabe del sistema universitario, los colores y el logo ya los trae. Se guarda solo.
+                </span>
+                <Btn size="sm" variant="ghost" Icon={RotateCcw} onClick={() => ponerMarca(PERFIL_MARCA_BASE)}>Volver al de base</Btn>
+              </div>
             </div>
           )}
         </div>
@@ -5626,16 +5681,30 @@ function EstudioView({ db, setDb, say, onListo }) {
               ))}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+              <Btn variant="outline" Icon={Sparkles} disabled={Boolean(busy)} onClick={generarFotos}>
+                {busy === "fotos" ? "Creando fotos…" : fotosIA.length ? "Otras 2 fotos" : "Crear fotos con IA"}
+              </Btn>
               <label className="crm-btn" style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${C.line}`, background: C.panel, borderRadius: 6, padding: "5px 11px", fontFamily: "var(--ui)", fontSize: 12.5, cursor: "pointer" }}>
-                <ImagePlus size={13} />{foto ? "Cambiar foto de fondo" : "Usar una foto de fondo (opcional)"}
+                <ImagePlus size={13} />Subir una foto propia
                 <input type="file" accept="image/*" onChange={elegirFoto} style={{ display: "none" }} />
               </label>
-              {foto && <><img src={foto} alt="" style={{ height: 34, borderRadius: 4 }} /><Btn size="sm" variant="ghost" Icon={X} onClick={() => setFoto("")}>Quitar</Btn></>}
               <Btn variant="solid" Icon={Palette} disabled={Boolean(busy)} onClick={disenarDos}>
                 {busy === "disenar" ? "Diseñando…" : deEste.length ? "Diseñar otras 2" : "Diseñar 2 opciones"}
               </Btn>
             </div>
-            {busy === "disenar" && espera("Claude está diseñando dos composiciones; tarda alrededor de un minuto.")}
+            {(foto || fotosIA.length > 0) && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+                {[...new Set([foto, ...fotosIA].filter(Boolean))].map((f) => (
+                  <button key={f.slice(-40)} onClick={() => setFoto(f)} title={f === foto ? "Foto elegida" : "Usar esta foto"}
+                    style={{ padding: 0, border: `3px solid ${f === foto ? C.jade : "transparent"}`, borderRadius: 7, background: "none", cursor: "pointer" }}>
+                    <img src={f} alt="" style={{ display: "block", height: 74, borderRadius: 4 }} />
+                  </button>
+                ))}
+                <span style={{ ...nota, flex: "1 1 200px" }}>La marcada es la que usan los diseños nuevos. Las personas creadas con IA no existen: ilustran la pieza, no son atletas de Catch.</span>
+              </div>
+            )}
+            {busy === "fotos" && espera("Claude describe dos fotos y el generador las crea; tarda entre 20 segundos y un minuto.")}
+            {busy === "disenar" && espera("Claude mira la foto y diseña dos composiciones; tarda alrededor de un minuto.")}
             {deEste.length > 0 && (
               <>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>

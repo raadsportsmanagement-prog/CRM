@@ -9,7 +9,7 @@ export const PERFIL_BASE = `## Propósito
 Encontrar lo que está pasando este mes en becas deportivas universitarias (NCAA, NAIA, JUCO), reclutamiento de atletas latinoamericanos y la vida del estudiante-atleta en EE. UU., para convertirlo en mensajes de WhatsApp y correo que lleven a registrarse en la app Catch.
 
 ## Audiencia
-Atletas de 15 a 25 años en Latinoamérica (colegios de estrato medio-alto, deporte competitivo) que quieren estudiar y jugar en el exterior, y sus padres, que quieren que sigan estudiando.
+Atletas de 14 a 25 años en Latinoamérica (NSE 4-6, deporte competitivo), hombres y mujeres, que sienten que el sistema local los encasilló y quieren estudiar y jugar en el exterior; y sus padres (40 a 50 años), que quieren que sigan estudiando y buscan a alguien serio que los acompañe.
 
 ## Ángulos a priorizar
 - Cambios de reglas NCAA, NIL y elegibilidad que afectan a internacionales
@@ -17,11 +17,16 @@ Atletas de 15 a 25 años en Latinoamérica (colegios de estrato medio-alto, depo
 - Historias reales de latinos becados y lo que hicieron para lograrlo
 - Errores comunes en el proceso de reclutamiento
 - Datos verificables (cifras, montos de becas, número de cupos)
+- Atletas que rompieron un "no puedes" (estatura, edad, físico, género) y lo que hicieron
+- Fútbol y deporte femenino: oportunidades y becas para mujeres
+- Costo de la educación superior en Colombia frente a estudiar con beca en EE. UU.
+- Tecnología y datos en la evaluación de atletas (IA, análisis de rendimiento)
 
 ## Ignorar
 - Apuestas deportivas
 - Chismes de fichajes profesionales sin relación con becas
 - Promesas de "beca garantizada"
+- Contenido que refuerce estereotipos o se burle de atletas
 
 ## Ajustes
 - idioma: español
