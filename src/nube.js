@@ -13,6 +13,8 @@
    copias anteriores por si eso alguna vez pisa algo que importaba.
    ──────────────────────────────────────────────────────────── */
 
+import { fusionarTextos } from "./fusion.js";
+
 const CLAVE_PRINCIPAL = "crm:data";
 
 /* Identifica a esta pestaña ante el servidor, para que el aviso de un cambio
@@ -21,6 +23,21 @@ const ORIGEN = (crypto.randomUUID && crypto.randomUUID()) || `o${Date.now()}${Ma
 
 /* La última versión que esta pestaña conoce de cada clave. */
 const revs = new Map();
+
+/* La versión de la que desciende lo que la pestaña tiene en memoria: la que
+   leyó al abrir, la última que guardó o la última que adoptó de afuera. Se
+   guarda "sobre" ella; si el servidor ya va en otra (escribió un agente,
+   Catch, Claude por /mcp, otro equipo), se juntan las dos en vez de pisar.
+   `candidatas` es lo que llegó de afuera y el CRM todavía no adoptó: sólo
+   pasa a ser base cuando el CRM avisa cuál de ellas tomó (`adoptado`): puede
+   haber llegado otra más nueva entre medias, y la base tiene que ser
+   exactamente la que el CRM tiene en memoria. */
+const bases = new Map();
+const candidatas = new Map();
+const proponer = (clave, texto, rev) => {
+  const l = (candidatas.get(clave) || []).filter((c) => c.rev !== rev);
+  candidatas.set(clave, [...l, { texto, rev }].slice(-6));
+};
 
 const SESION_VENCIDA =
   "La sesión del CRM venció. Recarga la página para volver a entrar; lo que no se guardó sigue en esta pestaña mientras no la cierres.";
@@ -47,8 +64,9 @@ async function leer(clave) {
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(`el servidor no entregó los datos (${r.status})`);
   const value = await r.text();
-  revs.set(clave, Number(r.headers.get("X-Rev")) || 0);
-  return { value };
+  const rev = Number(r.headers.get("X-Rev")) || 0;
+  revs.set(clave, Math.max(rev, revs.get(clave) || 0));
+  return { value, rev };
 }
 
 const pausa = (ms) => new Promise((ok) => setTimeout(ok, ms));
@@ -59,27 +77,50 @@ const pausa = (ms) => new Promise((ok) => setTimeout(ok, ms));
    `keepalive` para que el envío sobreviva al cierre; el navegador sólo lo
    permite con cuerpos pequeños, así que con un cuaderno grande no se pide. */
 async function escribir(clave, value) {
-  const keepalive = value.length < 60_000;
+  let cuerpo = value;
+  let fusionado = false;
+  let baseRev = (bases.get(clave) || {}).rev;
   let ultimo;
-  for (let intento = 0; intento < 3; intento += 1) {
+  for (let intento = 0; intento < 5; intento += 1) {
     try {
       const r = await pedir(ruta(clave), {
         method: "PUT",
-        headers: { "Content-Type": "application/json", "X-Origen": ORIGEN },
-        body: value,
-        keepalive,
+        headers: {
+          "Content-Type": "application/json", "X-Origen": ORIGEN,
+          ...(baseRev != null ? { "X-Rev-Base": String(baseRev) } : {}),
+        },
+        body: cuerpo,
+        keepalive: cuerpo.length < 60_000,
       });
+      /* Alguien escribió desde que esta pestaña leyó: se trae lo de ahora y
+         se junta con lo propio. La base no cambia hasta que el CRM adopte el
+         resultado: si mientras tanto la persona siguió escribiendo, el
+         próximo guardado vuelve a chocar y se junta otra vez desde la base
+         correcta, en vez de borrar lo ajeno creyendo que lo quitó ella. */
+      if (r.status === 409) {
+        const actual = await leer(clave);
+        if (!actual) { baseRev = 0; continue; }
+        cuerpo = fusionarTextos((bases.get(clave) || {}).texto, cuerpo, actual.value);
+        baseRev = actual.rev;
+        fusionado = true;
+        continue;
+      }
       if (!r.ok) throw new Error(`el servidor no aceptó el guardado (${r.status})`);
       const { rev } = await r.json();
       revs.set(clave, rev);
-      return;
+      if (fusionado) {
+        proponer(clave, cuerpo, rev);
+        return { fusionado: cuerpo };
+      }
+      bases.set(clave, { texto: cuerpo, rev });
+      return {};
     } catch (e) {
       ultimo = e;
       if (e.message === SESION_VENCIDA) break;
       await pausa(600 * (intento + 1));
     }
   }
-  throw ultimo;
+  throw ultimo || new Error("el cuaderno cambió varias veces seguidas mientras se guardaba");
 }
 
 /* Las escrituras de una misma clave salen en fila: si dos guardados viajaran
@@ -99,6 +140,7 @@ async function traerCambio(clave, rev) {
   try {
     const r = await leer(clave);
     if (!r) return;
+    proponer(clave, r.value, r.rev);
     window.dispatchEvent(new StorageEvent("storage", { key: clave, newValue: r.value }));
   } catch (_) {
     /* Si no se pudo traer ahora, la próxima conexión vuelve a comparar
@@ -159,8 +201,23 @@ function conectarEnVivo() {
 export function almacenNube() {
   conectarEnVivo();
   return {
-    get: (clave) => leer(clave),
+    get: async (clave) => {
+      const r = await leer(clave);
+      bases.set(clave, r ? { texto: r.value, rev: r.rev } : { texto: null, rev: 0 });
+      return r && { value: r.value };
+    },
+    /* Devuelve { fusionado } cuando tuvo que juntar lo propio con lo que había
+       escrito otro: el CRM lo adopta si no hubo cambios nuevos entre medias. */
     set: (clave, value) => enFila(clave, () => escribir(clave, value)),
+    /* El CRM avisa que tomó lo último que llegó de afuera (o lo fusionado):
+       desde ahí, lo que tiene en memoria desciende de esa versión. */
+    adoptado: (clave, texto) => {
+      const l = candidatas.get(clave) || [];
+      const c = l.find((x) => x.texto === texto);
+      if (!c) return;
+      bases.set(clave, c);
+      candidatas.set(clave, l.filter((x) => x.rev > c.rev));
+    },
     delete: (clave) => enFila(clave, async () => {
       const r = await pedir(ruta(clave), { method: "DELETE", headers: { "X-Origen": ORIGEN } });
       if (!r.ok && r.status !== 404) throw new Error(`el servidor no borró (${r.status})`);

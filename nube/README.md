@@ -152,3 +152,77 @@ npx wrangler secret put ANTHROPIC_API_KEY
 
 Para probarlo en local con `npm run nube:local`, agrega
 `ANTHROPIC_API_KEY=...` a `.dev.vars`.
+
+## Los agentes trabajando solos (`nube/operacion.js`)
+
+Los agentes de **Mensajes → Agentes** contestan los WhatsApp en el servidor,
+también con el CRM cerrado:
+
+1. Meta (o Twilio) avisa al puente de un WhatsApp entrante. El puente lo
+   guarda en KV, como siempre, y además se lo pasa al CRM por el service
+   binding (`Puerta.mensajesWhatsApp`).
+2. El mensaje entra al cuaderno: se pega a la ficha con ese teléfono o se
+   crea el contacto.
+3. La conversación espera 8 segundos en la fila del `Operador` (un Durable
+   Object con alarma), por si llegan más mensajes seguidos.
+4. El agente que le toca redacta. Según su modo:
+   - **Sugerir** (el de fábrica): queda en **Mensajes → Supervisión** para
+     aprobar, corregir o descartar.
+   - **Automático**: sale solo por el puente. Al llegar al tope de mensajes
+     automáticos con la misma persona en 24 horas, vuelve a pedir aprobación.
+   - Si el agente pide una persona, la conversación queda en manos de una
+     persona y deja de contestar ahí.
+
+En la lista de agentes está el botón **Pausar todos**: siguen entrando los
+mensajes, pero nadie redacta ni envía.
+
+Lo que hace un agente queda en `supervision` y cada escritura va firmada con
+su nombre (se ve en `/api/copias`).
+
+### Guardar sin pisar a los agentes
+
+La pestaña guarda indicando sobre qué versión escribe (`X-Rev-Base`). Si un
+agente, Catch o Claude escribieron entre medias, el servidor contesta 409 y
+la pestaña junta las dos versiones ficha por ficha (`src/fusion.js`). Si las
+dos cambian el mismo valor, gana la pestaña.
+
+### Para encenderlo
+
+- En el puente: `WA_APP_SECRET` y el webhook de WhatsApp apuntando a
+  `https://go.raadsports.com/wa/webhook` (ver `tracker/README.md`). Sin eso,
+  Meta no entrega los mensajes entrantes.
+- Publicar primero el CRM (`npm run deploy`, crea el `Operador`) y después
+  el puente (`npx wrangler deploy --config wrangler.toml` en `tracker/`).
+- En Conexiones, la clave del puente: es con la que salen los mensajes.
+
+## Los agentes de operación (`nube/marketing.js`)
+
+La cadena de una noticia a un lead que se suscribe en Catch, sola en el
+servidor. Se configura en **Mensajes → Agentes → Agentes de operación**.
+
+| Agente | Cuándo | Qué hace |
+|---|---|---|
+| Contenido | 6:00 de Bogotá, después de Tendencias | Toma la tendencia con mejor nota de JEV (mínimo configurable), escribe el WhatsApp y el correo con `{{registro}}` y manda la plantilla a Meta |
+| Campañas | Cada 10 minutos | Cuando Meta aprueba, envía en tandas de 20 a los leads sin registro, dentro del horario y del tope semanal por persona |
+| Seguimiento | Cada 10 minutos | A los N días de una campaña, a quien no se registró ni contestó, la plantilla fija `catch_seguimiento_v1`; si contesta, lo atiende el agente de texto |
+| Conversión (`nube/catch.js`) | Cuando Catch avisa | Registro → `leadStatus` Conectado. Pago → Cliente, y su negocio pasa a Ganado (o se crea ganado) |
+
+Nadie recibe campañas si ya se registró, es cliente, está descalificado,
+lo atiende una persona o llegó al tope. El enlace de cada envío lleva
+`ref` (el id del contacto) y `utm_medium` / `utm_campaign`, que Catch
+devuelve al registrarse.
+
+### Correo por Amazon SES
+
+Cloudflare Email no admite marketing, así que las campañas salen por SES:
+
+1. En SES, verifica el dominio del remitente (SPF/DKIM) y pide salir del
+   modo de prueba (sandbox).
+2. Crea un usuario de IAM que sólo pueda `ses:SendEmail` y guarda sus
+   llaves: `npx wrangler secret put AWS_ACCESS_KEY_ID` y
+   `npx wrangler secret put AWS_SECRET_ACCESS_KEY`.
+3. En `wrangler.jsonc`, `SES_REGION` y `SES_FROM` (p. ej.
+   `"Catch <hola@catchrsm.com>"`).
+
+Sin SES, las campañas salen sólo por WhatsApp. Las bajas las recibe el
+puente (`/b/<id>`) y el agente las aplica antes de cada tanda.

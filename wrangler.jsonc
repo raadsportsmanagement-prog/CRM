@@ -19,10 +19,22 @@
   /* Workers AI: genera las fotos con personas del Estudio (FLUX.2). */
   "ai": { "binding": "AI" },
 
+  /* Cuaderno guarda los datos; Operador es la fila de los agentes, que
+     contestan los WhatsApp con el CRM cerrado (nube/operacion.js). */
   "durable_objects": {
-    "bindings": [{ "name": "CUADERNO", "class_name": "Cuaderno" }]
+    "bindings": [
+      { "name": "CUADERNO", "class_name": "Cuaderno" },
+      { "name": "OPERADOR", "class_name": "Operador" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cuaderno"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Cuaderno"] },
+    { "tag": "v2", "new_sqlite_classes": ["Operador"] }
+  ],
+
+  /* El puente (tracker/, crm-medidor): los agentes mandan los WhatsApp por
+     aquí, sin salir a internet. La clave del puente la ponen en Conexiones. */
+  "services": [{ "binding": "PUENTE", "service": "crm-medidor" }],
 
   /* Sólo la dirección propia, que es la que cuida Cloudflare Access. Las
      direcciones automáticas de workers.dev quedarían fuera de Access. */
@@ -33,13 +45,19 @@
   /* Se llenan después de crear la aplicación en Cloudflare Access (paso 3 del
      README). Mientras estén vacíos, /api/ no responde a nadie. */
   "vars": {
+    /* Amazon SES, para el correo de las campañas (nube/ses.js). Las llaves
+       van aparte: wrangler secret put AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+       Vacío, las campañas salen sólo por WhatsApp. */
+    "SES_REGION": "",
+    "SES_FROM": "",
     "ACCESS_EQUIPO": "https://quiet-hill-7383.cloudflareaccess.com",
     "ACCESS_AUD": "f77abf9451e89957aab1122906de15f8f91c772104433288ecec3f7d4b2dae7e"
   },
 
-  /* Tendencias: a las 6:00 de Bogotá (11:00 UTC) Claude busca y JEV califica.
-     Ver nube/tendencias.js. */
-  "triggers": { "crons": ["0 11 * * *"] },
+  /* A las 6:00 de Bogotá (11:00 UTC) Claude busca tendencias, JEV califica y
+     el Agente de Contenido arma la campaña del día. Cada diez minutos, el de
+     Campañas y el de Seguimiento. Ver nube/marketing.js. */
+  "triggers": { "crons": ["0 11 * * *", "*/10 * * * *"] },
 
   "observability": { "enabled": true }
 }

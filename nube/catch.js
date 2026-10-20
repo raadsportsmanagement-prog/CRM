@@ -17,6 +17,7 @@
 
 import { z } from "zod";
 import { cambiarDb } from "./mcp.js";
+import { conAnotacion } from "../src/agentes.js";
 
 export const ETAPAS_CATCH = ["Sembrando", "Al mundo", "El sueño", "Más alto", "1er cierre", "La meta"];
 export const ESTADOS_APP = ["Sin registro", "Registrado", "Perfil completo", "Activo"];
@@ -95,7 +96,10 @@ export function aplicarEventosCatch(db, eventos) {
   const vistos = new Set(Array.isArray(app.vistos) ? app.vistos : []);
   const contacts = [...(db.contacts || [])];
   let activities = db.activities || [];
+  let deals = [...(db.deals || [])];
   const nuevasActs = [];
+  /* Lo que conviene que una persona sepa: quién se registró y quién pagó. */
+  const avisos = [];
   const res = { aplicados: 0, repetidos: 0, invalidos: 0, fichasNuevas: 0, fusionadas: 0 };
 
   const tocar = (i, props) => { contacts[i] = { ...contacts[i], props: { ...contacts[i].props, ...props } }; };
@@ -155,8 +159,13 @@ export function aplicarEventosCatch(db, eventos) {
     const nota = (subject, body = "") => nuevasActs.push({ id: uid(), ext: `catch:${ev.id}`, type: "note", dir: "out", at: ev.at, subject, body, contactIds: [c.id] });
 
     if (ev.tipo === "registro") {
+      /* Ya no es un lead frío: se registró. Avanza de estado para que lo
+         atienda el agente que acompaña a quien ya está en conversación, y
+         deja de recibir las campañas que invitan a registrarse. */
+      const frio = ["", "Nuevo", "Abierto", "Intento de contacto"].includes(props.leadStatus || "");
       tocar(i, {
         ...base, ...completar,
+        ...(frio ? { leadStatus: "Conectado" } : {}),
         appEstado: subirEstado(props.appEstado, "Registrado"),
         appRegistroAt: props.appRegistroAt || ev.at,
         ...(ev.utm && ev.utm.campaign ? { appCampana: ev.utm.campaign } : {}),
@@ -165,6 +174,7 @@ export function aplicarEventosCatch(db, eventos) {
       });
       const desde = ev.utm && ev.utm.medium ? ` desde ${ev.utm.medium === "whatsapp" ? "WhatsApp" : ev.utm.medium === "email" ? "un correo" : ev.utm.medium}` : "";
       nota(`Se registró en Catch${desde}${ev.conversacional ? " conversando con el Companion" : ""}`);
+      avisos.push({ c, ev, texto: `Se registró en Catch${desde}${ev.utm && ev.utm.campaign ? ` (campaña ${ev.utm.campaign})` : ""}.`, campanaId: (ev.utm && ev.utm.campaign) || "" });
     } else if (ev.tipo === "perfil") {
       tocar(i, { ...base, ...completar, ...(ev.completo ? { appEstado: subirEstado(props.appEstado, "Perfil completo") } : {}) });
       if (ev.completo) nota("Completó su perfil en Catch");
@@ -173,8 +183,20 @@ export function aplicarEventosCatch(db, eventos) {
       tocar(i, { ...base, appEtapa: etapa, appEstado: subirEstado(props.appEstado, "Registrado") });
       nota(`Pasó a la etapa ${ev.etapa} en Catch: ${etapa}`);
     } else if (ev.tipo === "acceso") {
-      tocar(i, { ...base, ...(ev.activo ? { appEstado: subirEstado(props.appEstado, "Activo") } : {}) });
+      tocar(i, { ...base, ...(ev.activo ? { appEstado: subirEstado(props.appEstado, "Activo"), type: "Cliente", leadStatus: "Calificado" } : {}) });
       nota(ev.activo ? "Activó su acceso pago en Catch" : "Se le cerró el acceso pago en Catch");
+      if (ev.activo) {
+        /* La conversión: su negocio abierto pasa a Ganado; si no tenía, se
+           crea uno ya ganado, para que el pipeline cuente la venta. */
+        const abierto = deals.find((d) => (d.contactIds || []).includes(c.id) && !["Ganado", "Perdido"].includes(d.props && d.props.stage));
+        if (abierto) {
+          deals = deals.map((d) => (d.id === abierto.id ? { ...d, props: { ...d.props, stage: "Ganado", lastActivityAt: ev.at } } : d));
+        } else if (!deals.some((d) => (d.contactIds || []).includes(c.id) && d.props && d.props.source === "App Catch" && d.props.stage === "Ganado")) {
+          const nombre = [contacts[i].props.firstName, contacts[i].props.lastName].filter(Boolean).join(" ") || "Atleta";
+          deals = [{ id: uid(), props: { name: `Suscripción Catch · ${nombre}`, stage: "Ganado", source: "App Catch", createdAt: ev.at, lastActivityAt: ev.at }, contactIds: [c.id] }, ...deals];
+        }
+        avisos.push({ c, ev, texto: "Se suscribió en Catch: pasó a cliente y su negocio quedó ganado." });
+      }
     } else if (ev.tipo === "turno") {
       tocar(i, { ...base, ...completar });
       nuevasActs.push({
@@ -199,10 +221,21 @@ export function aplicarEventosCatch(db, eventos) {
 
   const yaHay = new Set(activities.map((a) => a.ext).filter(Boolean));
   const entran = nuevasActs.filter((a) => !yaHay.has(a.ext));
+  let supervision = db.supervision;
+  for (const a of avisos) {
+    const rec = contacts.find((x) => x.id === a.c.id) || a.c;
+    supervision = conAnotacion({ supervision }, {
+      tipo: "conversion", agente: "App Catch", clave: `contact:${rec.id}`, kind: "contact", recId: rec.id,
+      nombre: [rec.props.firstName, rec.props.lastName].filter(Boolean).join(" ") || "Atleta", texto: a.texto,
+      ...(a.campanaId ? { campanaId: a.campanaId } : {}),
+    });
+  }
   return {
     db: {
       ...db,
       contacts,
+      deals,
+      ...(avisos.length ? { supervision } : {}),
       activities: [...entran.sort((a, b) => (a.at < b.at ? 1 : -1)), ...activities],
       catchApp: { ...app, vistos: [...vistos].slice(-VISTOS_MAX), ultimoAt: new Date().toISOString() },
     },

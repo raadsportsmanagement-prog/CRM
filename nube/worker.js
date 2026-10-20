@@ -25,11 +25,18 @@ import { atenderEstudio } from "./estudio.js";
 import { atenderDrafts } from "./drafts.js";
 import { atenderTendencias, tendenciasProgramadas } from "./tendencias.js";
 import { recibirEventosCatch } from "./catch.js";
+import { Operador, recibirWhatsApp, atenderOperacion } from "./operacion.js";
+import { producirCampana, avanzarCampanas } from "./marketing.js";
+
+/* El Operador es la fila de los agentes (nube/operacion.js). Se exporta
+   desde aquí porque Cloudflare busca las clases en el archivo principal. */
+export { Operador };
 
 /* Las claves que guarda la app empiezan todas así; cualquier otra cosa se
    rechaza para que el almacén no sirva de depósito de lo que sea. */
 const PREFIJO = "crm:";
 const CLAVE_PRINCIPAL = "crm:data";
+const MANANA = "0 11 * * *";
 
 /* Una fila de SQLite en un Durable Object admite hasta 2 MB. El texto se
    parte en trozos de medio millón de caracteres: aun si todos fueran de tres
@@ -205,10 +212,10 @@ export class Cuaderno extends DurableObject {
      /mcp): sólo escribe si nadie guardó entre medias. Si alguien lo hizo,
      devuelve ok: false y el que llama vuelve a leer y reintenta, en vez de
      pisar lo que la app acababa de escribir. */
-  escribirSi(clave, texto, quien, revLeida) {
+  escribirSi(clave, texto, quien, revLeida, origen = "") {
     const actual = (this.#meta(clave) || {}).rev || 0;
     if (actual !== revLeida) return { ok: false, rev: actual };
-    return { ok: true, ...this.escribir(clave, texto, quien, "") };
+    return { ok: true, ...this.escribir(clave, texto, quien, origen) };
   }
 
   borrar(clave, origen) {
@@ -287,6 +294,10 @@ export default {
       if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
       return atenderDrafts(req, env);
     }
+    if (url.pathname === "/api/operacion") {
+      if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
+      return atenderOperacion(req, env, cuaderno, quien);
+    }
     if (url.pathname === "/api/tendencias") {
       if (!req.headers.get("X-Origen")) return json({ error: "Falta X-Origen" }, 400);
       return atenderTendencias(req, env, cuaderno, quien);
@@ -312,6 +323,17 @@ export default {
 
       if (req.method === "PUT") {
         const texto = await req.text();
+        /* La pestaña dice sobre qué versión escribe. Si ya hay otra (la
+           escribió un agente, Catch u otro equipo), no se pisa: se le
+           contesta 409 y ella junta las dos (src/fusion.js). Sin la cabecera
+           se guarda como antes, para una pestaña abierta con la versión vieja
+           de la app. */
+        const base = req.headers.get("X-Rev-Base");
+        if (base != null && /^\d+$/.test(base)) {
+          const r = await cuaderno.escribirSi(clave, texto, quien, Number(base), origen);
+          if (!r.ok) return json({ error: "conflicto", rev: r.rev }, 409);
+          return json({ rev: r.rev, at: r.at });
+        }
         return json(await cuaderno.escribir(clave, texto, quien, origen));
       }
       if (req.method === "DELETE") return json(await cuaderno.borrar(clave, origen));
@@ -321,10 +343,21 @@ export default {
     return json({ error: "No existe" }, 404);
   },
 
-  /* Cada mañana (ver "triggers" en wrangler.jsonc): buscar tendencias y que
-     JEV las califique, para que estén listas al abrir el CRM. */
+  /* Los relojes (ver "triggers" en wrangler.jsonc):
+     · cada mañana, buscar tendencias, que JEV las califique y que el Agente
+       de Contenido arme con la mejor la campaña del día;
+     · cada diez minutos, el Agente de Campañas (aprobaciones de Meta y
+       envíos en tandas) y el de Seguimiento. */
   async scheduled(evento, env, ctx) {
-    ctx.waitUntil(tendenciasProgramadas(env, env.CUADERNO.getByName("principal")));
+    const cuaderno = env.CUADERNO.getByName("principal");
+    if (evento.cron === MANANA) {
+      ctx.waitUntil((async () => {
+        await tendenciasProgramadas(env, cuaderno);
+        await producirCampana(env, cuaderno).catch((e) => console.log("El Agente de Contenido falló", (e && e.message) || e));
+      })());
+      return;
+    }
+    ctx.waitUntil(avanzarCampanas(env, cuaderno).catch((e) => console.log("El Agente de Campañas falló", (e && e.message) || e)));
   },
 };
 
@@ -335,5 +368,11 @@ export default {
 export class Puerta extends WorkerEntrypoint {
   async eventosCatch(cuerpo) {
     return recibirEventosCatch(this.env.CUADERNO.getByName("principal"), cuerpo);
+  }
+
+  /* Los WhatsApp que recibió el puente. Entran al cuaderno y los agentes los
+     atienden aunque no haya ninguna pestaña abierta (nube/operacion.js). */
+  async mensajesWhatsApp(mensajes) {
+    return recibirWhatsApp(this.env, this.env.CUADERNO.getByName("principal"), mensajes);
   }
 }

@@ -25,7 +25,7 @@ Tono: motivacional, cercano e innovador, siempre desde lo positivo; español lat
 /* El especialista: lo que sabe del sistema universitario y del oficio no
    depende de la marca, así que vive aquí fijo. Lo que sí cambia con el
    negocio —oferta, audiencias, voz— es el perfil de marca del Estudio. */
-const SISTEMA = `Eres el especialista en marketing del sistema universitario de EE. UU. (college system) del CRM de Raad Sports. Preparas mensajes de marketing por WhatsApp (plantillas que Meta debe aprobar), su versión para correo e Instagram, y sus imágenes, para que atletas latinoamericanos y sus padres se registren en la app Catch.
+export const SISTEMA = `Eres el especialista en marketing del sistema universitario de EE. UU. (college system) del CRM de Raad Sports. Preparas mensajes de marketing por WhatsApp (plantillas que Meta debe aprobar), su versión para correo e Instagram, y sus imágenes, para que atletas latinoamericanos y sus padres se registren en la app Catch.
 
 ${MARCA_BASE}
 
@@ -96,7 +96,7 @@ const json = (data, status = 200) =>
 
 /* Sin perfil guardado (undefined) va el de base; uno borrado a propósito ("")
    se respeta. */
-const marcaDe = (txt) => {
+export const marcaDe = (txt) => {
   const t = String(txt ?? PERFIL_MARCA_BASE).trim().slice(0, 10000);
   return t ? `<marca>\n${t}\n</marca>` : "";
 };

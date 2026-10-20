@@ -66,6 +66,38 @@ const SISTEMA = `Eres el asistente comercial dentro del CRM de Raad Sports. Trab
    corta del lado de la app, aquí sólo se pone un tope por si acaso. */
 const MAX_CONTEXTO = 200_000;
 
+/* Lo que redacta un agente para una ficha, desde la app (atenderClaude) o
+   desde el servidor (nube/operacion.js). Devuelve { texto } o, si el agente
+   decide que atienda una persona, { traspaso } con el motivo. Los errores de
+   la API suben tal cual: quien llama decide cómo contarlos. */
+export async function redactarComoAgente(env, agente, ficha, indicaciones = "") {
+  if (!env.ANTHROPIC_API_KEY) throw new Error("Falta conectar Claude: agrega el secreto ANTHROPIC_API_KEY al Worker.");
+  const fichaTxt = JSON.stringify(ficha || {});
+  if (fichaTxt.length > MAX_CONTEXTO) throw new Error("La ficha es demasiado larga para mandarla completa.");
+  const pedido = [
+    `<ficha>\n${fichaTxt}\n</ficha>`,
+    TAREAS.agente,
+    ...(String(indicaciones || "").trim() ? [`Indicaciones del usuario: ${String(indicaciones).slice(0, 4000)}`] : []),
+  ].join("\n\n");
+  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+  const r = await client.beta.messages.create({
+    model: "claude-opus-5-5",
+    max_tokens: 16000,
+    output_config: { effort: "low" },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    system: sistemaAgente(agente || {}),
+    messages: [{ role: "user", content: pedido }],
+  });
+  if (r.stop_reason === "refusal") return { texto: "", traspaso: "Claude no quiso responder esta conversación." };
+  const texto = r.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  if (texto.startsWith(MARCA_TRASPASO)) {
+    return { texto: "", traspaso: texto.slice(MARCA_TRASPASO.length).trim() || "El agente prefiere que conteste una persona." };
+  }
+  if (!texto) return { texto: "", traspaso: "El agente no supo qué contestar." };
+  return { texto, traspaso: "" };
+}
+
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
 

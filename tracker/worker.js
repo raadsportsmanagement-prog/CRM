@@ -970,6 +970,14 @@ function guardarRecibidos(env, ctx, mensajes) {
     )));
     await env.EVENTOS.put(WA_ULTIMO, String(ms));
   })());
+  /* Y se le pasan al CRM, que los guarda y los pone en la fila de los
+     agentes aunque nadie tenga el CRM abierto (nube/operacion.js). Lo de KV
+     sigue siendo el respaldo: si esto falla, la pestaña los trae como
+     siempre, y el identificador de Meta evita que entren dos veces. */
+  if (env.CRM) {
+    ctx.waitUntil(env.CRM.mensajesWhatsApp(mensajes).catch((e) =>
+      console.log("El CRM no recibió los WhatsApp", (e && e.message) || e)));
+  }
 }
 
 /* Lo recibido desde una fecha, para el CRM. Antes de listar se mira la marca

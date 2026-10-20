@@ -34,8 +34,15 @@ import {
 import { ANOS, GRUPOS, DIVISIONES, analizarRoster } from "./drafts.js";
 import { PERFIL_BASE, CRITERIOS_JEV } from "./tendencias.js";
 import { PERFIL_MARCA_BASE } from "./marca.js";
+import { VACIO_OPS, OPS_FILTRO, grupoFiltro, estaVacio, cumpleFiltros } from "./filtros.js";
+import { normalizaMarketing, normalizeCampanas, audienciaDe } from "./marketing.js";
+import { fichaParaClaude, fichaDe } from "./fichaClaude.js";
+import {
+  marcarEnlacesApp, applyTemplate, VARS_META, EJEMPLOS_META, nombreParaMeta, plantillaWaPara,
+} from "./plantillas.js";
 import {
   ETAPAS_AGENTE, HUMANO, agenteVacio, normalizaAgente, normalizeAgentes, normalizeAgentesChat, agentesDeBase,
+  MODOS_AGENTE, claveConv, agentePorEtapa, agenteDe, normalizaOperacion, normalizeSupervision, POR_REVISAR,
 } from "./agentes.js";
 
 /* ────────────────────────────────────────────────────────────
@@ -223,46 +230,6 @@ function parseCSV(text) {
 /* enHtml: dentro de una plantilla HTML las variables se escapan antes de
    entrar. Una institución llamada "Ríos & Cía." no debe poder abrir una
    etiqueta ni romper un atributo del diseño. */
-/* ── Enlaces a la app Catch ──
-   Todo enlace a la app que sale hacia un contacto lleva su id (ref) y de
-   dónde viene (utm). Catch lo guarda al registrarse y lo devuelve en el
-   evento de registro: así el CRM sabe quién se registró y desde qué envío.
-   {{registro}} pone el enlace de registro ya armado. */
-const APP_CATCH = "https://app.catchrsm.com";
-const APP_REGISTRO = `${APP_CATCH}/register`;
-const RE_APP = /https:\/\/app\.catchrsm\.com[^\s"'<>)]*/g;
-const conParams = (url, params, enHtml) => {
-  let u;
-  try { u = new URL(url.replace(/&amp;/g, "&")); } catch (_) { return url; }
-  for (const [k, v] of Object.entries(params)) if (v && !u.searchParams.has(k)) u.searchParams.set(k, v);
-  const s = u.toString();
-  return enHtml ? s.replace(/&/g, "&amp;") : s;
-};
-const marcarEnlacesApp = (texto, params, enHtml) => String(texto || "").replace(RE_APP, (m) => {
-  /* El punto o la coma que cierra la frase no son parte del enlace. */
-  const [, url, cola] = m.match(/^(.*?)([.,;:!?]*)$/);
-  return conParams(url, params, enHtml) + cola;
-});
-const refDe = (rec, kind) => (kind === "contact" && rec && rec.id ? { ref: rec.id, utm_source: "crm" } : { utm_source: "crm" });
-
-const applyTemplate = (text, rec, kind, enHtml) => {
-  const p = rec.props || {};
-  const map = {
-    nombre: p.firstName || p.name || "",
-    apellido: p.lastName || "",
-    institucion: p.institution || p.name || "",
-    empresa: p.name || p.institution || "",
-    correo: p.email || "",
-    telefono: p.phone || "",
-    registro: conParams(APP_REGISTRO, refDe(rec, kind), false),
-  };
-  const lleno = String(text || "").replace(/\{\{\s*([a-zA-ZñÑáéíóú_]+)\s*\}\}/g, (m, k) => {
-    const v = map[norm(k)];
-    if (v == null) return m;
-    return enHtml ? escapeHtml(v) : v;
-  });
-  return marcarEnlacesApp(lleno, refDe(rec, kind), enHtml);
-};
 
 /* ── Plantillas de WhatsApp aprobadas en Meta ──
    Una plantilla del CRM puede ir enlazada a una que Meta ya aprobó. Por la
@@ -311,21 +278,7 @@ const revisionWa = (r) => (r && typeof r === "object" && r.nombre ? {
 
 const revisionAbierta = (r) => Boolean(r) && r.estado !== "APPROVED" && r.estado !== "REJECTED";
 
-/* Las variables que el CRM sabe llenar —las de applyTemplate—. Una plantilla
-   que pida otra cosa saldría con el {{hueco}} a la vista, así que no se manda. */
-const VARS_META = ["nombre", "apellido", "institucion", "empresa", "correo", "telefono", "registro"];
 
-/* Meta pide un ejemplo por variable para revisarla. Van inventados a
-   propósito: lo que se le manda a revisión no tiene por qué llevar datos de
-   personas reales. */
-const EJEMPLOS_META = {
-  nombre: "Ana", apellido: "Gómez", institucion: "Club Deportivo Los Andes",
-  empresa: "Club Deportivo Los Andes", correo: "ana@ejemplo.com", telefono: "3001234567",
-  registro: `${APP_REGISTRO}?ref=ejemplo`,
-};
-
-const nombreParaMeta = (txt) => String(txt || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-  .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60);
 
 /* Lo que Meta rechazaría de entrada, dicho antes de mandarlo. Las reglas de
    contenido (qué se considera engañoso, la categoría) las decide su revisión. */
@@ -394,27 +347,6 @@ const MOTIVO_RECHAZO = {
   TAG_CONTENT_MISMATCH: "el contenido no coincide con la categoría",
 };
 
-/* Lo que se le pide a Meta para una ficha: cada variable con su valor, y el
-   texto ya armado para el historial. Meta rechaza una variable vacía o con
-   saltos de línea, así que eso se ataja aquí con un mensaje que se entienda. */
-const plantillaWaPara = (meta, rec, kind) => {
-  const valores = meta.vars.map((v) => applyTemplate(v.valor, rec, kind).replace(/\s+/g, " ").trim());
-  const vacia = meta.vars.findIndex((_, i) => !valores[i]);
-  if (vacia >= 0) {
-    return { err: `La variable {{${meta.vars[vacia].clave}}} de «${meta.nombre}» queda vacía para ${titleOf(kind, rec)} (${meta.vars[vacia].valor || "sin dato"}).` };
-  }
-  if (meta.cabecera === "IMAGE" && !meta.imagen) {
-    return { err: `«${meta.nombre}» lleva una imagen en el encabezado y no está elegida. Súbela en Plantillas.` };
-  }
-  const porClave = new Map(meta.vars.map((v, i) => [v.clave, valores[i]]));
-  return {
-    imagen: meta.cabecera === "IMAGE" ? meta.imagen : "",
-    plantilla: meta.nombre,
-    idioma: meta.idioma,
-    variables: meta.formato === "nombrado" ? Object.fromEntries(porClave) : valores,
-    texto: meta.cuerpo.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, k) => (porClave.has(k) ? porClave.get(k) : m)),
-  };
-};
 
 const titleOf = (kind, rec) => {
   const p = rec.props || {};
@@ -465,6 +397,10 @@ const emptyDb = () => ({
      dejó fijado a mano: un agente o una persona. */
   agentes: [],
   agentesChat: {},
+  operacion: normalizaOperacion(),
+  supervision: [],
+  marketing: normalizaMarketing(),
+  campanas: [],
 });
 
 const PAPELERA_DIAS = 15;
@@ -566,6 +502,10 @@ function normalizeDb(raw) {
     drafts: arr(d.drafts).filter((x) => x && x.id).map((x) => ({ ...x, jugadores: arr(x.jugadores) })),
     agentes,
     agentesChat: normalizeAgentesChat(d.agentesChat, agentes),
+    operacion: normalizaOperacion(d.operacion),
+    supervision: normalizeSupervision(d.supervision),
+    marketing: normalizaMarketing(d.marketing),
+    campanas: normalizeCampanas(d.campanas),
   };
 }
 
@@ -759,6 +699,9 @@ export default function CRM() {
   const dbRef = useRef(null);
   const pending = useRef(false);
   const external = useRef(false);
+  /* Lo que hay que hacer cuando la pestaña adopta un cuaderno que cambió
+     afuera. Se llena más abajo, donde ya existe emitirActividad. */
+  const alAdoptar = useRef(null);
   /* Cada cambio sube `rev`. El guardado anota qué número está escribiendo y
      sólo baja la bandera de pendiente si nadie tocó nada mientras escribía; si
      entró un cambio nuevo, sigue pendiente y lo alcanza el guardado siguiente.
@@ -793,8 +736,24 @@ export default function CRM() {
       /* Con localStorage la escritura ya ocurrió al volver de aquí, así que se
          confirma en el acto; un almacenamiento que devuelva promesa se espera. */
       const r = window.storage.set(STORE_KEY, payload);
-      if (r && typeof r.then === "function") r.then(ok, failed);
-      else ok();
+      if (r && typeof r.then === "function") {
+        r.then((res) => {
+          /* En la nube, si otro escribió mientras tanto (un agente, Catch),
+             el guardado juntó las dos versiones. Si la persona no cambió
+             nada más entre medias, la pestaña toma el resultado; si cambió,
+             el próximo guardado vuelve a juntar. */
+          if (res && res.fusionado && rev.current === writing) {
+            try {
+              const next = normalizeDb(JSON.parse(res.fusionado));
+              external.current = true;
+              dbRef.current = next;
+              setDb(next);
+              if (window.storage.adoptado) window.storage.adoptado(STORE_KEY, res.fusionado);
+            } catch (_) {}
+          }
+          ok();
+        }, failed);
+      } else ok();
     } catch (e) { failed(e); }
   }, []);
 
@@ -856,10 +815,13 @@ export default function CRM() {
     const onStorage = (e) => {
       if (e.key !== STORE_KEY || !e.newValue || pending.current) return;
       try {
+        const antes = dbRef.current;
         const next = normalizeDb(JSON.parse(e.newValue));
         external.current = true;
         dbRef.current = next;
         setDb(next);
+        if (window.storage.adoptado) window.storage.adoptado(STORE_KEY, e.newValue);
+        if (alAdoptar.current) alAdoptar.current(antes, next);
       } catch (_) {}
     };
     window.addEventListener("storage", onStorage);
@@ -1450,6 +1412,21 @@ export default function CRM() {
     });
   };
 
+  /* Los WhatsApp que recibe el servidor (nube/operacion.js) entran al
+     cuaderno sin pasar por esta pestaña, así que las reglas de "contestan un
+     mensaje" no se enterarían. Al adoptar el cambio se avisa de los recién
+     llegados. Sólo la pestaña que está a la vista, para que dos abiertas no
+     disparen la misma regla dos veces. */
+  alAdoptar.current = (antes, despues) => {
+    if (!antes || (typeof document !== "undefined" && document.visibilityState !== "visible")) return;
+    const habia = new Set((antes.activities || []).map((a) => a.id));
+    const frescos = Date.now() - 36 * 3600 * 1000;
+    for (const a of (despues.activities || [])) {
+      if (a.via !== "servidor" || a.dir !== "in" || habia.has(a.id)) continue;
+      if (Date.parse(a.at) >= frescos) emitirActividad(a);
+    }
+  };
+
   /* ── Envío de un pendiente ──
      Vale para el botón de Pendientes y para el modo automático: un solo camino,
      así que lo que se apruebe a mano y lo que salga solo arman el mensaje
@@ -1698,19 +1675,29 @@ export default function CRM() {
   const tendenciasNuevas = ((db.tendencias && db.tendencias.items) || []).filter((x) => (x.estado || "nueva") === "nueva" && x.jev && x.jev.decision === "producir").length;
 
   const NAV = [
-    { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
-    { key: "messages", label: "Mensajes", Icon: Inbox },
-    { key: "contact", label: "Contactos", Icon: Users },
-    { key: "company", label: "Empresas", Icon: Building2 },
-    { key: "deal", label: "Negocios", Icon: Briefcase },
-    { key: "drafts", label: "Drafts", Icon: Trophy },
-    { key: "activities", label: "Actividades", Icon: Activity },
-    { key: "templates", label: "Plantillas", Icon: MessageSquare },
-    { key: "trends", label: "Tendencias", Icon: Newspaper },
-    { key: "studio", label: "Estudio", Icon: Palette },
-    { key: "automations", label: "Automatizaciones", Icon: Zap },
-    { key: "connections", label: "Conexiones", Icon: Plug },
-    { key: "settings", label: "Configuración", Icon: Settings },
+    { grupo: null, items: [
+      { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
+      { key: "messages", label: "Mensajes", Icon: Inbox },
+    ] },
+    { grupo: "Comercial", items: [
+      { key: "contact", label: "Contactos", Icon: Users },
+      { key: "company", label: "Empresas", Icon: Building2 },
+      { key: "deal", label: "Negocios", Icon: Briefcase },
+      { key: "activities", label: "Actividades", Icon: Activity },
+    ] },
+    { grupo: "Reclutamiento", items: [
+      { key: "drafts", label: "Drafts", Icon: Trophy },
+    ] },
+    { grupo: "Marketing", items: [
+      { key: "templates", label: "Plantillas", Icon: MessageSquare },
+      { key: "trends", label: "Tendencias", Icon: Newspaper },
+      { key: "studio", label: "Estudio", Icon: Palette },
+    ] },
+    { grupo: "Sistema", items: [
+      { key: "automations", label: "Automatizaciones", Icon: Zap },
+      { key: "connections", label: "Conexiones", Icon: Plug },
+      { key: "settings", label: "Configuración", Icon: Settings },
+    ] },
   ];
 
   return (
@@ -1731,25 +1718,30 @@ export default function CRM() {
 
       <div style={{ display: "flex", minHeight: "100vh" }}>
         {/* Rail */}
-        <aside style={{ width: 208, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: "#E9EDE5", padding: "18px 12px", display: "flex", flexDirection: "column", gap: 4, position: "sticky", top: 0, height: "100vh" }}>
+        <aside style={{ width: 208, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: "#E9EDE5", padding: "18px 12px", display: "flex", flexDirection: "column", gap: 4, position: "sticky", top: 0, height: "100vh", overflowY: "auto" }}>
           <div style={{ padding: "0 8px 18px" }}>
             <img src="/raadsports-logo.png" alt="Raad Sports Management" style={{ display: "block", width: "100%", maxWidth: 168, height: "auto" }} />
             <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".08em", textTransform: "uppercase", marginTop: 6 }}>CRM comercial</div>
           </div>
-          {NAV.map(({ key, label, Icon }) => {
-            const on = view === key;
-            const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : key === "trends" ? tendenciasNuevas : 0;
-            return (
-              <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
-                style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
-                <Icon size={15} strokeWidth={2} />
-                <span style={{ flex: 1 }}>{label}</span>
-                {nuevos > 0 && (
-                  <span style={{ background: on ? "rgba(255,255,255,.25)" : C.clay, color: "#fff", fontFamily: "var(--mono)", fontSize: 10, fontWeight: 600, borderRadius: 99, padding: "1px 6px", minWidth: 18, textAlign: "center" }}>{nuevos > 99 ? "99+" : nuevos}</span>
-                )}
-              </button>
-            );
-          })}
+          {NAV.map(({ grupo, items }, i) => (
+            <div key={grupo || i} style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: i ? 10 : 0 }}>
+              {grupo && <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, letterSpacing: ".08em", textTransform: "uppercase", padding: "0 10px 4px" }}>{grupo}</div>}
+              {items.map(({ key, label, Icon }) => {
+                const on = view === key;
+                const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : key === "trends" ? tendenciasNuevas : 0;
+                return (
+                  <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
+                    style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
+                    <Icon size={15} strokeWidth={2} />
+                    <span style={{ flex: 1 }}>{label}</span>
+                    {nuevos > 0 && (
+                      <span style={{ background: on ? "rgba(255,255,255,.25)" : C.clay, color: "#fff", fontFamily: "var(--mono)", fontSize: 10, fontWeight: 600, borderRadius: 99, padding: "1px 6px", minWidth: 18, textAlign: "center" }}>{nuevos > 99 ? "99+" : nuevos}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
           <div style={{ marginTop: "auto", padding: "12px 10px", borderTop: `1px solid ${C.line}` }}>
             <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, lineHeight: 1.6 }}>
               {db.contacts.length} contactos<br />{db.companies.length} empresas<br />{db.deals.length} negocios
@@ -3619,8 +3611,13 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
   };
 
   const sinNada = conversaciones.length === 0;
+  const pendientes = useMemo(() => new Set((db.supervision || []).filter((x) => x.estado === "pendiente").map((x) => x.clave)), [db.supervision]);
 
   if (seccion === "agentes") return <AgentesView db={db} setDb={setDb} say={say} seccion={seccion} setSeccion={setSeccion} />;
+  if (seccion === "supervision") {
+    return <SupervisionView db={db} say={say} seccion={seccion} setSeccion={setSeccion}
+      onAbrir={(clave) => { setSel(clave); setBuscar(""); setFiltro("all"); setSeccion("chats"); }} />;
+  }
 
   return (
     <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
@@ -3639,7 +3636,7 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
             </Btn>
           </div>
 
-          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} />
+          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} supervision={db.supervision} />
 
           <div style={{ position: "relative", marginTop: 12 }}>
             <Search size={13} color={C.faint} style={{ position: "absolute", left: 9, top: 9 }} />
@@ -3666,6 +3663,7 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
             const on = c.clave === sel;
             const ch = CHANNEL[c.ultimo.type];
             const quien = agenteDe(db, c.kind, c.rec);
+            const propuesta = pendientes.has(c.clave);
             return (
               <button key={c.clave} onClick={() => setSel(c.clave)} className={on ? "" : "crm-row"}
                 style={{ display: "flex", gap: 10, width: "100%", textAlign: "left", padding: "11px 14px", borderTop: "none", borderRight: "none", borderBottom: "1px solid #F2F4F0", borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : "transparent", cursor: "pointer" }}>
@@ -3677,6 +3675,7 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
                     <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--ui)", fontSize: 13, fontWeight: c.nuevos ? 700 : 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.nombre}</span>
                     {quien.humano && <Headset size={11} color={C.clay} style={{ flexShrink: 0, alignSelf: "center" }}><title>Atiende una persona</title></Headset>}
                     {quien.agente && <Bot size={11} color={C.jade} style={{ flexShrink: 0, alignSelf: "center" }}><title>{nombreAgente(quien.agente)}</title></Bot>}
+                    {propuesta && <Sparkles size={11} color={C.plum} style={{ flexShrink: 0, alignSelf: "center" }}><title>Hay una respuesta del agente esperando aprobación</title></Sparkles>}
                     <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, flexShrink: 0 }}>{haceRato(c.ultimo.at)}</span>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 3 }}>
@@ -3743,34 +3742,15 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
    Hoy el agente propone y una persona envía: corre en esta pestaña, como todo
    lo demás. Que conteste solo, con el CRM cerrado, es trabajo del Worker.
    ──────────────────────────────────────────────────────────── */
-const claveConv = (kind, id) => `${kind}:${id}`;
 
 /* Las condiciones se escriben sobre las propiedades de un contacto: una
    empresa no tiene etapa de persona y queda sin agente salvo que se le fije. */
-function agentePorEtapa(db, kind, rec) {
-  if (kind !== "contact") return null;
-  return (db.agentes || []).find((a) => a.activo
-    && cumpleFiltros(rec, a.filtros.filter((c) => c.key), db.schema.contact)) || null;
-}
-
-function agenteDe(db, kind, rec) {
-  const fijo = (db.agentesChat || {})[claveConv(kind, rec.id)];
-  if (fijo === HUMANO) return { humano: true, fijo: true };
-  const a = fijo && (db.agentes || []).find((x) => x.id === fijo);
-  if (a) return { agente: a, fijo: true };
-  const porEtapa = agentePorEtapa(db, kind, rec);
-  return porEtapa ? { agente: porEtapa } : {};
-}
-
 const nombreAgente = (a) => a.nombre.trim() || "Agente sin nombre";
 
 /* Pide al agente el próximo mensaje para esta ficha. Usa el agente tal como
    se le pasa —también uno a medio editar—, que es lo que deja probarlo antes
    de guardarlo. */
 async function pedirAlAgente(db, agente, kind, rec, indicaciones = "") {
-  const tiene = (a) => (a.contactIds || []).includes(rec.id) || (a.companyIds || []).includes(rec.id);
-  const acts = db.activities.filter(tiene).sort((a, b) => (a.at < b.at ? 1 : -1));
-  const deals = db.deals.filter((d) => (d.contactIds || []).includes(rec.id) || d.companyId === rec.id);
   const { nombre, etapa, objetivo, instrucciones, traspaso } = agente;
   const r = await fetch("/api/claude", {
     method: "POST",
@@ -3780,7 +3760,7 @@ async function pedirAlAgente(db, agente, kind, rec, indicaciones = "") {
     body: JSON.stringify({
       tarea: "agente", pregunta: indicaciones,
       agente: { nombre, etapa, objetivo, instrucciones, traspaso },
-      ficha: fichaParaClaude(db, kind, rec, acts, deals),
+      ficha: fichaDe(db, kind, rec),
     }),
   });
   if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
@@ -3796,12 +3776,14 @@ const fijarAgenteChat = (setDb, clave, valor) => setDb((d) => {
   return { ...d, agentesChat: m };
 });
 
-/* Conversaciones | Agentes, arriba de la columna izquierda en las dos vistas. */
-function SeccionMensajes({ seccion, setSeccion, agentes }) {
+/* Chats | Supervisión | Agentes, arriba de la columna izquierda en las tres
+   vistas. */
+function SeccionMensajes({ seccion, setSeccion, agentes, supervision = [] }) {
   const encendidos = agentes.filter((a) => a.activo).length;
+  const porRevisar = supervision.filter((x) => POR_REVISAR.includes(x.estado)).length;
   return (
     <div style={{ display: "flex", background: "#EEF1EB", borderRadius: 8, padding: 3, marginTop: 12 }}>
-      {[["chats", "Conversaciones", Inbox], ["agentes", "Agentes", Bot]].map(([k, l, I]) => {
+      {[["chats", "Chats", Inbox], ["supervision", "Supervisión", ShieldCheck], ["agentes", "Agentes", Bot]].map(([k, l, I]) => {
         const on = seccion === k;
         return (
           <button key={k} onClick={() => setSeccion(k)} className="crm-btn"
@@ -3809,6 +3791,9 @@ function SeccionMensajes({ seccion, setSeccion, agentes }) {
             <I size={12} /> {l}
             {k === "agentes" && agentes.length > 0 && (
               <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{encendidos}/{agentes.length}</span>
+            )}
+            {k === "supervision" && porRevisar > 0 && (
+              <span style={{ background: C.clay, color: "#fff", fontFamily: "var(--mono)", fontSize: 9.5, fontWeight: 600, borderRadius: 99, padding: "1px 5px" }}>{porRevisar}</span>
             )}
           </button>
         );
@@ -3846,7 +3831,7 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
   const actual = agentes.find((a) => a.id === sel) || null;
 
   useEffect(() => {
-    if (!actual && agentes.length) setSel(agentes[0].id);
+    if (!actual && sel !== OPERACION && agentes.length) setSel(agentes[0].id);
   }, [actual, agentes.length]);
 
   const conversaciones = useMemo(() => construirConversaciones(db), [db]);
@@ -3863,6 +3848,9 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
   }, [conversaciones, db.agentes, db.agentesChat]);
 
   const guardar = (a) => setDb((d) => ({ ...d, agentes: (d.agentes || []).map((x) => (x.id === a.id ? normalizaAgente(a) : x)) }));
+  const op = db.operacion || {};
+  const mkt = normalizaMarketing(db.marketing);
+  const setOperacion = (parche) => setDb((d) => ({ ...d, operacion: normalizaOperacion({ ...(d.operacion || {}), ...parche }) }));
   const crear = (a) => {
     setDb((d) => ({ ...d, agentes: [...(d.agentes || []), a] }));
     setSel(a.id);
@@ -3905,7 +3893,24 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
             </div>
             <Btn size="sm" variant="outline" Icon={Plus} onClick={() => crear(agenteVacio())}>Nuevo</Btn>
           </div>
-          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={agentes} />
+          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={agentes} supervision={db.supervision} />
+        </div>
+
+        <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.line}`, background: op.pausada ? C.claySoft : C.jadeSoft, fontFamily: "var(--ui)", fontSize: 12, color: C.ink, lineHeight: 1.5 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 99, background: op.pausada ? C.clay : C.jade, flexShrink: 0 }} />
+            <span style={{ flex: 1, fontWeight: 600 }}>{op.pausada ? "Agentes en pausa" : "Agentes en marcha"}</span>
+            <Btn size="sm" variant="outline" Icon={op.pausada ? Play : Pause} onClick={() => {
+              setOperacion({ pausada: !op.pausada });
+              say(op.pausada ? "Los agentes vuelven a atender" : "Agentes en pausa: nadie redacta ni envía");
+            }}>{op.pausada ? "Reanudar" : "Pausar todos"}</Btn>
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7, fontSize: 11.5, color: C.mute }}>
+            Tope automático por persona en 24 h
+            <input className="crm-in" type="number" min={1} max={50} value={op.topeAutomatico || 8}
+              onChange={(e) => setOperacion({ topeAutomatico: Number(e.target.value) })}
+              style={{ ...inputStyle, width: 58, padding: "3px 6px", fontSize: 12 }} />
+          </label>
         </div>
 
         <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: "#F6F8F4", fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, lineHeight: 1.5 }}>
@@ -3914,6 +3919,19 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
         </div>
 
         <div style={{ flex: 1, overflowY: "auto" }}>
+          <div onClick={() => setSel(OPERACION)} className={sel === OPERACION ? "" : "crm-row"}
+            style={{ display: "flex", gap: 10, alignItems: "center", padding: "11px 10px 11px 14px", borderBottom: `1px solid ${C.line}`, borderLeft: `3px solid ${sel === OPERACION ? C.jade : "transparent"}`, background: sel === OPERACION ? C.jadeSoft : "#FAFBF8", cursor: "pointer" }}>
+            <span style={{ width: 14, flexShrink: 0 }} />
+            <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, background: mkt.contenido.activo || mkt.seguimiento.activo ? C.plum : "#D9DED5", color: "#fff", display: "grid", placeItems: "center" }}>
+              <Zap size={15} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>Agentes de operación</div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                Contenido {mkt.contenido.activo ? "encendido" : "apagado"} · Seguimiento {mkt.seguimiento.activo ? "encendido" : "apagado"}
+              </div>
+            </div>
+          </div>
           {agentes.map((a, i) => {
             const on = a.id === sel;
             return (
@@ -3926,7 +3944,7 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: a.activo ? C.ink : C.mute, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nombreAgente(a)}</div>
                   <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {[a.etapa || "Sin etapa", a.activo ? `${carga.n[a.id] || 0} conversación(es)` : "Apagado"].join(" · ")}
+                    {[a.etapa || "Sin etapa", a.activo ? `${a.modo === "automatico" ? "automático" : "sugiere"} · ${carga.n[a.id] || 0} conversación(es)` : "Apagado"].join(" · ")}
                   </div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
@@ -3947,7 +3965,8 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
       </div>
 
       <div style={{ flex: 1, minWidth: 0, overflowY: "auto", background: C.canvas }}>
-        {actual
+        {sel === OPERACION ? <OperacionPanel db={db} setDb={setDb} say={say} />
+          : actual
           ? <EditorAgente key={actual.id} db={db} agente={actual} indice={agentes.indexOf(actual)} conversaciones={conversaciones}
               onGuardar={(a) => { guardar(a); say("Agente guardado"); }}
               onAlternar={() => alternar(actual)}
@@ -3967,6 +3986,139 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
               </div>
             </div>
           )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Los agentes de operación ──
+   Contenido, Campañas y Seguimiento (nube/marketing.js): lo que hacen solos
+   en el servidor, sus límites, y las campañas que van armando. */
+const OPERACION = "__operacion";
+
+const ESTADO_CAMPANA = {
+  revision: { label: "Esperando a Meta", color: C.amber },
+  enviando: { label: "Enviando", color: C.blue },
+  enviada: { label: "Enviada", color: C.jade },
+  rechazada: { label: "Rechazada por Meta", color: C.clay },
+  detenida: { label: "Detenida", color: C.faint },
+  fallo: { label: "Falló", color: C.clay },
+};
+
+function OperacionPanel({ db, setDb, say }) {
+  const mk = normalizaMarketing(db.marketing);
+  const campanas = normalizeCampanas(db.campanas);
+  const audiencia = useMemo(() => audienciaDe(db, mk).length, [db.contacts, db.activities, db.marketing, db.agentesChat]);
+  const [abierta, setAbierta] = useState("");
+  const set = (fn) => setDb((d) => ({ ...d, marketing: normalizaMarketing(fn(normalizaMarketing(d.marketing))) }));
+  const cambiarCampana = (id, parche, aviso) => {
+    setDb((d) => ({ ...d, campanas: normalizeCampanas(d.campanas).map((c) => (c.id === id ? { ...c, ...parche } : c)) }));
+    say(aviso);
+  };
+  const tarjeta = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 };
+  const ayuda = (t) => <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>{t}</div>;
+  const numero = (valor, alCambiar, min, max) => (
+    <input className="crm-in" type="number" min={min} max={max} value={valor} onChange={(e) => alCambiar(Number(e.target.value))}
+      style={{ ...inputStyle, width: 64, padding: "4px 7px", fontSize: 12.5 }} />
+  );
+  const fila = { display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, flexWrap: "wrap" };
+  const encabezado = (Icon, titulo, activo, alternar) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <Icon size={16} color={activo ? C.plum : C.faint} />
+      <div style={{ flex: 1, fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>{titulo}</div>
+      {alternar && <Btn variant={activo ? "outline" : "solid"} Icon={activo ? Pause : Play} onClick={alternar}>{activo ? "Apagar" : "Encender"}</Btn>}
+    </div>
+  );
+  const seg = mk.seguimiento.plantilla;
+  const estadoSeg = !seg ? "se crea en Meta al encenderlo" : seg.estado === "APPROVED" ? "aprobada por Meta" : seg.estado === "REJECTED" ? `rechazada por Meta${seg.rechazo ? ` (${seg.rechazo})` : ""}` : "esperando la aprobación de Meta";
+
+  return (
+    <div style={{ padding: "22px 28px 40px", maxWidth: 860, display: "flex", flexDirection: "column", gap: 14 }}>
+      <div>
+        <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>Trabajan solos en el servidor</div>
+        <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em", marginTop: 3 }}>Agentes de operación</div>
+        {ayuda("De una noticia a un lead registrado en Catch: el de Contenido elige y escribe la campaña del día, el de Campañas la envía cuando Meta la aprueba, el de Seguimiento le escribe a quien no se registró, y si contesta lo atiende el agente de texto. Todo queda en Mensajes → Supervisión y se detiene con «Pausar todos».")}
+      </div>
+
+      <div style={tarjeta}>
+        {encabezado(Newspaper, "Contenido · cada mañana a las 6:00", mk.contenido.activo, () => {
+          set((m) => ({ ...m, contenido: { ...m.contenido, activo: !m.contenido.activo } }));
+          say(mk.contenido.activo ? "Agente de Contenido apagado" : "Agente de Contenido encendido: mañana a las 6:00 arma la campaña del día");
+        })}
+        {ayuda("Toma la tendencia mejor calificada por JEV, escribe el WhatsApp y el correo con el enlace personal de registro a app.catchrsm.com, y manda la plantilla a Meta. Cuando Meta la aprueba, sale sola.")}
+        <label style={fila}>Nota mínima de JEV para producir {numero(mk.contenido.minimoJev, (v) => set((m) => ({ ...m, contenido: { ...m.contenido, minimoJev: v } })), 0, 100)}</label>
+      </div>
+
+      <div style={tarjeta}>
+        {encabezado(Megaphone, "Campañas · reglas de envío", true, null)}
+        <div style={fila}>
+          <span>Tope de mensajes de marketing por persona en 7 días</span>
+          {numero(mk.topeSemanal, (v) => set((m) => ({ ...m, topeSemanal: v })), 1, 14)}
+        </div>
+        <div style={fila}>
+          <span>Sólo se envía entre las</span>
+          {numero(mk.horario.desde, (v) => set((m) => ({ ...m, horario: { ...m.horario, desde: v } })), 0, 23)}
+          <span>y las</span>
+          {numero(mk.horario.hasta, (v) => set((m) => ({ ...m, horario: { ...m.horario, hasta: v } })), 1, 24)}
+          <span>(hora de Bogotá)</span>
+        </div>
+        {ayuda(`Hoy una campaña le llegaría a ${audiencia} lead(s): los que no se han registrado en Catch, no son clientes, no están en manos de una persona y no llegaron al tope. El correo sale por Amazon SES a quien no se dio de baja.`)}
+      </div>
+
+      <div style={tarjeta}>
+        {encabezado(Reply, "Seguimiento", mk.seguimiento.activo, () => {
+          set((m) => ({ ...m, seguimiento: { ...m.seguimiento, activo: !m.seguimiento.activo } }));
+          say(mk.seguimiento.activo ? "Agente de Seguimiento apagado" : "Agente de Seguimiento encendido");
+        })}
+        <label style={fila}>Escribir a quien no se registró a los {numero(mk.seguimiento.dias, (v) => set((m) => ({ ...m, seguimiento: { ...m.seguimiento, dias: v } })), 1, 30)} días de la campaña</label>
+        {ayuda(`Usa una plantilla fija que invita a resolver dudas por WhatsApp (${estadoSeg}). Si la persona contesta, la atiende el agente de texto que le toque en Agentes.`)}
+      </div>
+
+      <div style={tarjeta}>
+        <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>Campañas</div>
+        {campanas.length === 0 && ayuda("Todavía no hay campañas. Con Contenido encendido, la primera se arma mañana a las 6:00.")}
+        {campanas.map((c) => {
+          const e = ESTADO_CAMPANA[c.estado] || ESTADO_CAMPANA.fallo;
+          const ver = abierta === c.id;
+          return (
+            <div key={c.id} style={{ borderTop: `1px solid ${C.line}`, marginTop: 10, paddingTop: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={() => setAbierta(ver ? "" : c.id)} className="crm-btn"
+                  style={{ flex: 1, minWidth: 200, textAlign: "left", border: "none", background: "none", padding: 0, cursor: "pointer", fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>
+                  {ver ? <ChevronDown size={13} /> : <ChevronRight size={13} />} {c.titulo || "Sin título"}
+                </button>
+                <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: e.color }}>{e.label}</span>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{haceRato(c.at)}</span>
+                {(c.estado === "enviando" || c.estado === "revision") && (
+                  <Btn size="sm" variant="outline" Icon={Pause} onClick={() => cambiarCampana(c.id, { estado: "detenida" }, "Campaña detenida")}>Detener</Btn>
+                )}
+                {c.estado === "detenida" && c.cola.length > 0 && c.wa.plantilla && c.wa.plantilla.estado === "APPROVED" && (
+                  <Btn size="sm" variant="outline" Icon={Play} onClick={() => cambiarCampana(c.id, { estado: "enviando", loteAt: "" }, "Campaña reanudada")}>Reanudar</Btn>
+                )}
+              </div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 4 }}>
+                {[c.tendencia && `JEV ${c.tendencia.total}`, c.lector, `${c.enviados.wa} WhatsApp`, `${c.enviados.correo} correos`, c.cola.length ? `${c.cola.length} en cola` : "", c.enviados.omitidos ? `${c.enviados.omitidos} omitidos` : ""].filter(Boolean).join(" · ")}
+              </div>
+              {(c.error || c.ultimoError) && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 4 }}>{c.error || c.ultimoError}</div>}
+              {ver && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+                  {c.tendencia && (
+                    <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, lineHeight: 1.5 }}>
+                      Tendencia: <a href={c.tendencia.url} target="_blank" rel="noopener noreferrer" style={{ color: C.jade }}>{c.tendencia.titulo}</a>{c.tendencia.medio ? ` (${c.tendencia.medio})` : ""}. {c.porque}
+                    </div>
+                  )}
+                  {c.wa.texto && <div style={{ background: CHANNEL.whatsapp.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{c.wa.texto}</div>}
+                  {c.correo.texto && (
+                    <div style={{ background: CHANNEL.email.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                      <strong>{c.correo.asunto}</strong>{"\n\n"}{c.correo.texto}
+                    </div>
+                  )}
+                  {c.wa.plantilla && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>Plantilla en Meta: {c.wa.plantilla.nombre} · {c.wa.plantilla.estado}</div>}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -4017,7 +4169,7 @@ function EditorAgente({ db, agente, indice, conversaciones, onGuardar, onAlterna
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 200 }}>
           <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
-            Prioridad {indice + 1} · {agente.activo ? "Encendido" : "Apagado"}
+            Prioridad {indice + 1} · {agente.activo ? (agente.modo === "automatico" ? "Encendido · automático" : "Encendido · sugiere") : "Apagado"}
           </div>
           <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em", marginTop: 3 }}>{nombreAgente(draft)}</div>
         </div>
@@ -4035,6 +4187,20 @@ function EditorAgente({ db, agente, indice, conversaciones, onGuardar, onAlterna
             <input className="crm-in" value={draft.etapa} list="etapas-agente" placeholder="Prospecto" onChange={(e) => set({ etapa: e.target.value })} style={inputStyle} />
             <datalist id="etapas-agente">{ETAPAS_AGENTE.map((x) => <option key={x} value={x} />)}</datalist>
           </label>
+        </div>
+        <div style={{ marginTop: 12 }}>
+          {etiqueta("Cómo trabaja con los WhatsApp que llegan")}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {Object.entries(MODOS_AGENTE).map(([k, l]) => (
+              <button key={k} type="button" onClick={() => set({ modo: k })} className="crm-btn"
+                style={{ border: `1px solid ${draft.modo === k ? (k === "automatico" ? C.clay : C.jade) : C.line}`, background: draft.modo === k ? (k === "automatico" ? C.claySoft : C.jadeSoft) : C.panel, color: draft.modo === k ? C.ink : C.mute, borderRadius: 8, padding: "7px 12px", fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: draft.modo === k ? 600 : 400, cursor: "pointer" }}>
+                {l}
+              </button>
+            ))}
+          </div>
+          {ayuda(draft.modo === "automatico"
+            ? `Contesta solo, aunque el CRM esté cerrado. Todo queda en Supervisión, y al llegar a ${(db.operacion || {}).topeAutomatico || 8} mensajes automáticos en 24 horas con la misma persona vuelve a pedir tu aprobación.`
+            : "Redacta en el servidor cuando llega un WhatsApp y lo deja en Supervisión: tú lo apruebas, lo corriges o lo descartas.")}
         </div>
         <div style={{ marginTop: 12 }}>{etiqueta("Objetivo")}{area("objetivo", 2, "Qué tiene que lograr con cada persona.")}</div>
         <div style={{ marginTop: 12 }}>
@@ -4099,7 +4265,225 @@ function EditorAgente({ db, agente, indice, conversaciones, onGuardar, onAlterna
       </div>
 
       <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, lineHeight: 1.6 }}>
-        Por ahora el agente propone el mensaje dentro de cada conversación y una persona lo revisa y lo envía. Que conteste solo por WhatsApp, también con el CRM cerrado, es el siguiente paso.
+        Encendido, este agente atiende los WhatsApp que entran a las conversaciones que le tocan, también con el CRM cerrado. Lo que propone o envía queda en Mensajes → Supervisión.
+      </div>
+    </div>
+  );
+}
+
+/* ── Supervisión ──
+   Lo que hacen los agentes en el servidor (nube/operacion.js): lo que espera
+   aprobación, lo que salió solo, lo que pasaron a una persona y lo que
+   falló. Aprobar, corregir o descartar va al servidor, que es quien envía y
+   anota: así lo aprobado aquí y lo automático quedan registrados igual. */
+async function pedirOperacion(cuerpo) {
+  const r = await fetch("/api/operacion", {
+    method: "POST",
+    redirect: "manual",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Origen": "supervision" },
+    body: JSON.stringify(cuerpo),
+  });
+  if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
+  if (!(r.headers.get("Content-Type") || "").includes("application/json")) throw new Error("Supervisión sólo funciona en la versión publicada del CRM.");
+  const data = await r.json();
+  if (!r.ok || data.ok === false) throw new Error(data.error || `Error ${r.status}`);
+  return data;
+}
+
+const ESTADO_SUP = {
+  pendiente: { label: "Por aprobar", color: C.plum, soft: C.plumSoft, Icon: Sparkles },
+  enviando: { label: "Enviando", color: C.blue, soft: C.blueSoft, Icon: Send },
+  enviado: { label: "Enviado", color: C.jade, soft: C.jadeSoft, Icon: Check },
+  descartado: { label: "Descartado", color: C.faint, soft: "#EEF1EB", Icon: X },
+  reemplazado: { label: "Reemplazado", color: C.faint, soft: "#EEF1EB", Icon: RotateCcw },
+  traspaso: { label: "Pide una persona", color: C.clay, soft: C.claySoft, Icon: Headset },
+  fallo: { label: "Falló", color: C.clay, soft: C.claySoft, Icon: AlertTriangle },
+  info: { label: "Aviso", color: C.blue, soft: C.blueSoft, Icon: BellRing },
+};
+
+function EtiquetaEstado({ estado }) {
+  const e = ESTADO_SUP[estado] || ESTADO_SUP.pendiente;
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: e.soft, color: e.color, borderRadius: 999, padding: "2px 8px", fontFamily: "var(--ui)", fontSize: 11, fontWeight: 600, flexShrink: 0 }}>
+      <e.Icon size={11} /> {e.label}
+    </span>
+  );
+}
+
+/* La tarjeta de una entrada: lo que recibió, lo que propone o hizo el agente,
+   y lo que se puede hacer con ella. La usan Supervisión y el hilo abierto. */
+function PropuestaAgente({ item, say, onAbrir, compacta = false }) {
+  const [texto, setTexto] = useState(item.texto || "");
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  useEffect(() => { setTexto(item.texto || ""); setErr(""); }, [item.id, item.texto]);
+
+  const hacer = async (accion, extra, aviso) => {
+    setBusy(accion); setErr("");
+    try {
+      await pedirOperacion({ accion, ...extra });
+      if (aviso) say(aviso);
+    } catch (e) {
+      setErr((e && e.message) || String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+  const editable = (item.estado === "pendiente" || (item.estado === "fallo" && item.texto)) && (!item.tipo || item.tipo === "respuesta");
+  const cerrable = ["pendiente", "fallo", "traspaso"].includes(item.estado);
+  const etiqueta = (t) => <div style={{ fontFamily: "var(--ui)", fontSize: 11, fontWeight: 600, color: C.mute, marginBottom: 4, letterSpacing: ".02em" }}>{t}</div>;
+
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${item.estado === "pendiente" ? "#D9C8E6" : C.line}`, borderRadius: 9, padding: compacta ? 12 : 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <Bot size={14} color={C.jade} />
+        <span style={{ fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, color: C.ink }}>{item.agente || "Operación"}</span>
+        {item.modo && <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>{item.modo === "automatico" ? "automático" : "sugiere"}</span>}
+        <span style={{ flex: 1 }} />
+        <EtiquetaEstado estado={item.estado} />
+        <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{haceRato(item.resueltoAt || item.at)}</span>
+      </div>
+
+      {!compacta && item.recibido && (
+        <div style={{ marginTop: 12 }}>
+          {etiqueta("Recibido")}
+          <div style={{ background: "#F2F4F0", borderRadius: "10px 10px 10px 3px", padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap", color: C.ink }}>{item.recibido}</div>
+        </div>
+      )}
+
+      {item.motivo && (
+        <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "flex-start", background: C.claySoft, borderRadius: 8, padding: "8px 12px", fontFamily: "var(--ui)", fontSize: 12.5, color: C.clay, lineHeight: 1.5 }}>
+          <Headset size={14} style={{ flexShrink: 0, marginTop: 2 }} /> {item.motivo}
+        </div>
+      )}
+
+      {editable ? (
+        <div style={{ marginTop: 12 }}>
+          {etiqueta(item.estado === "fallo" ? "No salió. Puedes corregirlo y reintentar" : "Propone responder")}
+          <textarea className="crm-in" rows={compacta ? 3 : 5} value={texto} onChange={(e) => setTexto(e.target.value)}
+            style={{ ...inputStyle, resize: "vertical", lineHeight: 1.55, background: CHANNEL.whatsapp.soft }} />
+        </div>
+      ) : item.texto ? (
+        <div style={{ marginTop: 12 }}>
+          {etiqueta(item.tipo && item.tipo !== "respuesta" ? "Detalle" : item.estado === "enviado" ? (item.editado ? "Enviado, corregido por una persona" : "Enviado") : "Había propuesto")}
+          <div style={{ background: CHANNEL.whatsapp.soft, borderRadius: "10px 10px 3px 10px", padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap", color: C.ink }}>{item.texto}</div>
+        </div>
+      ) : null}
+
+      {item.error && <div style={{ marginTop: 8, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>{item.error}</div>}
+      {item.resueltoPor && !["pendiente", "enviando"].includes(item.estado) && (
+        <div style={{ marginTop: 8, fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint }}>Por {item.resueltoPor}</div>
+      )}
+      {err && <div style={{ marginTop: 8, fontFamily: "var(--ui)", fontSize: 12, color: C.clay, lineHeight: 1.5 }}>{err}</div>}
+
+      <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+        {editable && (
+          <Btn variant="solid" Icon={Send} disabled={Boolean(busy) || !texto.trim()}
+            onClick={() => hacer("enviar", { id: item.id, texto }, "WhatsApp enviado")}>{busy === "enviar" ? "Enviando…" : "Aprobar y enviar"}</Btn>
+        )}
+        {cerrable && (
+          <Btn variant="outline" Icon={item.estado === "traspaso" ? Check : X} disabled={Boolean(busy)}
+            onClick={() => hacer("descartar", { id: item.id }, item.estado === "traspaso" ? "Marcado como atendido" : "Descartado")}>
+            {item.estado === "traspaso" ? "Atendido" : "Descartar"}
+          </Btn>
+        )}
+        {["pendiente", "fallo"].includes(item.estado) && item.clave && (
+          <Btn variant="outline" Icon={RefreshCw} disabled={Boolean(busy)}
+            onClick={() => hacer("redactar", { clave: item.clave }, "El agente volvió a redactar")}>{busy === "redactar" ? "Redactando…" : "Volver a redactar"}</Btn>
+        )}
+        {onAbrir && item.clave && <Btn variant="outline" Icon={Inbox} onClick={() => onAbrir(item.clave)}>Abrir conversación</Btn>}
+      </div>
+    </div>
+  );
+}
+
+function SupervisionView({ db, say, seccion, setSeccion, onAbrir }) {
+  const items = db.supervision || [];
+  const op = db.operacion || {};
+  const [filtro, setFiltro] = useState("revisar");
+  const [sel, setSel] = useState("");
+  const filtrados = items.filter((x) =>
+    filtro === "revisar" ? POR_REVISAR.includes(x.estado)
+      : filtro === "enviados" ? x.estado === "enviado" || x.estado === "enviando"
+        : filtro === "operacion" ? Boolean(x.tipo) && x.tipo !== "respuesta"
+          : true);
+  const actual = filtrados.find((x) => x.id === sel) || filtrados[0] || null;
+  const cuenta = (f) => items.filter((x) => (f === "revisar" ? POR_REVISAR.includes(x.estado) : f === "enviados" ? x.estado === "enviado"
+    : f === "operacion" ? Boolean(x.tipo) && x.tipo !== "respuesta" : true)).length;
+
+  return (
+    <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
+      <div style={{ width: 316, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: C.panel, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: "18px 16px 12px", borderBottom: `1px solid ${C.line}` }}>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
+            {cuenta("revisar")} por revisar
+          </div>
+          <h1 style={{ fontFamily: "var(--display)", fontSize: 21, fontWeight: 600, letterSpacing: "-.02em", margin: "3px 0 0" }}>Mensajes</h1>
+          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} supervision={items} />
+          <div style={{ display: "flex", gap: 5, marginTop: 12, flexWrap: "wrap" }}>
+            {[["revisar", "Por revisar"], ["enviados", "Enviados"], ["operacion", "Campañas"], ["todo", "Todo"]].map(([k, l]) => (
+              <button key={k} onClick={() => { setFiltro(k); setSel(""); }} className="crm-btn"
+                style={{ border: `1px solid ${filtro === k ? C.jade : C.line}`, background: filtro === k ? C.jade : C.panel, color: filtro === k ? "#fff" : C.mute, borderRadius: 999, padding: "3px 10px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer" }}>
+                {l} <span style={{ fontFamily: "var(--mono)", fontSize: 10, opacity: 0.8 }}>{cuenta(k)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {op.pausada && (
+          <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: C.claySoft, fontFamily: "var(--ui)", fontSize: 11.5, color: C.clay, lineHeight: 1.5, display: "flex", gap: 6 }}>
+            <Pause size={13} style={{ flexShrink: 0, marginTop: 1 }} /> Los agentes están en pausa: entran los mensajes, pero nadie redacta ni envía. Se reanudan en Agentes.
+          </div>
+        )}
+
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {filtrados.map((x) => {
+            const on = actual && x.id === actual.id;
+            const e = ESTADO_SUP[x.estado] || ESTADO_SUP.pendiente;
+            return (
+              <button key={x.id} onClick={() => setSel(x.id)} className={on ? "" : "crm-row"}
+                style={{ display: "flex", gap: 10, width: "100%", textAlign: "left", padding: "11px 14px", borderTop: "none", borderRight: "none", borderBottom: "1px solid #F2F4F0", borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : "transparent", cursor: "pointer" }}>
+                <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, background: e.soft, color: e.color, display: "grid", placeItems: "center" }}>
+                  <e.Icon size={14} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                    <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.nombre}</span>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, flexShrink: 0 }}>{haceRato(x.at)}</span>
+                  </div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {[x.agente || "Operación", e.label, x.motivo || x.error || x.texto].filter(Boolean).join(" · ")}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+          {filtrados.length === 0 && (
+            <div style={{ padding: "30px 18px", textAlign: "center", fontFamily: "var(--ui)", fontSize: 12.5, color: C.faint, lineHeight: 1.6 }}>
+              {filtro === "revisar" ? "Nada por revisar." : "Todavía no hay nada aquí."}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0, overflowY: "auto", background: C.canvas }}>
+        {actual ? (
+          <div style={{ padding: "22px 28px 40px", maxWidth: 760, display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em" }}>{actual.nombre}</div>
+            <PropuestaAgente key={actual.id} item={actual} say={say} onAbrir={onAbrir} />
+          </div>
+        ) : (
+          <div style={{ height: "100%", display: "grid", placeItems: "center", padding: 24 }}>
+            <div style={{ textAlign: "center", maxWidth: 440 }}>
+              <ShieldCheck size={30} color={C.faint} />
+              <div style={{ fontFamily: "var(--display)", fontSize: 16, fontWeight: 600, marginTop: 12 }}>Lo que hacen tus agentes</div>
+              <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.mute, marginTop: 6, lineHeight: 1.6 }}>
+                Cuando llega un WhatsApp, el agente que atiende esa conversación redacta la respuesta en el servidor, también con el CRM cerrado. En modo sugerir la deja aquí para que la apruebes; en automático la envía y aquí queda la constancia.
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4162,6 +4546,9 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
      caja para que una persona la lea, la corrija y la envíe. */
   const quien = agenteDe(db, kind, rec);
   const [sugerencia, setSugerencia] = useState({ busy: false, traspaso: "" });
+  /* Lo que el agente dejó en Supervisión para esta conversación y espera a
+     una persona: la propuesta por aprobar, el pedido de traspaso o el fallo. */
+  const propuesta = (db.supervision || []).find((x) => x.clave === conv.clave && POR_REVISAR.includes(x.estado)) || null;
   const sugerir = async () => {
     if (!quien.agente) return;
     setErr("");
@@ -4234,6 +4621,9 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
       setBusy(false);
       if (!r.ok) { setErr(r.err); return; }
       registrarSalida(cuerpo);
+      /* Contestó una persona: lo que el agente proponía ya no corresponde. */
+      setDb((d) => ({ ...d, supervision: (d.supervision || []).map((x) => (x.clave === conv.clave && x.estado === "pendiente"
+        ? { ...x, estado: "reemplazado", resueltoAt: nowISO(), resueltoPor: "respondido a mano" } : x)) }));
       limpiar();
       say(r.solo ? "WhatsApp enviado" : "WhatsApp abierto y registrado");
       return;
@@ -4393,6 +4783,11 @@ function Conversacion({ conv, db, setDb, say, setDetail, onLog }) {
 
       {/* Redactar */}
       <div style={{ borderTop: `1px solid ${C.line}`, background: C.panel, padding: "12px 22px 16px" }}>
+        {propuesta && (
+          <div style={{ marginBottom: 10 }}>
+            <PropuestaAgente item={propuesta} say={say} compacta />
+          </div>
+        )}
         {!puedeEscribir ? (
           <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, lineHeight: 1.6 }}>
             Este registro no tiene teléfono ni correo guardado, así que no hay por dónde escribirle.{" "}
@@ -8266,74 +8661,8 @@ const PAUSA_MIN = 20_000;
 const PAUSA_MAX = 60_000;
 const pausaAlAzar = () => PAUSA_MIN + Math.random() * (PAUSA_MAX - PAUSA_MIN);
 
-/* ── Filtros por propiedad ──
-   A quién le llega un masivo se decide por lo que dice la ficha: "Tipo es
-   Acudiente", "Institución contiene San José", "creados en los últimos 30
-   días". Todas las condiciones deben cumplirse a la vez; para decir "esto o
-   aquello" en una lista se marcan varios valores en la misma condición. Una
-   condición a medio llenar no filtra: mientras se escribe, la lista no se
-   vacía de golpe. */
-const VACIO_OPS = [["lleno", "tiene valor"], ["vacio", "está vacío"]];
-const OPS_FILTRO = {
-  select: [["en", "es"], ["noen", "no es"], ...VACIO_OPS],
-  numero: [["igual", "es igual a"], ["min", "es al menos"], ["max", "es como máximo"], ...VACIO_OPS],
-  fecha: [["ultimos", "en los últimos… días"], ["desde", "desde el día"], ["hasta", "hasta el día"], ...VACIO_OPS],
-  texto: [["contiene", "contiene"], ["nocontiene", "no contiene"], ["igual", "es exactamente"], ...VACIO_OPS],
-};
-const grupoFiltro = (f) => (f.type === "select" ? "select" : f.type === "number" ? "numero"
-  : f.type === "date" || f.type === "datetime" ? "fecha" : "texto");
-const estaVacio = (v) => v === undefined || v === null || String(v).trim() === "";
-
-/* Una fecha se compara por día en la hora local: una ficha creada a las 9 de
-   la noche del 5 sigue siendo del 5 aunque en UTC ya sea el 6. */
-const diaLocal = (v) => {
-  const s = String(v);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const d = new Date(s);
-  if (isNaN(d)) return "";
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-};
-
-function cumpleFiltro(r, c, f) {
-  if (!f) return true;
-  const v = r.props[c.key];
-  if (c.op === "lleno") return !estaVacio(v);
-  if (c.op === "vacio") return estaVacio(v);
-  const grupo = grupoFiltro(f);
-  if (grupo === "select") {
-    const vals = c.values || [];
-    if (!vals.length) return true;
-    const esta = vals.includes(estaVacio(v) ? "" : String(v));
-    return c.op === "noen" ? !esta : esta;
-  }
-  const q = String(c.value ?? "").trim();
-  if (!q) return true;
-  if (grupo === "numero") {
-    const n = Number(v), m = Number(q);
-    if (isNaN(m)) return true;
-    if (estaVacio(v) || isNaN(n)) return false;
-    return c.op === "min" ? n >= m : c.op === "max" ? n <= m : n === m;
-  }
-  if (grupo === "fecha") {
-    if (estaVacio(v)) return false;
-    if (c.op === "ultimos") {
-      const dias = Number(q);
-      if (isNaN(dias)) return true;
-      const t = new Date(/^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? `${v}T00:00` : v).getTime();
-      return !isNaN(t) && Date.now() - t <= dias * 86400000;
-    }
-    const dia = diaLocal(v);
-    if (!dia) return false;
-    return c.op === "desde" ? dia >= q : dia <= q;
-  }
-  const hay = norm(v), aguja = norm(q);
-  if (c.op === "igual") return hay === aguja;
-  if (c.op === "nocontiene") return !hay.includes(aguja);
-  return hay.includes(aguja);
-}
-
-const cumpleFiltros = (r, filtros, schema) =>
-  filtros.every((c) => cumpleFiltro(r, c, schema.find((f) => f.key === c.key)));
+/* Los filtros por propiedad viven en filtros.js: el servidor los usa para
+   saber qué agente atiende cada conversación. */
 
 /* El criterio completo de una tabla: buscador, estado de lead y filtros. Es
    lo que guarda una vista y lo que define a una lista activa. */
@@ -9347,31 +9676,6 @@ const TAREAS_CLAUDE = [
   { key: "whatsapp", label: "Redactar WhatsApp" },
   { key: "correo", label: "Redactar correo" },
 ];
-
-function fichaParaClaude(db, kind, rec, acts, relatedDeals) {
-  const conEtiquetas = (k, r) => Object.fromEntries((db.schema[k] || [])
-    .filter((f) => r.props[f.key] != null && r.props[f.key] !== "")
-    .map((f) => [f.label, r.props[f.key]]));
-  const empresa = rec.companyId && db.companies.find((c) => c.id === rec.companyId);
-  const contactos = (rec.contactIds || []).map((cid) => db.contacts.find((c) => c.id === cid)).filter(Boolean);
-  return {
-    tipo: OBJ[kind].singular,
-    nombre: titleOf(kind, rec),
-    propiedades: conEtiquetas(kind, rec),
-    ...(empresa ? { empresa: { nombre: titleOf("company", empresa), ...conEtiquetas("company", empresa) } } : {}),
-    ...(contactos.length ? { contactos: contactos.map((c) => ({ nombre: titleOf("contact", c), ...conEtiquetas("contact", c) })) } : {}),
-    ...(relatedDeals.length ? { negocios: relatedDeals.map((d) => ({ nombre: d.props.name, etapa: d.props.stage, valor: d.props.amount })) } : {}),
-    /* Las 40 más recientes y cada cuerpo recortado: una conversación larga
-       de correos con citas y firmas no cabe entera ni hace falta. */
-    historial: acts.slice(0, 40).map((a) => ({
-      canal: (CHANNEL[a.type] || {}).label || a.type,
-      sentido: a.dir === "in" ? "recibido" : "enviado",
-      fecha: a.at,
-      ...(a.subject ? { asunto: a.subject } : {}),
-      ...(a.body ? { texto: htmlToText(String(a.body)).slice(0, 3000) } : {}),
-    })),
-  };
-}
 
 function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
   const [pregunta, setPregunta] = useState("");
