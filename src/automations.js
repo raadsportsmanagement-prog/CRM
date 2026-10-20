@@ -749,7 +749,7 @@ export function disparar(db, evento) {
   return salida;
 }
 
-export const coleccionDe = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : "deals");
+export const coleccionDe = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : kind === "alliance" ? "alliances" : "deals");
 export const buscarFicha = (db, kind, id) => (arr(db[coleccionDe(kind)]).find((r) => r.id === id) || null);
 
 /* ────────────────────────────────────────────────────────────

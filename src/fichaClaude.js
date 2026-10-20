@@ -2,14 +2,14 @@
    La ficha que se le pasa a Claude
    Lo mismo para el asistente de la ficha y los agentes, desde la app o desde
    el servidor (nube/operacion.js): propiedades con su etiqueta, la empresa,
-   los contactos, los negocios y el historial reciente. Que salga de un solo
+   los contactos, los negocios, las alianzas y el historial reciente. Que salga de un solo
    sitio es lo que hace que un agente conteste igual con el CRM abierto que
    cerrado. No toca la red ni el navegador.
    ──────────────────────────────────────────────────────────── */
 
 import { htmlToText } from "./integrations.js";
 
-const SINGULAR = { contact: "Contacto", company: "Empresa", deal: "Negocio" };
+const SINGULAR = { contact: "Contacto", company: "Empresa", deal: "Negocio", alliance: "Alianza" };
 const CANAL = { whatsapp: "WhatsApp", email: "Correo", call: "Llamada", note: "Nota", app: "App Catch" };
 
 export const titulo = (kind, rec) => {
@@ -18,7 +18,7 @@ export const titulo = (kind, rec) => {
   return p.name || "Sin nombre";
 };
 
-export function fichaParaClaude(db, kind, rec, acts, relatedDeals) {
+export function fichaParaClaude(db, kind, rec, acts, relatedDeals, relatedAlliances = []) {
   const conEtiquetas = (k, r) => Object.fromEntries((db.schema[k] || [])
     .filter((f) => r.props[f.key] != null && r.props[f.key] !== "")
     .map((f) => [f.label, r.props[f.key]]));
@@ -31,6 +31,7 @@ export function fichaParaClaude(db, kind, rec, acts, relatedDeals) {
     ...(empresa ? { empresa: { nombre: titulo("company", empresa), ...conEtiquetas("company", empresa) } } : {}),
     ...(contactos.length ? { contactos: contactos.map((c) => ({ nombre: titulo("contact", c), ...conEtiquetas("contact", c) })) } : {}),
     ...(relatedDeals.length ? { negocios: relatedDeals.map((d) => ({ nombre: d.props.name, etapa: d.props.stage, valor: d.props.amount })) } : {}),
+    ...(relatedAlliances.length ? { alianzas: relatedAlliances.map((d) => ({ nombre: d.props.name, etapa: d.props.stage })) } : {}),
     /* Las 40 más recientes y cada cuerpo recortado: una conversación larga
        de correos con citas y firmas no cabe entera ni hace falta. */
     historial: acts.slice(0, 40).map((a) => ({
@@ -43,11 +44,12 @@ export function fichaParaClaude(db, kind, rec, acts, relatedDeals) {
   };
 }
 
-/* La ficha de un contacto o empresa con su historial y sus negocios, como la
+/* La ficha de un contacto o empresa con su historial, sus negocios y sus
+   alianzas, como la
    piden los agentes. */
 export function fichaDe(db, kind, rec) {
   const tiene = (a) => (a.contactIds || []).includes(rec.id) || (a.companyIds || []).includes(rec.id);
   const acts = (db.activities || []).filter(tiene).sort((a, b) => (a.at < b.at ? 1 : -1));
-  const deals = (db.deals || []).filter((d) => (d.contactIds || []).includes(rec.id) || d.companyId === rec.id);
-  return fichaParaClaude(db, kind, rec, acts, deals);
+  const suyas = (lista) => (lista || []).filter((d) => (d.contactIds || []).includes(rec.id) || d.companyId === rec.id);
+  return fichaParaClaude(db, kind, rec, acts, suyas(db.deals), suyas(db.alliances));
 }

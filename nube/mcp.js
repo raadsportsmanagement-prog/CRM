@@ -22,8 +22,10 @@ import { z } from "zod";
 
 const CLAVE_PRINCIPAL = "crm:data";
 
-const COLECCION = { contact: "contacts", company: "companies", deal: "deals" };
-const TIPO = z.enum(["contact", "company", "deal"]).describe("contact = contacto, company = empresa, deal = negocio");
+const COLECCION = { contact: "contacts", company: "companies", deal: "deals", alliance: "alliances" };
+const TIPO = z.enum(["contact", "company", "deal", "alliance"]).describe("contact = contacto, company = empresa, deal = negocio, alliance = alianza (colaborador B2B2C: mismas etapas que un negocio, sin valor)");
+/* Negocios y alianzas comparten etapas, fuente y contactos asociados. */
+const EMBUDO = (tipo) => tipo === "deal" || tipo === "alliance";
 
 /* Mismas reglas que la app (CRM.jsx), copiadas porque aquella vive en el
    navegador. Si allá cambian, cambiarlas aquí también. */
@@ -54,10 +56,11 @@ const actividadCorta = (a, largo = 400) => ({
   ...(a.contactIds && a.contactIds.length ? { contactIds: a.contactIds } : {}),
   ...(a.companyIds && a.companyIds.length ? { companyIds: a.companyIds } : {}),
   ...(a.dealId ? { dealId: a.dealId } : {}),
+  ...(a.allianceId ? { allianceId: a.allianceId } : {}),
 });
 
 const tocaA = (a, tipo, id) =>
-  tipo === "deal" ? a.dealId === id : (tipo === "contact" ? a.contactIds || [] : a.companyIds || []).includes(id);
+  tipo === "deal" ? a.dealId === id : tipo === "alliance" ? a.allianceId === id : (tipo === "contact" ? a.contactIds || [] : a.companyIds || []).includes(id);
 
 /* Leer, cambiar y guardar el cuaderno. Entre leer y guardar alguien pudo
    escribir desde la app; el almacén lo detecta por el número de versión y
@@ -84,7 +87,7 @@ function crearServidor(cuaderno, quien) {
   const server = new McpServer({ name: "crm-raad-sports", version: "1.0.0" });
 
   server.registerTool("resumen_crm", {
-    description: "Panorama del CRM de Raad Sports: cuántos contactos, empresas y negocios hay, negocios por etapa con su valor, y la actividad más reciente. Úsalo primero para orientarte.",
+    description: "Panorama del CRM de Raad Sports: cuántos contactos, empresas, negocios y alianzas hay, negocios por etapa con su valor, y la actividad más reciente. Úsalo primero para orientarte.",
     inputSchema: {},
     annotations: { readOnlyHint: true },
   }, async () => {
@@ -100,6 +103,8 @@ function crearServidor(cuaderno, quien) {
       empresas: (db.companies || []).length,
       negocios: deals.length,
       negociosAbiertos: deals.filter(ABIERTO).length,
+      alianzas: (db.alliances || []).length,
+      alianzasAbiertas: (db.alliances || []).filter(ABIERTO).length,
       porEtapa,
       actividadReciente: (db.activities || []).slice(0, 10).map((a) => actividadCorta(a, 200)),
     });
@@ -118,11 +123,11 @@ function crearServidor(cuaderno, quien) {
       ...(f.readOnly ? { soloLectura: true } : {}),
       ...(f.required ? { obligatoria: true } : {}),
     }));
-    return texto({ contact: limpio(sch.contact), company: limpio(sch.company), deal: limpio(sch.deal) });
+    return texto({ contact: limpio(sch.contact), company: limpio(sch.company), deal: limpio(sch.deal), alliance: limpio(sch.alliance) });
   });
 
   server.registerTool("buscar_registros", {
-    description: "Busca contactos, empresas o negocios. El texto se busca en todas las propiedades (nombre, correo, teléfono, institución…), sin importar tildes ni mayúsculas. Devuelve fichas resumidas con su id.",
+    description: "Busca contactos, empresas, negocios o alianzas. El texto se busca en todas las propiedades (nombre, correo, teléfono, institución…), sin importar tildes ni mayúsculas. Devuelve fichas resumidas con su id.",
     inputSchema: {
       tipo: TIPO,
       texto: z.string().optional().describe("Texto a buscar. Vacío = todos."),
@@ -163,12 +168,15 @@ function crearServidor(cuaderno, quien) {
     if (!r) return fallo(`No hay ningún ${tipo} con id ${id}.`);
     const empresa = r.companyId && (db.companies || []).find((c) => c.id === r.companyId);
     const contactos = (r.contactIds || []).map((cid) => (db.contacts || []).find((c) => c.id === cid)).filter(Boolean);
-    const negocios = tipo === "deal" ? [] : (db.deals || []).filter((d) => (d.contactIds || []).includes(id) || d.companyId === id);
+    const suyas = (lista) => (EMBUDO(tipo) ? [] : (lista || []).filter((d) => (d.contactIds || []).includes(id) || d.companyId === id));
+    const negocios = suyas(db.deals);
+    const alianzas = suyas(db.alliances);
     return texto({
       ...enLista(tipo, r),
       ...(empresa ? { empresa: enLista("company", empresa) } : {}),
       ...(contactos.length ? { contactos: contactos.map((c) => enLista("contact", c)) } : {}),
       ...(negocios.length ? { negocios: negocios.map((d) => enLista("deal", d)) } : {}),
+      ...(alianzas.length ? { alianzas: alianzas.map((d) => enLista("alliance", d)) } : {}),
       actividades: (db.activities || []).filter((a) => tocaA(a, tipo, id)).slice(0, actividades).map((a) => actividadCorta(a, 2000)),
     });
   });
@@ -193,18 +201,18 @@ function crearServidor(cuaderno, quien) {
   });
 
   server.registerTool("crear_registro", {
-    description: "Crea un contacto, una empresa o un negocio. Usa las claves de `ver_esquema` (p. ej. firstName, lastName, email, phone, leadStatus para contactos; name, stage, amount para negocios). No crea un contacto o empresa si ya hay otra ficha con el mismo correo.",
+    description: "Crea un contacto, una empresa, un negocio o una alianza. Usa las claves de `ver_esquema` (p. ej. firstName, lastName, email, phone, leadStatus para contactos; name, stage, amount para negocios; name, stage para alianzas). No crea un contacto o empresa si ya hay otra ficha con el mismo correo.",
     inputSchema: {
       tipo: TIPO,
       props: z.record(z.string(), z.union([z.string(), z.number()])).describe("Propiedades de la ficha."),
-      companyId: z.string().optional().describe("Empresa a la que pertenece (contactos y negocios)."),
-      contactIds: z.array(z.string()).optional().describe("Contactos del negocio (sólo negocios)."),
+      companyId: z.string().optional().describe("Empresa a la que pertenece (contactos, negocios y alianzas)."),
+      contactIds: z.array(z.string()).optional().describe("Contactos del negocio o la alianza (sólo negocios y alianzas)."),
     },
   }, async ({ tipo, props, companyId, contactIds }) => {
     const col = COLECCION[tipo];
     const res = await cambiarDb(cuaderno, quien, (db) => {
       const lista = db[col] || [];
-      if (tipo !== "deal" && emailKey(props.email)) {
+      if (!EMBUDO(tipo) && emailKey(props.email)) {
         const igual = lista.find((r) => emailKey(r.props && r.props.email) === emailKey(props.email));
         if (igual) return { error: `Ya existe «${titulo(tipo, igual)}» (id ${igual.id}) con el correo ${props.email}. Actualiza esa ficha en vez de crear otra.` };
       }
@@ -213,9 +221,9 @@ function crearServidor(cuaderno, quien) {
       const ahora = nowISO();
       const rec = {
         id: uid(),
-        props: { createdAt: ahora, lastActivityAt: ahora, ...(tipo === "deal" ? { stage: "Nuevo", source: "Manual" } : { leadSource: "Manual" }), ...props },
+        props: { createdAt: ahora, lastActivityAt: ahora, ...(EMBUDO(tipo) ? { stage: "Nuevo", source: "Manual" } : { leadSource: "Manual" }), ...props },
         ...(companyId ? { companyId } : {}),
-        ...(tipo === "deal" ? { contactIds: contactIds || [] } : {}),
+        ...(EMBUDO(tipo) ? { contactIds: contactIds || [] } : {}),
       };
       return { db: { ...db, [col]: [rec, ...lista] }, rec };
     });
@@ -237,7 +245,7 @@ function crearServidor(cuaderno, quien) {
       const lista = db[col] || [];
       const antes = lista.find((r) => r.id === id);
       if (!antes) return { error: `No hay ningún ${tipo} con id ${id}.` };
-      if (tipo !== "deal" && props.email && emailKey(props.email) !== emailKey(antes.props.email)) {
+      if (!EMBUDO(tipo) && props.email && emailKey(props.email) !== emailKey(antes.props.email)) {
         const igual = lista.find((r) => r.id !== id && emailKey(r.props && r.props.email) === emailKey(props.email));
         if (igual) return { error: `El correo ${props.email} ya es de «${titulo(tipo, igual)}» (id ${igual.id}).` };
       }
@@ -249,7 +257,7 @@ function crearServidor(cuaderno, quien) {
   });
 
   server.registerTool("agregar_nota", {
-    description: "Deja una nota en el historial de un contacto, una empresa o un negocio (p. ej. el resumen de una llamada). Aparece en la ficha como cualquier otra actividad.",
+    description: "Deja una nota en el historial de un contacto, una empresa, un negocio o una alianza (p. ej. el resumen de una llamada). Aparece en la ficha como cualquier otra actividad.",
     inputSchema: { tipo: TIPO, id: z.string(), texto: z.string().min(1) },
   }, async ({ tipo, id, texto: cuerpo }) => {
     const col = COLECCION[tipo];
@@ -257,7 +265,7 @@ function crearServidor(cuaderno, quien) {
       const rec = (db[col] || []).find((r) => r.id === id);
       if (!rec) return { error: `No hay ningún ${tipo} con id ${id}.` };
       const at = nowISO();
-      const enlaces = tipo === "deal" ? { dealId: id, contactIds: [], companyIds: [] } : { contactIds: tipo === "contact" ? [id] : [], companyIds: tipo === "company" ? [id] : [] };
+      const enlaces = tipo === "deal" ? { dealId: id, contactIds: [], companyIds: [] } : tipo === "alliance" ? { allianceId: id, contactIds: [], companyIds: [] } : { contactIds: tipo === "contact" ? [id] : [], companyIds: tipo === "company" ? [id] : [] };
       /* En la app el texto de una nota va en `subject`, que es lo que pinta
          el historial. */
       const act = { id: uid(), type: "note", subject: cuerpo, at, dir: "out", ...enlaces };

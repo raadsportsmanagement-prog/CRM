@@ -7,7 +7,7 @@ import {
   MailOpen, MousePointerClick, MailX, Gauge, Pencil,
   Zap, Sparkles, Play, Pause, ListChecks, AlertTriangle, History, BellRing, Braces,
   Megaphone, UserPlus, ArrowUp, ArrowDown, RotateCcw, ChevronRight, ArrowLeft, Reply, MailCheck, ListFilter,
-  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus, Save, Instagram
+  Trophy, Bot, Headset, Palette, Newspaper, Lightbulb, ImagePlus, Save, Instagram, Handshake
 } from "lucide-react";
 import {
   EMAIL_MODES, WHATSAPP_MODES, normalizeIntegrations, toE164, waLink,
@@ -162,12 +162,25 @@ const BASE_SCHEMA = {
     { key: "lastActivityAt", label: "Última actividad", type: "datetime", system: true, readOnly: true, col: true },
     { key: "createdAt", label: "Fecha de creación", type: "datetime", system: true, readOnly: true, col: false },
   ],
+  /* Alianzas: el mismo recorrido que un negocio, pero con colaboradores que
+     llevan el producto a su gente (B2B2C). No traen valor propio, así que no
+     tienen "Valor" ni se suman en el panel ni en el embudo de ventas. */
+  alliance: [
+    { key: "name", label: "Nombre", type: "text", system: true, col: true, required: true },
+    { key: "stage", label: "Etapa de la alianza", type: "select", options: STAGES.map((s) => s.label), system: true, col: true },
+    { key: "source", label: "Fuente de la alianza", type: "select", options: LEAD_SOURCE, system: true, col: true },
+    { key: "wonReason", label: "Motivo de cierre ganado", type: "select", options: ["Alcance de su comunidad", "Producto", "Relación previa", "Referido", "Beneficio mutuo", "Otro"], system: true, col: false, showIf: { key: "stage", value: "Ganado" } },
+    { key: "lostReason", label: "Motivo de cierre perdido", type: "select", options: ["Sin interés", "Conflicto de intereses", "Eligió otro aliado", "Sin respuesta", "Fuera de tiempo", "Otro"], system: true, col: false, showIf: { key: "stage", value: "Perdido" } },
+    { key: "lastActivityAt", label: "Última actividad", type: "datetime", system: true, readOnly: true, col: true },
+    { key: "createdAt", label: "Fecha de creación", type: "datetime", system: true, readOnly: true, col: false },
+  ],
 };
 
 const OBJ = {
   contact: { plural: "Contactos", singular: "Contacto", Icon: Users },
   company: { plural: "Empresas", singular: "Empresa", Icon: Building2 },
   deal: { plural: "Negocios", singular: "Negocio", Icon: Briefcase },
+  alliance: { plural: "Alianzas", singular: "Alianza", Icon: Handshake },
 };
 
 /* ────────────────────────────────────────────────────────────
@@ -370,6 +383,7 @@ const emptyDb = () => ({
   contacts: [],
   companies: [],
   deals: [],
+  alliances: [],
   activities: [],
   templates: { whatsapp: [], email: [] },
   integrations: normalizeIntegrations(null),
@@ -385,7 +399,7 @@ const emptyDb = () => ({
   autoMarcas: {},
   /* Propiedades borradas: salen del esquema al instante pero sus datos se
      guardan PAPELERA_DIAS días por si fue un error. */
-  papelera: { contact: [], company: [], deal: [] },
+  papelera: { contact: [], company: [], deal: [], alliance: [] },
   /* Vistas: cómo se mira una tabla (búsqueda, filtros, columnas, orden).
      Listas: a quién se le escribe. Una lista activa guarda condiciones y sus
      miembros cambian solos; una fija guarda personas concretas. */
@@ -404,7 +418,7 @@ const emptyDb = () => ({
 });
 
 const PAPELERA_DIAS = 15;
-const COLECCION = { contact: "contacts", company: "companies", deal: "deals" };
+const COLECCION = { contact: "contacts", company: "companies", deal: "deals", alliance: "alliances" };
 
 /* Vencido el plazo, la propiedad se borra de verdad: sale de la papelera y su
    valor se quita de cada registro. Antes de eso no se toca ningún dato. */
@@ -456,10 +470,11 @@ function normalizeDb(raw) {
   return {
     ...d,
     v: DATA_VERSION,
-    schema: { contact: sch("contact"), company: sch("company"), deal: sch("deal") },
+    schema: { contact: sch("contact"), company: sch("company"), deal: sch("deal"), alliance: sch("alliance") },
     contacts: arr(d.contacts),
     companies: arr(d.companies),
     deals: arr(d.deals),
+    alliances: arr(d.alliances),
     /* Antes de Mensajes todo lo registrado era algo que salió de aquí, así que
        lo guardado sin sentido se lee como enviado. Es la única lectura cierta:
        el CRM no tenía forma de anotar una respuesta. */
@@ -491,6 +506,7 @@ function normalizeDb(raw) {
       contact: arr(d.papelera && d.papelera.contact),
       company: arr(d.papelera && d.papelera.company),
       deal: arr(d.papelera && d.papelera.deal),
+      alliance: arr(d.papelera && d.papelera.alliance),
     },
     automations: normalizeAutomations(d.automations),
     autoCola: normalizeCola(d.autoCola),
@@ -867,10 +883,13 @@ export default function CRM() {
   }, [emailCfg && emailCfg.mode, emailCfg && emailCfg.clientId, emailCfg && emailCfg.leerBandeja]);
 
   /* ── mutaciones ── */
-  const collKey = (kind) => (kind === "contact" ? "contacts" : kind === "company" ? "companies" : "deals");
+  const collKey = (kind) => COLECCION[kind] || "deals";
 
+  /* Las alianzas todavía no tienen disparadores propios: no se avisan a las
+     automatizaciones para que una regla de negocios no las tome por uno. */
   const addRecords = (kind, list) => {
     setDb((d) => ({ ...d, [collKey(kind)]: [...list, ...d[collKey(kind)]] }));
+    if (kind === "alliance") return;
     const tipo = kind === "contact" ? "contacto.creado" : kind === "company" ? "empresa.creada" : "negocio.creado";
     list.forEach((r) => emitir({ tipo, kind, recId: r.id, rec: r }));
   };
@@ -884,7 +903,7 @@ export default function CRM() {
     setDb((d) => ({
       ...d, [collKey(kind)]: d[collKey(kind)].map((r) => (r.id === id ? { ...r, props: { ...r.props, ...props } } : r)),
     }));
-    if (!antes) return;
+    if (!antes || kind === "alliance") return;
     const rec = { ...antes, props: { ...antes.props, ...props } };
     const campos = Object.keys(props).filter((k) => String(antes.props[k] == null ? "" : antes.props[k]) !== String(props[k] == null ? "" : props[k]));
     if (!campos.length) return;
@@ -928,6 +947,7 @@ export default function CRM() {
       contacts: stamp(d.contacts),
       companies: stamp(d.companies),
       deals: act.dealId ? d.deals.map((x) => x.id === act.dealId ? { ...x, props: { ...x.props, lastActivityAt: at } } : x) : d.deals,
+      alliances: act.allianceId ? d.alliances.map((x) => x.id === act.allianceId ? { ...x, props: { ...x.props, lastActivityAt: at } } : x) : d.alliances,
     };
   });
 
@@ -1688,6 +1708,7 @@ export default function CRM() {
       { key: "contact", label: "Contactos", Icon: Users },
       { key: "company", label: "Empresas", Icon: Building2 },
       { key: "deal", label: "Negocios", Icon: Briefcase },
+      { key: "alliance", label: "Alianzas", Icon: Handshake },
       { key: "activities", label: "Actividades", Icon: Activity },
     ] },
     { grupo: "Reclutamiento", items: [
@@ -1749,7 +1770,7 @@ export default function CRM() {
           ))}
           <div style={{ marginTop: "auto", padding: "12px 10px", borderTop: `1px solid ${C.line}` }}>
             <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, lineHeight: 1.6 }}>
-              {db.contacts.length} contactos<br />{db.companies.length} empresas<br />{db.deals.length} negocios
+              {db.contacts.length} contactos<br />{db.companies.length} empresas<br />{db.deals.length} negocios<br />{db.alliances.length} alianzas
             </div>
             <div title={save.error || ""} style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 9, fontFamily: "var(--ui)", fontSize: 11, color: save.state === "error" ? C.clay : C.mute }}>
               <span style={{ width: 7, height: 7, borderRadius: 99, flexShrink: 0, background: save.state === "error" ? C.clay : save.state === "saving" ? C.amber : C.jade }} />
@@ -1775,7 +1796,7 @@ export default function CRM() {
           {(view === "contact" || view === "company") && (
             <RecordList key={view} kind={view} db={db} setDb={setDb} say={say} setModal={setModal} setDetail={setDetail} onDelete={(ids) => { deleteRecords(view, ids); say(`${ids.length} registro(s) eliminados`); }} />
           )}
-          {view === "deal" && <DealsView db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord("deal", id, { stage, lastActivityAt: nowISO() }); say(`Negocio movido a ${stage}`); }} />}
+          {(view === "deal" || view === "alliance") && <DealsView key={view} kind={view} db={db} setModal={setModal} setDetail={setDetail} onStage={(id, stage) => { updateRecord(view, id, { stage, lastActivityAt: nowISO() }); say(`${view === "alliance" ? "Alianza movida" : "Negocio movido"} a ${stage}`); }} />}
           {view === "drafts" && <DraftsView db={db} setDb={setDb} say={say} />}
           {view === "activities" && (
             <ActivitiesView db={db} setModal={setModal} setDetail={setDetail} say={say}
@@ -1886,11 +1907,11 @@ export default function CRM() {
             say(`Envío registrado en ${dest.length} registro(s)`);
           }} />
       )}
-      {modal?.kind === "deal" && (
-        <RecordForm db={db} objKind="deal" presets={modal.presets} onClose={() => setModal(null)}
+      {(modal?.kind === "deal" || modal?.kind === "alliance") && (
+        <RecordForm db={db} objKind={modal.kind} presets={modal.presets} onClose={() => setModal(null)}
           onSave={(props) => {
-            addRecords("deal", [{ id: uid(), props: { createdAt: nowISO(), lastActivityAt: nowISO(), ...props }, contactIds: modal.contactIds || [], companyId: modal.companyId }]);
-            setModal(null); say("Negocio creado");
+            addRecords(modal.kind, [{ id: uid(), props: { createdAt: nowISO(), lastActivityAt: nowISO(), ...props }, contactIds: modal.contactIds || [], companyId: modal.companyId }]);
+            setModal(null); say(modal.kind === "alliance" ? "Alianza creada" : "Negocio creado");
           }} />
       )}
 
@@ -2415,6 +2436,7 @@ function RecordList({ kind, db, setDb, say, setModal, setDetail, onDelete }) {
           <Btn size="sm" variant="outline" Icon={MessageSquare} onClick={() => setModal({ kind: "send", channel: "whatsapp", objKind: kind, ids: sel })}>Enviar WhatsApp</Btn>
           <Btn size="sm" variant="outline" Icon={Mail} onClick={() => setModal({ kind: "send", channel: "email", objKind: kind, ids: sel })}>Enviar correo</Btn>
           <Btn size="sm" variant="outline" Icon={Briefcase} onClick={() => setModal({ kind: "deal", contactIds: kind === "contact" ? sel : [], companyId: kind === "company" ? sel[0] : undefined, presets: { source: "Manual" } })}>Crear negocio</Btn>
+          <Btn size="sm" variant="outline" Icon={Handshake} onClick={() => setModal({ kind: "alliance", contactIds: kind === "contact" ? sel : [], companyId: kind === "company" ? sel[0] : undefined, presets: { stage: "Nuevo", source: "Manual" } })}>Crear alianza</Btn>
           <Btn size="sm" variant="outline" Icon={Pencil} onClick={() => setModal({ kind: "bulk", objKind: kind, ids: sel })}>Editar propiedad</Btn>
           <Menu label="Añadir a lista" Icon={ListChecks} items={[
             { label: `Nueva lista fija con estos ${sel.length}`, Icon: Plus, onClick: () => pedirNombre("Nueva lista fija", `Guarda a estos ${sel.length} ${plural}.`, (n) => crearLista(n, "fija", sel)) },
@@ -2551,25 +2573,31 @@ const CellValue = ({ f, v }) => {
 };
 
 /* ────────────────────────────────────────────────────────────
-   Negocios (tablero + tabla)
+   Negocios y alianzas (tablero + tabla)
+   Las alianzas recorren las mismas etapas que un negocio, pero no son venta:
+   el colaborador lleva el producto a su comunidad (B2B2C). Por eso su tablero
+   no muestra montos.
    ──────────────────────────────────────────────────────────── */
-function DealsView({ db, setModal, setDetail, onStage }) {
+function DealsView({ kind = "deal", db, setModal, setDetail, onStage }) {
   const [mode, setMode] = useState("board");
-  const total = db.deals.reduce((s, d) => s + (Number(d.props.amount) || 0), 0);
+  const alianza = kind === "alliance";
+  const lista = db[COLECCION[kind]] || [];
+  const { plural, singular } = OBJ[kind];
+  const total = lista.reduce((s, d) => s + (Number(d.props.amount) || 0), 0);
 
   return (
     <div>
-      <Header eyebrow={`${db.deals.length} negocios · $${total.toLocaleString("es-CO")}`} title="Negocios"
+      <Header eyebrow={alianza ? `${lista.length} alianzas` : `${lista.length} negocios · $${total.toLocaleString("es-CO")}`} title={plural}
         right={<>
           <Btn variant="outline" onClick={() => setMode(mode === "board" ? "table" : "board")}>{mode === "board" ? "Ver tabla" : "Ver tablero"}</Btn>
-          <Btn variant="ghost" size="md" Icon={Plus} onClick={() => setModal({ kind: "prop", objKind: "deal" })}>Nueva propiedad</Btn>
-          <Btn variant="solid" Icon={Plus} onClick={() => setModal({ kind: "deal", presets: { stage: "Nuevo", source: "Manual" } })}>Crear negocio</Btn>
+          <Btn variant="ghost" size="md" Icon={Plus} onClick={() => setModal({ kind: "prop", objKind: kind })}>Nueva propiedad</Btn>
+          <Btn variant="solid" Icon={Plus} onClick={() => setModal({ kind, presets: { stage: "Nuevo", source: "Manual" } })}>Crear {singular.toLowerCase()}</Btn>
         </>} />
 
       {mode === "board" ? (
         <div style={{ padding: 20, display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start" }}>
           {STAGES.map((s) => {
-            const items = db.deals.filter((d) => norm(d.props.stage) === s.key);
+            const items = lista.filter((d) => norm(d.props.stage) === s.key);
             const sum = items.reduce((a, d) => a + (Number(d.props.amount) || 0), 0);
             return (
               <div key={s.key} style={{ minWidth: 218, flex: "1 0 218px", background: "#E9EDE5", borderRadius: 9, padding: 10 }}>
@@ -2581,8 +2609,8 @@ function DealsView({ db, setModal, setDetail, onStage }) {
                 <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
                   {items.map((d) => (
                     <div key={d.id} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 7, padding: 10 }}>
-                      <button onClick={() => setDetail({ kind: "deal", id: d.id })} style={{ background: "none", border: "none", padding: 0, textAlign: "left", cursor: "pointer", fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, color: C.ink, lineHeight: 1.35 }}>{d.props.name}</button>
-                      <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: s.color, marginTop: 5 }}>${(Number(d.props.amount) || 0).toLocaleString("es-CO")}</div>
+                      <button onClick={() => setDetail({ kind, id: d.id })} style={{ background: "none", border: "none", padding: 0, textAlign: "left", cursor: "pointer", fontFamily: "var(--ui)", fontSize: 12.5, fontWeight: 600, color: C.ink, lineHeight: 1.35 }}>{d.props.name}</button>
+                      {!alianza && <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: s.color, marginTop: 5 }}>${(Number(d.props.amount) || 0).toLocaleString("es-CO")}</div>}
                       <div style={{ fontFamily: "var(--ui)", fontSize: 11, color: C.faint, marginTop: 3 }}>{fmt(d.props.lastActivityAt)}</div>
                       <select className="crm-in" value={d.props.stage} onChange={(e) => onStage(d.id, e.target.value)}
                         style={{ ...inputStyle, marginTop: 7, padding: "3px 5px", fontSize: 11.5 }}>
@@ -2592,7 +2620,7 @@ function DealsView({ db, setModal, setDetail, onStage }) {
                   ))}
                   {items.length === 0 && <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, padding: "10px 4px" }}>Vacío</div>}
                 </div>
-                {sum > 0 && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.mute, marginTop: 9, paddingLeft: 4 }}>${sum.toLocaleString("es-CO")}</div>}
+                {!alianza && sum > 0 && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.mute, marginTop: 9, paddingLeft: 4 }}>${sum.toLocaleString("es-CO")}</div>}
               </div>
             );
           })}
@@ -2602,18 +2630,18 @@ function DealsView({ db, setModal, setDetail, onStage }) {
           <table>
             <thead>
               <tr style={{ background: "#F4F6F1", borderBottom: `1px solid ${C.line}` }}>
-                {db.schema.deal.filter((f) => f.col).map((f) => (
+                {db.schema[kind].filter((f) => f.col).map((f) => (
                   <th key={f.key} style={{ padding: "9px 12px", textAlign: "left", fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 500, color: C.mute, letterSpacing: ".07em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{f.label}</th>
                 ))}
                 <th style={{ padding: "9px 12px", textAlign: "left", fontFamily: "var(--mono)", fontSize: 10.5, color: C.mute, letterSpacing: ".07em", textTransform: "uppercase" }}>Asociado a</th>
               </tr>
             </thead>
             <tbody>
-              {db.deals.map((d) => (
+              {lista.map((d) => (
                 <tr key={d.id} className="crm-row" style={{ borderBottom: "1px solid #EEF1EC" }}>
-                  {db.schema.deal.filter((f) => f.col).map((f, i) => (
+                  {db.schema[kind].filter((f) => f.col).map((f, i) => (
                     <td key={f.key} style={{ padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 13 }}>
-                      {i === 0 ? <button onClick={() => setDetail({ kind: "deal", id: d.id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontWeight: 600, fontSize: 13, fontFamily: "var(--ui)" }}>{d.props.name}</button> : <CellValue f={f} v={d.props[f.key]} />}
+                      {i === 0 ? <button onClick={() => setDetail({ kind, id: d.id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.jade, fontWeight: 600, fontSize: 13, fontFamily: "var(--ui)" }}>{d.props.name}</button> : <CellValue f={f} v={d.props[f.key]} />}
                     </td>
                   ))}
                   <td style={{ padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute }}>
@@ -2623,7 +2651,7 @@ function DealsView({ db, setModal, setDetail, onStage }) {
               ))}
             </tbody>
           </table>
-          {db.deals.length === 0 && <Empty title="Todavía no hay negocios" hint="Créalos desde un contacto, desde una empresa o de forma manual." />}
+          {lista.length === 0 && <Empty title={`Todavía no hay ${plural.toLowerCase()}`} hint={`${alianza ? "Créalas" : "Créalos"} desde un contacto, desde una empresa o de forma manual.`} />}
         </div>
       )}
     </div>
@@ -8222,7 +8250,7 @@ function SettingsView({ db, setDb, setModal, say }) {
     if (!file) return;
     try {
       const next = normalizeDb(JSON.parse(await file.text()));
-      const n = next.contacts.length + next.companies.length + next.deals.length;
+      const n = next.contacts.length + next.companies.length + next.deals.length + next.alliances.length;
       if (!window.confirm(`Se reemplazarán los datos actuales por los del respaldo (${n} registros). Esta acción no se puede deshacer. ¿Continuar?`)) return;
       setDb({ ...purgeDemoData(next).db, demoPurgedAt: nowISO() });
       say(`Respaldo restaurado · ${n} registros`);
@@ -8359,7 +8387,7 @@ function SettingsView({ db, setDb, setModal, say }) {
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 }}>
           <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Datos y respaldo</div>
           <div style={{ fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, marginBottom: 12, lineHeight: 1.6 }}>
-            {db.contacts.length} contactos · {db.companies.length} empresas · {db.deals.length} negocios · {db.activities.length} actividades.
+            {db.contacts.length} contactos · {db.companies.length} empresas · {db.deals.length} negocios · {db.alliances.length} alianzas · {db.activities.length} actividades.
             <br />{import.meta.env.VITE_NUBE === "1"
               ? "Todo queda guardado en el servidor del CRM apenas lo escribes, y aparece al instante en tus otros equipos. El respaldo es un archivo con la copia completa: sirve para conservarla fuera de la nube o para traer los datos de otro navegador."
               : "Todo queda guardado en este navegador apenas lo escribes. El respaldo es un archivo con la copia completa: sirve para conservarla fuera del equipo o para pasarla a otro navegador."}
@@ -8382,7 +8410,7 @@ function SettingsView({ db, setDb, setModal, say }) {
    ──────────────────────────────────────────────────────────── */
 function RecordForm({ db, objKind, id, presets, onClose, onSave, onAbrirDuplicado }) {
   const schema = db.schema[objKind];
-  const coll = objKind === "contact" ? db.contacts : objKind === "company" ? db.companies : db.deals;
+  const coll = db[COLECCION[objKind]] || [];
   const existing = id ? coll.find((r) => r.id === id) : null;
   const [v, setV] = useState(existing ? { ...existing.props } : { ...(presets || {}) });
 
@@ -8677,7 +8705,7 @@ const OTRO_VALOR = "__otro__"; // en una propiedad de lista: valor fuera de las 
 
 function BulkEditModal({ db, objKind, ids, onClose, onApply }) {
   const schema = db.schema[objKind];
-  const coll = objKind === "contact" ? db.contacts : objKind === "company" ? db.companies : db.deals;
+  const coll = db[COLECCION[objKind]] || [];
   const editables = schema.filter((f) => !f.readOnly);
 
   const [key, setKey] = useState("");
@@ -9811,7 +9839,7 @@ const TAREAS_CLAUDE = [
   { key: "correo", label: "Redactar correo" },
 ];
 
-function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
+function AsistenteClaude({ db, kind, rec, acts, relatedDeals, relatedAlliances }) {
   const [pregunta, setPregunta] = useState("");
   const [estado, setEstado] = useState({ cargando: null, texto: "", error: "" });
   const [copiado, setCopiado] = useState(false);
@@ -9829,7 +9857,7 @@ function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
         redirect: "manual",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Origen": "asistente" },
-        body: JSON.stringify({ tarea, pregunta, ficha: fichaParaClaude(db, kind, rec, acts, relatedDeals) }),
+        body: JSON.stringify({ tarea, pregunta, ficha: fichaParaClaude(db, kind, rec, acts, relatedDeals, relatedAlliances) }),
       });
       if (r.type === "opaqueredirect" || r.status === 401) throw new Error("La sesión del CRM venció. Recarga la página para volver a entrar.");
       const tipo = r.headers.get("Content-Type") || "";
@@ -9883,16 +9911,19 @@ function AsistenteClaude({ db, kind, rec, acts, relatedDeals }) {
 
 function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
   const { kind, id } = detail;
-  const coll = kind === "contact" ? db.contacts : kind === "company" ? db.companies : db.deals;
+  const coll = db[COLECCION[kind]] || [];
   const rec = coll.find((r) => r.id === id);
   const [note, setNote] = useState("");
   if (!rec) return null;
 
   const schema = db.schema[kind];
-  const acts = db.activities.filter((a) => (a.contactIds || []).includes(id) || (a.companyIds || []).includes(id) || a.dealId === id);
-  const relatedDeals = kind === "deal" ? [] : db.deals.filter((d) => (d.contactIds || []).includes(id) || d.companyId === id);
+  const acts = db.activities.filter((a) => (a.contactIds || []).includes(id) || (a.companyIds || []).includes(id) || a.dealId === id || a.allianceId === id);
+  const pipeline = kind === "deal" || kind === "alliance";
+  const asociadas = (lista) => (pipeline ? [] : (lista || []).filter((d) => (d.contactIds || []).includes(id) || d.companyId === id));
+  const relatedDeals = asociadas(db.deals);
+  const relatedAlliances = asociadas(db.alliances);
 
-  const link = kind === "contact" ? { contactIds: [id] } : kind === "company" ? { companyIds: [id] } : { dealId: id };
+  const link = kind === "contact" ? { contactIds: [id] } : kind === "company" ? { companyIds: [id] } : kind === "alliance" ? { allianceId: id } : { dealId: id };
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(19,28,26,.35)", zIndex: 50, display: "flex", justifyContent: "flex-end" }}>
@@ -9906,11 +9937,12 @@ function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
             <button onClick={onClose} className="crm-btn" style={{ border: "none", background: "none", cursor: "pointer", color: C.faint }}><X size={18} /></button>
           </div>
           <div style={{ display: "flex", gap: 7, marginTop: 14, flexWrap: "wrap" }}>
-            {kind !== "deal" && <>
+            {!pipeline && <>
               <Btn size="sm" variant="outline" Icon={MessageSquare} onClick={() => setModal({ kind: "send", channel: "whatsapp", objKind: kind, ids: [id] })}>WhatsApp</Btn>
               <Btn size="sm" variant="outline" Icon={Mail} onClick={() => setModal({ kind: "send", channel: "email", objKind: kind, ids: [id] })}>Correo</Btn>
               <Btn size="sm" variant="outline" Icon={Phone} onClick={() => onLog({ type: "call", subject: "Llamada registrada", ...link })}>Registrar llamada</Btn>
               <Btn size="sm" variant="outline" Icon={Briefcase} onClick={() => setModal({ kind: "deal", presets: { stage: "Nuevo", source: rec.props.leadSource || "Manual", name: `Negocio · ${titleOf(kind, rec)}` }, contactIds: kind === "contact" ? [id] : [], companyId: kind === "company" ? id : undefined })}>Crear negocio</Btn>
+              <Btn size="sm" variant="outline" Icon={Handshake} onClick={() => setModal({ kind: "alliance", presets: { stage: "Nuevo", source: rec.props.leadSource || "Manual", name: `Alianza · ${titleOf(kind, rec)}` }, contactIds: kind === "contact" ? [id] : [], companyId: kind === "company" ? id : undefined })}>Crear alianza</Btn>
             </>}
             <Btn size="sm" variant="solid" onClick={onEdit}>Editar</Btn>
           </div>
@@ -9927,19 +9959,19 @@ function RecordDetail({ db, detail, onClose, setModal, onLog, onEdit }) {
             ))}
           </div>
 
-          {relatedDeals.length > 0 && (
-            <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
-              <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>Negocios asociados</div>
-              {relatedDeals.map((d) => (
+          {[["Negocios asociados", relatedDeals], ["Alianzas asociadas", relatedAlliances]].map(([titulo, lista]) => lista.length > 0 && (
+            <div key={titulo} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
+              <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>{titulo}</div>
+              {lista.map((d) => (
                 <div key={d.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", gap: 8 }}>
                   <span style={{ fontFamily: "var(--ui)", fontSize: 12.5 }}>{d.props.name}</span>
                   <Pill color={stageColor(norm(d.props.stage))} soft="#F1F3EE">{d.props.stage}</Pill>
                 </div>
               ))}
             </div>
-          )}
+          ))}
 
-          <AsistenteClaude db={db} kind={kind} rec={rec} acts={acts} relatedDeals={relatedDeals} />
+          <AsistenteClaude db={db} kind={kind} rec={rec} acts={acts} relatedDeals={relatedDeals} relatedAlliances={relatedAlliances} />
 
           <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 16 }}>
             <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>Historial</div>
