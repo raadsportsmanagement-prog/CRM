@@ -155,7 +155,7 @@ Para probarlo en local con `npm run nube:local`, agrega
 
 ## Los agentes trabajando solos (`nube/operacion.js`)
 
-Los agentes de **Mensajes → Agentes** contestan los WhatsApp en el servidor,
+Los agentes de **Agentes → Atención** contestan los WhatsApp en el servidor,
 también con el CRM cerrado:
 
 1. Meta (o Twilio) avisa al puente de un WhatsApp entrante. El puente lo
@@ -166,14 +166,14 @@ también con el CRM cerrado:
 3. La conversación espera 8 segundos en la fila del `Operador` (un Durable
    Object con alarma), por si llegan más mensajes seguidos.
 4. El agente que le toca redacta. Según su modo:
-   - **Sugerir** (el de fábrica): queda en **Mensajes → Supervisión** para
+   - **Sugerir** (el de fábrica): queda en **Agentes → Supervisión** para
      aprobar, corregir o descartar.
    - **Automático**: sale solo por el puente. Al llegar al tope de mensajes
      automáticos con la misma persona en 24 horas, vuelve a pedir aprobación.
    - Si el agente pide una persona, la conversación queda en manos de una
      persona y deja de contestar ahí.
 
-En la lista de agentes está el botón **Pausar todos**: siguen entrando los
+Arriba de la sección **Agentes** está el botón **Pausar todos**: siguen entrando los
 mensajes, pero nadie redacta ni envía.
 
 Lo que hace un agente queda en `supervision` y cada escritura va firmada con
@@ -198,7 +198,7 @@ dos cambian el mismo valor, gana la pestaña.
 ## Los agentes de operación (`nube/marketing.js`)
 
 La cadena de una noticia a un lead que se suscribe en Catch, sola en el
-servidor. Se configura en **Mensajes → Agentes → Agentes de operación**.
+servidor. Se configura en **Agentes → Equipo**.
 
 | Agente | Cuándo | Qué hace |
 |---|---|---|
@@ -226,3 +226,19 @@ Cloudflare Email no admite marketing, así que las campañas salen por SES:
 
 Sin SES, las campañas salen sólo por WhatsApp. Las bajas las recibe el
 puente (`/b/<id>`) y el agente las aplica antes de cada tanda.
+
+### Dónde se ve cada cosa
+
+La sección **Agentes** del menú reúne todo lo de los agentes, aparte de
+Mensajes:
+
+- **Supervisión**: lo que esperan aprobación, lo que enviaron, campañas y
+  conversiones.
+- **Atención**: los agentes que conversan con los usuarios (Luna y los de
+  cada etapa), con su modo y sus condiciones.
+- **Equipo**: los de operación interna (Investigador y JEV, Contenido,
+  Campañas, Seguimiento), cada uno con su ficha, su configuración y lo último
+  que hizo.
+
+En Mensajes quedan las conversaciones; dentro de cada una se ve la propuesta
+del agente que espera aprobación y quién la atiende.

@@ -31,7 +31,7 @@ Devuelve sólo el texto del mensaje.`,
 };
 
 /* Un agente de texto contesta en nombre del negocio. Su encargo lo escribe el
-   usuario en Mensajes → Agentes y llega en cada pedido; aquí se envuelve con
+   usuario en Agentes → Atención y llega en cada pedido; aquí se envuelve con
    las reglas que ningún agente puede saltarse. Si no debe contestar él, la
    primera línea lo dice y la app avisa en vez de proponer un mensaje. */
 const MARCA_TRASPASO = "PASAR A PERSONA:";

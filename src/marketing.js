@@ -24,7 +24,7 @@ const txt = (x) => String(x == null ? "" : x);
 const num = (x, min, max, def) => Math.min(max, Math.max(min, Math.round(Number(x)) || def));
 const DIA_MS = 24 * 3600 * 1000;
 
-/* Salen apagados: se encienden en Mensajes → Agentes, una vez configurado el
+/* Salen apagados: se encienden en Agentes → Equipo, una vez configurado el
    envío (Meta, SES). */
 export const MARKETING_BASE = {
   contenido: { activo: false, minimoJev: 70 },

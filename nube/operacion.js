@@ -10,7 +10,7 @@
      3. La conversación espera unos segundos en la fila del Operador, por si
         la persona manda tres mensajes seguidos: se contesta una vez, al
         último.
-     4. El agente que le toca (el mismo de Mensajes → Agentes) redacta.
+     4. El agente que le toca (el mismo de Agentes → Atención) redacta.
      5. Según su modo, la respuesta queda en Supervisión esperando a una
         persona, o sale sola por el puente. Si el agente pide una persona, la
         conversación queda en manos de una persona y deja de contestar ahí.

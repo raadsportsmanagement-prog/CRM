@@ -690,6 +690,8 @@ const Empty = ({ title, hint, action }) => (
 export default function CRM() {
   const [db, setDb] = useState(null);
   const [view, setView] = useState("dashboard");
+  /* La conversación que Agentes → Supervisión pide abrir en Mensajes. */
+  const [abrirConv, setAbrirConv] = useState("");
   const [toast, setToast] = useState(null);
   const [modal, setModal] = useState(null); // {kind:'record'|'import'|'prop'|'send'|'deal', ...}
   const [detail, setDetail] = useState(null); // {kind, id}
@@ -1674,10 +1676,13 @@ export default function CRM() {
      pueden esperar sin encender nada. */
   const tendenciasNuevas = ((db.tendencias && db.tendencias.items) || []).filter((x) => (x.estado || "nueva") === "nueva" && x.jev && x.jev.decision === "producir").length;
 
+  const agentesPorRevisar = (db.supervision || []).filter((x) => POR_REVISAR.includes(x.estado)).length;
+
   const NAV = [
     { grupo: null, items: [
       { key: "dashboard", label: "Panel", Icon: LayoutDashboard },
       { key: "messages", label: "Mensajes", Icon: Inbox },
+      { key: "agents", label: "Agentes", Icon: Bot },
     ] },
     { grupo: "Comercial", items: [
       { key: "contact", label: "Contactos", Icon: Users },
@@ -1728,7 +1733,7 @@ export default function CRM() {
               {grupo && <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, letterSpacing: ".08em", textTransform: "uppercase", padding: "0 10px 4px" }}>{grupo}</div>}
               {items.map(({ key, label, Icon }) => {
                 const on = view === key;
-                const nuevos = key === "messages" ? sinLeer : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : key === "trends" ? tendenciasNuevas : 0;
+                const nuevos = key === "messages" ? sinLeer : key === "agents" ? agentesPorRevisar : key === "automations" ? porAtender : key === "templates" ? plantillasNuevas : key === "trends" ? tendenciasNuevas : 0;
                 return (
                   <button key={key} className={on ? "" : "crm-nav"} onClick={() => { setView(key); setDetail(null); }}
                     style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer", background: on ? C.jade : "transparent", color: on ? "#fff" : C.ink, fontFamily: "var(--ui)", fontSize: 13.5, fontWeight: on ? 600 : 400, textAlign: "left" }}>
@@ -1758,9 +1763,14 @@ export default function CRM() {
           {view === "dashboard" && <Dashboard db={db} go={setView} />}
           {view === "messages" && (
             <MessagesView db={db} setDb={setDb} say={say} setDetail={setDetail} setView={setView}
+              abrir={abrirConv} onAbierta={() => setAbrirConv("")}
               onLog={logActivity} onImport={importActivities} onBuzon={marcarBuzon} onVisto={marcarVisto}
               onEventos={aplicarEventos} onRebotes={aplicarRebotes}
               onLeerBandeja={activarLectura} onLeads={importarLeads} onWhatsApp={importarWhatsApp} />
+          )}
+          {view === "agents" && (
+            <AgentesSeccion db={db} setDb={setDb} say={say} go={setView}
+              onAbrirConv={(clave) => { setAbrirConv(clave); setView("messages"); }} />
           )}
           {(view === "contact" || view === "company") && (
             <RecordList key={view} kind={view} db={db} setDb={setDb} say={say} setModal={setModal} setDetail={setDetail} onDelete={(ids) => { deleteRecords(view, ids); say(`${ids.length} registro(s) eliminados`); }} />
@@ -3550,7 +3560,7 @@ function resumenBarrido({ nuevos, revisados, rebotados, movidos, leads, fichas, 
   return trozos.length ? trozos.join(" · ") : "Sin novedades";
 }
 
-function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
+function MessagesView({ db, setDb, say, setDetail, setView, abrir, onAbierta, onLog, onImport, onBuzon, onVisto, onLeerBandeja, onEventos, onRebotes, onLeads, onWhatsApp }) {
   const integ = db.integrations;
   const conversaciones = useMemo(() => construirConversaciones(db), [db]);
 
@@ -3558,7 +3568,6 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
   const [buscar, setBuscar] = useState("");
   const [filtro, setFiltro] = useState("all");
   const [sync, setSync] = useState({ busy: false, nota: "", err: "" });
-  const [seccion, setSeccion] = useState("chats");
 
   /* Igual que en Contactos: la casilla responde al instante y la lista se
      filtra un paso detrás, y se pintan de a 100. */
@@ -3613,11 +3622,13 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
   const sinNada = conversaciones.length === 0;
   const pendientes = useMemo(() => new Set((db.supervision || []).filter((x) => x.estado === "pendiente").map((x) => x.clave)), [db.supervision]);
 
-  if (seccion === "agentes") return <AgentesView db={db} setDb={setDb} say={say} seccion={seccion} setSeccion={setSeccion} />;
-  if (seccion === "supervision") {
-    return <SupervisionView db={db} say={say} seccion={seccion} setSeccion={setSeccion}
-      onAbrir={(clave) => { setSel(clave); setBuscar(""); setFiltro("all"); setSeccion("chats"); }} />;
-  }
+  /* Desde Agentes → Supervisión se puede pedir abrir una conversación. */
+  useEffect(() => {
+    if (!abrir) return;
+    setSel(abrir); setBuscar(""); setFiltro("all");
+    if (onAbierta) onAbierta();
+  }, [abrir]);
+  const porRevisar = (db.supervision || []).filter((x) => POR_REVISAR.includes(x.estado)).length;
 
   return (
     <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
@@ -3636,7 +3647,12 @@ function MessagesView({ db, setDb, say, setDetail, setView, onLog, onImport, onB
             </Btn>
           </div>
 
-          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} supervision={db.supervision} />
+          {porRevisar > 0 && (
+            <button onClick={() => setView("agents")} className="crm-btn"
+              style={{ display: "flex", alignItems: "center", gap: 7, width: "100%", marginTop: 12, border: "1px solid #D9C8E6", background: C.plumSoft, color: C.plum, borderRadius: 8, padding: "7px 10px", fontFamily: "var(--ui)", fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "left" }}>
+              <ShieldCheck size={13} /> <span style={{ flex: 1 }}>{porRevisar} cosa(s) de los agentes por revisar</span> <ChevronRight size={13} />
+            </button>
+          )}
 
           <div style={{ position: "relative", marginTop: 12 }}>
             <Search size={13} color={C.faint} style={{ position: "absolute", left: 9, top: 9 }} />
@@ -3776,30 +3792,71 @@ const fijarAgenteChat = (setDb, clave, valor) => setDb((d) => {
   return { ...d, agentesChat: m };
 });
 
-/* Chats | Supervisión | Agentes, arriba de la columna izquierda en las tres
-   vistas. */
-function SeccionMensajes({ seccion, setSeccion, agentes, supervision = [] }) {
-  const encendidos = agentes.filter((a) => a.activo).length;
-  const porRevisar = supervision.filter((x) => POR_REVISAR.includes(x.estado)).length;
+/* ── La sección Agentes ──
+   Todo lo de los agentes, separado de Mensajes:
+     · Supervisión — lo que hicieron o esperan aprobación
+     · Atención — los que conversan con los usuarios (WhatsApp)
+     · Equipo — los de operación interna (contenido, campañas, seguimiento)
+   Arriba de la columna izquierda, en las tres, el mismo encabezado con las
+   pestañas y el interruptor general. */
+const SECCIONES_AGENTES = [
+  ["supervision", "Supervisión", ShieldCheck],
+  ["atencion", "Atención", Headset],
+  ["equipo", "Equipo", Zap],
+];
+
+function CabeceraAgentes({ db, setDb, say, seccion, setSeccion, subtitulo, accion }) {
+  const op = db.operacion || {};
+  const porRevisar = (db.supervision || []).filter((x) => POR_REVISAR.includes(x.estado)).length;
+  const atencion = db.agentes || [];
+  const mk = normalizaMarketing(db.marketing);
+  const equipoOn = [mk.contenido.activo, mk.seguimiento.activo].filter(Boolean).length;
+  const pausar = () => {
+    setDb((d) => ({ ...d, operacion: normalizaOperacion({ ...(d.operacion || {}), pausada: !op.pausada }) }));
+    say(op.pausada ? "Los agentes vuelven a trabajar" : "Agentes en pausa: nadie redacta ni envía");
+  };
   return (
-    <div style={{ display: "flex", background: "#EEF1EB", borderRadius: 8, padding: 3, marginTop: 12 }}>
-      {[["chats", "Chats", Inbox], ["supervision", "Supervisión", ShieldCheck], ["agentes", "Agentes", Bot]].map(([k, l, I]) => {
-        const on = seccion === k;
-        return (
-          <button key={k} onClick={() => setSeccion(k)} className="crm-btn"
-            style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, border: "none", borderRadius: 6, padding: "5px 8px", background: on ? C.panel : "transparent", boxShadow: on ? "0 1px 2px rgba(19,28,26,.12)" : "none", color: on ? C.ink : C.mute, fontFamily: "var(--ui)", fontSize: 12, fontWeight: on ? 600 : 500, cursor: "pointer" }}>
-            <I size={12} /> {l}
-            {k === "agentes" && agentes.length > 0 && (
-              <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{encendidos}/{agentes.length}</span>
-            )}
-            {k === "supervision" && porRevisar > 0 && (
-              <span style={{ background: C.clay, color: "#fff", fontFamily: "var(--mono)", fontSize: 9.5, fontWeight: 600, borderRadius: 99, padding: "1px 5px" }}>{porRevisar}</span>
-            )}
-          </button>
-        );
-      })}
-    </div>
+    <>
+      <div style={{ padding: "18px 16px 12px", borderBottom: `1px solid ${C.line}` }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>{subtitulo}</div>
+            <h1 style={{ fontFamily: "var(--display)", fontSize: 21, fontWeight: 600, letterSpacing: "-.02em", margin: "3px 0 0" }}>Agentes</h1>
+          </div>
+          {accion}
+        </div>
+        <div style={{ display: "flex", background: "#EEF1EB", borderRadius: 8, padding: 3, marginTop: 12 }}>
+          {SECCIONES_AGENTES.map(([k, l, I]) => {
+            const on = seccion === k;
+            const extra = k === "supervision" ? porRevisar : k === "atencion" ? `${atencion.filter((a) => a.activo).length}/${atencion.length}` : `${equipoOn}/2`;
+            return (
+              <button key={k} onClick={() => setSeccion(k)} className="crm-btn"
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, border: "none", borderRadius: 6, padding: "5px 6px", background: on ? C.panel : "transparent", boxShadow: on ? "0 1px 2px rgba(19,28,26,.12)" : "none", color: on ? C.ink : C.mute, fontFamily: "var(--ui)", fontSize: 12, fontWeight: on ? 600 : 500, cursor: "pointer" }}>
+                <I size={12} /> {l}
+                {k === "supervision"
+                  ? extra > 0 && <span style={{ background: C.clay, color: "#fff", fontFamily: "var(--mono)", fontSize: 9.5, fontWeight: 600, borderRadius: 99, padding: "1px 5px" }}>{extra}</span>
+                  : <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint }}>{extra}</span>}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: op.pausada ? C.claySoft : C.jadeSoft, fontFamily: "var(--ui)", fontSize: 12, color: C.ink, display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ width: 8, height: 8, borderRadius: 99, background: op.pausada ? C.clay : C.jade, flexShrink: 0 }} />
+        <span style={{ flex: 1, fontWeight: 600 }}>{op.pausada ? "Todos los agentes en pausa" : "Agentes en marcha"}</span>
+        <Btn size="sm" variant="outline" Icon={op.pausada ? Play : Pause} onClick={pausar}>{op.pausada ? "Reanudar" : "Pausar todos"}</Btn>
+      </div>
+    </>
   );
+}
+
+function AgentesSeccion({ db, setDb, say, onAbrirConv, go }) {
+  const [seccion, setSeccion] = useState(() =>
+    (db.supervision || []).some((x) => POR_REVISAR.includes(x.estado)) ? "supervision" : "atencion");
+  const cab = { db, setDb, say, seccion, setSeccion };
+  if (seccion === "supervision") return <SupervisionView db={db} say={say} cab={cab} onAbrir={onAbrirConv} />;
+  if (seccion === "equipo") return <EquipoView db={db} setDb={setDb} say={say} cab={cab} go={go} />;
+  return <AgentesView db={db} setDb={setDb} say={say} cab={cab} />;
 }
 
 /* En el encabezado del hilo: quién atiende y, para cambiarlo, el mismo menú. */
@@ -3825,13 +3882,13 @@ function SelectorAgente({ db, setDb, kind, rec }) {
   );
 }
 
-function AgentesView({ db, setDb, say, seccion, setSeccion }) {
+function AgentesView({ db, setDb, say, cab }) {
   const agentes = db.agentes || [];
   const [sel, setSel] = useState(() => (agentes[0] || {}).id || "");
   const actual = agentes.find((a) => a.id === sel) || null;
 
   useEffect(() => {
-    if (!actual && sel !== OPERACION && agentes.length) setSel(agentes[0].id);
+    if (!actual && agentes.length) setSel(agentes[0].id);
   }, [actual, agentes.length]);
 
   const conversaciones = useMemo(() => construirConversaciones(db), [db]);
@@ -3849,7 +3906,6 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
 
   const guardar = (a) => setDb((d) => ({ ...d, agentes: (d.agentes || []).map((x) => (x.id === a.id ? normalizaAgente(a) : x)) }));
   const op = db.operacion || {};
-  const mkt = normalizaMarketing(db.marketing);
   const setOperacion = (parche) => setDb((d) => ({ ...d, operacion: normalizaOperacion({ ...(d.operacion || {}), ...parche }) }));
   const crear = (a) => {
     setDb((d) => ({ ...d, agentes: [...(d.agentes || []), a] }));
@@ -3883,35 +3939,15 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
   return (
     <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
       <div style={{ width: 316, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: C.panel, display: "flex", flexDirection: "column" }}>
-        <div style={{ padding: "18px 16px 12px", borderBottom: `1px solid ${C.line}` }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <div>
-              <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
-                {agentes.length} agente{agentes.length === 1 ? "" : "s"}
-              </div>
-              <h1 style={{ fontFamily: "var(--display)", fontSize: 21, fontWeight: 600, letterSpacing: "-.02em", margin: "3px 0 0" }}>Mensajes</h1>
-            </div>
-            <Btn size="sm" variant="outline" Icon={Plus} onClick={() => crear(agenteVacio())}>Nuevo</Btn>
-          </div>
-          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={agentes} supervision={db.supervision} />
-        </div>
+        <CabeceraAgentes {...cab} subtitulo={`${agentes.length} de cara a los usuarios`}
+          accion={<Btn size="sm" variant="outline" Icon={Plus} onClick={() => crear(agenteVacio())}>Nuevo</Btn>} />
 
-        <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.line}`, background: op.pausada ? C.claySoft : C.jadeSoft, fontFamily: "var(--ui)", fontSize: 12, color: C.ink, lineHeight: 1.5 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 8, height: 8, borderRadius: 99, background: op.pausada ? C.clay : C.jade, flexShrink: 0 }} />
-            <span style={{ flex: 1, fontWeight: 600 }}>{op.pausada ? "Agentes en pausa" : "Agentes en marcha"}</span>
-            <Btn size="sm" variant="outline" Icon={op.pausada ? Play : Pause} onClick={() => {
-              setOperacion({ pausada: !op.pausada });
-              say(op.pausada ? "Los agentes vuelven a atender" : "Agentes en pausa: nadie redacta ni envía");
-            }}>{op.pausada ? "Reanudar" : "Pausar todos"}</Btn>
-          </div>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7, fontSize: 11.5, color: C.mute }}>
-            Tope automático por persona en 24 h
-            <input className="crm-in" type="number" min={1} max={50} value={op.topeAutomatico || 8}
-              onChange={(e) => setOperacion({ topeAutomatico: Number(e.target.value) })}
-              style={{ ...inputStyle, width: 58, padding: "3px 6px", fontSize: 12 }} />
-          </label>
-        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderBottom: `1px solid ${C.line}`, fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute }}>
+          <span style={{ flex: 1 }}>Tope automático por persona en 24 h</span>
+          <input className="crm-in" type="number" min={1} max={50} value={op.topeAutomatico || 8}
+            onChange={(e) => setOperacion({ topeAutomatico: Number(e.target.value) })}
+            style={{ ...inputStyle, width: 58, padding: "3px 6px", fontSize: 12 }} />
+        </label>
 
         <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: "#F6F8F4", fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, lineHeight: 1.5 }}>
           A cada conversación la atiende el primero de arriba hacia abajo que esté encendido y cuyas condiciones cumpla.
@@ -3919,19 +3955,6 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
         </div>
 
         <div style={{ flex: 1, overflowY: "auto" }}>
-          <div onClick={() => setSel(OPERACION)} className={sel === OPERACION ? "" : "crm-row"}
-            style={{ display: "flex", gap: 10, alignItems: "center", padding: "11px 10px 11px 14px", borderBottom: `1px solid ${C.line}`, borderLeft: `3px solid ${sel === OPERACION ? C.jade : "transparent"}`, background: sel === OPERACION ? C.jadeSoft : "#FAFBF8", cursor: "pointer" }}>
-            <span style={{ width: 14, flexShrink: 0 }} />
-            <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, background: mkt.contenido.activo || mkt.seguimiento.activo ? C.plum : "#D9DED5", color: "#fff", display: "grid", placeItems: "center" }}>
-              <Zap size={15} />
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>Agentes de operación</div>
-              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                Contenido {mkt.contenido.activo ? "encendido" : "apagado"} · Seguimiento {mkt.seguimiento.activo ? "encendido" : "apagado"}
-              </div>
-            </div>
-          </div>
           {agentes.map((a, i) => {
             const on = a.id === sel;
             return (
@@ -3965,8 +3988,7 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
       </div>
 
       <div style={{ flex: 1, minWidth: 0, overflowY: "auto", background: C.canvas }}>
-        {sel === OPERACION ? <OperacionPanel db={db} setDb={setDb} say={say} />
-          : actual
+        {actual
           ? <EditorAgente key={actual.id} db={db} agente={actual} indice={agentes.indexOf(actual)} conversaciones={conversaciones}
               onGuardar={(a) => { guardar(a); say("Agente guardado"); }}
               onAlternar={() => alternar(actual)}
@@ -3991,10 +4013,32 @@ function AgentesView({ db, setDb, say, seccion, setSeccion }) {
   );
 }
 
-/* ── Los agentes de operación ──
-   Contenido, Campañas y Seguimiento (nube/marketing.js): lo que hacen solos
-   en el servidor, sus límites, y las campañas que van armando. */
-const OPERACION = "__operacion";
+/* ── El equipo: los agentes de operación interna ──
+   Trabajan solos en el servidor (nube/tendencias.js y nube/marketing.js) y
+   no conversan con nadie: buscan, deciden, preparan y envían. Cada uno con su
+   ficha: qué hace, cuándo, su configuración y lo último que hizo. */
+const EQUIPO = [
+  {
+    key: "tendencias", nombre: "Investigador y JEV", Icon: Lightbulb, cuando: "Cada mañana a las 6:00",
+    rol: "Busca en la web lo que se está diciendo sobre lo que le importa a la audiencia de Catch, y JEV, el juez, le pone nota a cada noticia para decidir cuáles vale la pena producir.",
+    firma: ["cron (tendencias)"],
+  },
+  {
+    key: "contenido", nombre: "Agente de Contenido", Icon: Newspaper, cuando: "Cada mañana, después de JEV",
+    rol: "Elige la tendencia mejor calificada, escribe el WhatsApp y el correo con el enlace personal de registro a app.catchrsm.com y manda la plantilla a aprobación de Meta.",
+    firma: ["Agente de Contenido"],
+  },
+  {
+    key: "campanas", nombre: "Agente de Campañas", Icon: Megaphone, cuando: "Cada 10 minutos",
+    rol: "Cuando Meta aprueba la plantilla, envía la campaña por WhatsApp y por correo a los leads que no se han registrado, en tandas, en horario de día y sin pasar el tope semanal por persona.",
+    firma: ["Agente de Campañas"],
+  },
+  {
+    key: "seguimiento", nombre: "Agente de Seguimiento", Icon: Reply, cuando: "Cada 10 minutos",
+    rol: "A quien recibió una campaña hace unos días y sigue sin registrarse, le escribe para invitarlo a conversar. Si contesta, lo atiende el agente de Atención que le toque.",
+    firma: ["Agente de Seguimiento"],
+  },
+];
 
 const ESTADO_CAMPANA = {
   revision: { label: "Esperando a Meta", color: C.amber },
@@ -4005,117 +4049,218 @@ const ESTADO_CAMPANA = {
   fallo: { label: "Falló", color: C.clay },
 };
 
-function OperacionPanel({ db, setDb, say }) {
+/* Encendido, apagado o siempre activo, según el agente. */
+function estadoEquipo(key, mk, db) {
+  if (key === "tendencias") return { on: true, texto: "Siempre activo" };
+  if (key === "contenido") return { on: mk.contenido.activo, texto: mk.contenido.activo ? "Encendido" : "Apagado" };
+  if (key === "seguimiento") return { on: mk.seguimiento.activo, texto: mk.seguimiento.activo ? "Encendido" : "Apagado" };
+  const activas = normalizeCampanas(db.campanas).filter((c) => c.estado === "enviando" || c.estado === "revision").length;
+  return { on: true, texto: activas ? `${activas} campaña(s) en curso` : "Esperando campañas" };
+}
+
+function EquipoView({ db, setDb, say, cab, go }) {
+  const [sel, setSel] = useState(EQUIPO[1].key);
+  const mk = normalizaMarketing(db.marketing);
+  const op = db.operacion || {};
+  const actual = EQUIPO.find((x) => x.key === sel) || EQUIPO[0];
+  return (
+    <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
+      <div style={{ width: 316, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: C.panel, display: "flex", flexDirection: "column" }}>
+        <CabeceraAgentes {...cab} subtitulo="Operación interna" />
+        <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: "#F6F8F4", fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, lineHeight: 1.5 }}>
+          De una noticia a un lead registrado en Catch, en este orden. Trabajan solos en el servidor, también con el CRM cerrado.
+        </div>
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {EQUIPO.map((a, i) => {
+            const on = a.key === sel;
+            const est = estadoEquipo(a.key, mk, db);
+            const vivo = est.on && !op.pausada;
+            return (
+              <div key={a.key} onClick={() => setSel(a.key)} className={on ? "" : "crm-row"}
+                style={{ display: "flex", gap: 10, alignItems: "center", padding: "11px 10px 11px 14px", borderBottom: "1px solid #F2F4F0", borderLeft: `3px solid ${on ? C.jade : "transparent"}`, background: on ? C.jadeSoft : "transparent", cursor: "pointer" }}>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, width: 14, textAlign: "right", flexShrink: 0 }}>{i + 1}</span>
+                <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, background: vivo ? C.plum : "#D9DED5", color: "#fff", display: "grid", placeItems: "center" }}>
+                  <a.Icon size={15} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: vivo ? C.ink : C.mute }}>{a.nombre}</div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {[a.cuando, op.pausada ? "En pausa" : est.texto].join(" · ")}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ flex: 1, minWidth: 0, overflowY: "auto", background: C.canvas }}>
+        <PanelEquipo key={actual.key} agente={actual} db={db} setDb={setDb} say={say} go={go} />
+      </div>
+    </div>
+  );
+}
+
+function PanelEquipo({ agente, db, setDb, say, go }) {
   const mk = normalizaMarketing(db.marketing);
   const campanas = normalizeCampanas(db.campanas);
-  const audiencia = useMemo(() => audienciaDe(db, mk).length, [db.contacts, db.activities, db.marketing, db.agentesChat]);
+  const audiencia = useMemo(() => (agente.key === "campanas" ? audienciaDe(db, mk).length : 0), [agente.key, db.contacts, db.activities, db.marketing, db.agentesChat]);
   const [abierta, setAbierta] = useState("");
   const set = (fn) => setDb((d) => ({ ...d, marketing: normalizaMarketing(fn(normalizaMarketing(d.marketing))) }));
   const cambiarCampana = (id, parche, aviso) => {
     setDb((d) => ({ ...d, campanas: normalizeCampanas(d.campanas).map((c) => (c.id === id ? { ...c, ...parche } : c)) }));
     say(aviso);
   };
+  const est = estadoEquipo(agente.key, mk, db);
   const tarjeta = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, padding: 18 };
+  const titulo = (t) => <div style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{t}</div>;
   const ayuda = (t) => <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>{t}</div>;
   const numero = (valor, alCambiar, min, max) => (
     <input className="crm-in" type="number" min={min} max={max} value={valor} onChange={(e) => alCambiar(Number(e.target.value))}
       style={{ ...inputStyle, width: 64, padding: "4px 7px", fontSize: 12.5 }} />
   );
   const fila = { display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontFamily: "var(--ui)", fontSize: 12.5, color: C.mute, flexWrap: "wrap" };
-  const encabezado = (Icon, titulo, activo, alternar) => (
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-      <Icon size={16} color={activo ? C.plum : C.faint} />
-      <div style={{ flex: 1, fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>{titulo}</div>
-      {alternar && <Btn variant={activo ? "outline" : "solid"} Icon={activo ? Pause : Play} onClick={alternar}>{activo ? "Apagar" : "Encender"}</Btn>}
-    </div>
-  );
+
+  const alternable = agente.key === "contenido" || agente.key === "seguimiento";
+  const alternar = () => {
+    if (agente.key === "contenido") {
+      set((m) => ({ ...m, contenido: { ...m.contenido, activo: !m.contenido.activo } }));
+      say(mk.contenido.activo ? "Agente de Contenido apagado" : "Agente de Contenido encendido: mañana a las 6:00 arma la campaña del día");
+    } else {
+      set((m) => ({ ...m, seguimiento: { ...m.seguimiento, activo: !m.seguimiento.activo } }));
+      say(mk.seguimiento.activo ? "Agente de Seguimiento apagado" : "Agente de Seguimiento encendido");
+    }
+  };
+
+  /* Lo último que hizo, de Supervisión (o de las corridas de Tendencias). */
+  const movimientos = agente.key === "tendencias"
+    ? ((db.tendencias && db.tendencias.corridas) || []).slice(0, 8).map((c, i) => ({
+        id: `${c.at}-${i}`, at: c.at, estado: c.error ? "fallo" : "info",
+        texto: c.error ? c.error : `${c.n} noticia(s) nueva(s) calificadas${c.quien && c.quien !== "cron" ? ` · pedida por ${c.quien}` : ""}`,
+      }))
+    : (db.supervision || []).filter((x) => agente.firma.includes(x.agente)).slice(0, 8)
+      .map((x) => ({ id: x.id, at: x.at, estado: x.estado, texto: x.error || x.texto || x.motivo || "" }));
+
   const seg = mk.seguimiento.plantilla;
   const estadoSeg = !seg ? "se crea en Meta al encenderlo" : seg.estado === "APPROVED" ? "aprobada por Meta" : seg.estado === "REJECTED" ? `rechazada por Meta${seg.rechazo ? ` (${seg.rechazo})` : ""}` : "esperando la aprobación de Meta";
 
   return (
     <div style={{ padding: "22px 28px 40px", maxWidth: 860, display: "flex", flexDirection: "column", gap: 14 }}>
-      <div>
-        <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>Trabajan solos en el servidor</div>
-        <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em", marginTop: 3 }}>Agentes de operación</div>
-        {ayuda("De una noticia a un lead registrado en Catch: el de Contenido elige y escribe la campaña del día, el de Campañas la envía cuando Meta la aprueba, el de Seguimiento le escribe a quien no se registró, y si contesta lo atiende el agente de texto. Todo queda en Mensajes → Supervisión y se detiene con «Pausar todos».")}
-      </div>
-
-      <div style={tarjeta}>
-        {encabezado(Newspaper, "Contenido · cada mañana a las 6:00", mk.contenido.activo, () => {
-          set((m) => ({ ...m, contenido: { ...m.contenido, activo: !m.contenido.activo } }));
-          say(mk.contenido.activo ? "Agente de Contenido apagado" : "Agente de Contenido encendido: mañana a las 6:00 arma la campaña del día");
-        })}
-        {ayuda("Toma la tendencia mejor calificada por JEV, escribe el WhatsApp y el correo con el enlace personal de registro a app.catchrsm.com, y manda la plantilla a Meta. Cuando Meta la aprueba, sale sola.")}
-        <label style={fila}>Nota mínima de JEV para producir {numero(mk.contenido.minimoJev, (v) => set((m) => ({ ...m, contenido: { ...m.contenido, minimoJev: v } })), 0, 100)}</label>
-      </div>
-
-      <div style={tarjeta}>
-        {encabezado(Megaphone, "Campañas · reglas de envío", true, null)}
-        <div style={fila}>
-          <span>Tope de mensajes de marketing por persona en 7 días</span>
-          {numero(mk.topeSemanal, (v) => set((m) => ({ ...m, topeSemanal: v })), 1, 14)}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ width: 42, height: 42, borderRadius: 99, background: est.on ? C.plum : "#D9DED5", color: "#fff", display: "grid", placeItems: "center", flexShrink: 0 }}>
+          <agente.Icon size={20} />
         </div>
-        <div style={fila}>
-          <span>Sólo se envía entre las</span>
-          {numero(mk.horario.desde, (v) => set((m) => ({ ...m, horario: { ...m.horario, desde: v } })), 0, 23)}
-          <span>y las</span>
-          {numero(mk.horario.hasta, (v) => set((m) => ({ ...m, horario: { ...m.horario, hasta: v } })), 1, 24)}
-          <span>(hora de Bogotá)</span>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>{agente.cuando} · {est.texto}</div>
+          <div style={{ fontFamily: "var(--display)", fontSize: 20, fontWeight: 600, letterSpacing: "-.02em", marginTop: 3 }}>{agente.nombre}</div>
         </div>
-        {ayuda(`Hoy una campaña le llegaría a ${audiencia} lead(s): los que no se han registrado en Catch, no son clientes, no están en manos de una persona y no llegaron al tope. El correo sale por Amazon SES a quien no se dio de baja.`)}
+        {alternable && <Btn variant={est.on ? "outline" : "solid"} Icon={est.on ? Pause : Play} onClick={alternar}>{est.on ? "Apagar" : "Encender"}</Btn>}
+        {agente.key === "tendencias" && go && <Btn variant="outline" Icon={Newspaper} onClick={() => go("trends")}>Abrir Tendencias</Btn>}
       </div>
 
       <div style={tarjeta}>
-        {encabezado(Reply, "Seguimiento", mk.seguimiento.activo, () => {
-          set((m) => ({ ...m, seguimiento: { ...m.seguimiento, activo: !m.seguimiento.activo } }));
-          say(mk.seguimiento.activo ? "Agente de Seguimiento apagado" : "Agente de Seguimiento encendido");
-        })}
-        <label style={fila}>Escribir a quien no se registró a los {numero(mk.seguimiento.dias, (v) => set((m) => ({ ...m, seguimiento: { ...m.seguimiento, dias: v } })), 1, 30)} días de la campaña</label>
-        {ayuda(`Usa una plantilla fija que invita a resolver dudas por WhatsApp (${estadoSeg}). Si la persona contesta, la atiende el agente de texto que le toque en Agentes.`)}
+        {titulo("Qué hace")}
+        <div style={{ fontFamily: "var(--ui)", fontSize: 13, color: C.ink, lineHeight: 1.6 }}>{agente.rol}</div>
       </div>
 
-      <div style={tarjeta}>
-        <div style={{ fontFamily: "var(--display)", fontSize: 15, fontWeight: 600 }}>Campañas</div>
-        {campanas.length === 0 && ayuda("Todavía no hay campañas. Con Contenido encendido, la primera se arma mañana a las 6:00.")}
-        {campanas.map((c) => {
-          const e = ESTADO_CAMPANA[c.estado] || ESTADO_CAMPANA.fallo;
-          const ver = abierta === c.id;
-          return (
-            <div key={c.id} style={{ borderTop: `1px solid ${C.line}`, marginTop: 10, paddingTop: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <button onClick={() => setAbierta(ver ? "" : c.id)} className="crm-btn"
-                  style={{ flex: 1, minWidth: 200, textAlign: "left", border: "none", background: "none", padding: 0, cursor: "pointer", fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>
-                  {ver ? <ChevronDown size={13} /> : <ChevronRight size={13} />} {c.titulo || "Sin título"}
-                </button>
-                <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: e.color }}>{e.label}</span>
-                <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{haceRato(c.at)}</span>
-                {(c.estado === "enviando" || c.estado === "revision") && (
-                  <Btn size="sm" variant="outline" Icon={Pause} onClick={() => cambiarCampana(c.id, { estado: "detenida" }, "Campaña detenida")}>Detener</Btn>
-                )}
-                {c.estado === "detenida" && c.cola.length > 0 && c.wa.plantilla && c.wa.plantilla.estado === "APPROVED" && (
-                  <Btn size="sm" variant="outline" Icon={Play} onClick={() => cambiarCampana(c.id, { estado: "enviando", loteAt: "" }, "Campaña reanudada")}>Reanudar</Btn>
-                )}
-              </div>
-              <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 4 }}>
-                {[c.tendencia && `JEV ${c.tendencia.total}`, c.lector, `${c.enviados.wa} WhatsApp`, `${c.enviados.correo} correos`, c.cola.length ? `${c.cola.length} en cola` : "", c.enviados.omitidos ? `${c.enviados.omitidos} omitidos` : ""].filter(Boolean).join(" · ")}
-              </div>
-              {(c.error || c.ultimoError) && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 4 }}>{c.error || c.ultimoError}</div>}
-              {ver && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
-                  {c.tendencia && (
-                    <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, lineHeight: 1.5 }}>
-                      Tendencia: <a href={c.tendencia.url} target="_blank" rel="noopener noreferrer" style={{ color: C.jade }}>{c.tendencia.titulo}</a>{c.tendencia.medio ? ` (${c.tendencia.medio})` : ""}. {c.porque}
+      {agente.key === "tendencias" && (
+        <div style={tarjeta}>
+          {titulo("Configuración")}
+          {ayuda("El perfil de investigación (qué buscar, para quién, qué ignorar) y los pesos de JEV se editan en Tendencias.")}
+        </div>
+      )}
+
+      {agente.key === "contenido" && (
+        <div style={tarjeta}>
+          {titulo("Configuración")}
+          <label style={fila}>Nota mínima de JEV para producir {numero(mk.contenido.minimoJev, (v) => set((m) => ({ ...m, contenido: { ...m.contenido, minimoJev: v } })), 0, 100)}</label>
+          {ayuda("Si ninguna noticia de los últimos tres días llega a esa nota, ese día no hay campaña. La voz y la oferta salen del perfil de marca del Estudio. Encendido, trabaja en automático: lo que prepara sale sin pasar por aprobación una vez Meta aprueba la plantilla.")}
+        </div>
+      )}
+
+      {agente.key === "campanas" && (
+        <>
+          <div style={tarjeta}>
+            {titulo("Reglas de envío")}
+            <div style={fila}>
+              <span>Tope de mensajes de marketing por persona en 7 días</span>
+              {numero(mk.topeSemanal, (v) => set((m) => ({ ...m, topeSemanal: v })), 1, 14)}
+            </div>
+            <div style={fila}>
+              <span>Sólo se envía entre las</span>
+              {numero(mk.horario.desde, (v) => set((m) => ({ ...m, horario: { ...m.horario, desde: v } })), 0, 23)}
+              <span>y las</span>
+              {numero(mk.horario.hasta, (v) => set((m) => ({ ...m, horario: { ...m.horario, hasta: v } })), 1, 24)}
+              <span>(hora de Bogotá)</span>
+            </div>
+            {ayuda(`Hoy una campaña le llegaría a ${audiencia} lead(s): los que no se han registrado en Catch, no son clientes, no están en manos de una persona y no llegaron al tope. El correo sale por Amazon SES a quien no se dio de baja.`)}
+          </div>
+          <div style={tarjeta}>
+            {titulo("Campañas")}
+            {campanas.length === 0 && ayuda("Todavía no hay campañas. Con el Agente de Contenido encendido, la primera se arma a las 6:00.")}
+            {campanas.map((c) => {
+              const e = ESTADO_CAMPANA[c.estado] || ESTADO_CAMPANA.fallo;
+              const ver = abierta === c.id;
+              return (
+                <div key={c.id} style={{ borderTop: `1px solid ${C.line}`, marginTop: 10, paddingTop: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <button onClick={() => setAbierta(ver ? "" : c.id)} className="crm-btn"
+                      style={{ flex: 1, minWidth: 200, textAlign: "left", border: "none", background: "none", padding: 0, cursor: "pointer", fontFamily: "var(--ui)", fontSize: 13, fontWeight: 600, color: C.ink }}>
+                      {ver ? <ChevronDown size={13} /> : <ChevronRight size={13} />} {c.titulo || "Sin título"}
+                    </button>
+                    <span style={{ fontFamily: "var(--ui)", fontSize: 11.5, fontWeight: 600, color: e.color }}>{e.label}</span>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>{haceRato(c.at)}</span>
+                    {(c.estado === "enviando" || c.estado === "revision") && (
+                      <Btn size="sm" variant="outline" Icon={Pause} onClick={() => cambiarCampana(c.id, { estado: "detenida" }, "Campaña detenida")}>Detener</Btn>
+                    )}
+                    {c.estado === "detenida" && c.cola.length > 0 && c.wa.plantilla && c.wa.plantilla.estado === "APPROVED" && (
+                      <Btn size="sm" variant="outline" Icon={Play} onClick={() => cambiarCampana(c.id, { estado: "enviando", loteAt: "" }, "Campaña reanudada")}>Reanudar</Btn>
+                    )}
+                  </div>
+                  <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.mute, marginTop: 4 }}>
+                    {[c.tendencia && `JEV ${c.tendencia.total}`, c.lector, `${c.enviados.wa} WhatsApp`, `${c.enviados.correo} correos`, c.cola.length ? `${c.cola.length} en cola` : "", c.enviados.omitidos ? `${c.enviados.omitidos} omitidos` : ""].filter(Boolean).join(" · ")}
+                  </div>
+                  {(c.error || c.ultimoError) && <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.clay, marginTop: 4 }}>{c.error || c.ultimoError}</div>}
+                  {ver && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+                      {c.tendencia && (
+                        <div style={{ fontFamily: "var(--ui)", fontSize: 12, color: C.mute, lineHeight: 1.5 }}>
+                          Tendencia: <a href={c.tendencia.url} target="_blank" rel="noopener noreferrer" style={{ color: C.jade }}>{c.tendencia.titulo}</a>{c.tendencia.medio ? ` (${c.tendencia.medio})` : ""}. {c.porque}
+                        </div>
+                      )}
+                      {c.wa.texto && <div style={{ background: CHANNEL.whatsapp.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{c.wa.texto}</div>}
+                      {c.correo.texto && (
+                        <div style={{ background: CHANNEL.email.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                          <strong>{c.correo.asunto}</strong>{"\n\n"}{c.correo.texto}
+                        </div>
+                      )}
+                      {c.wa.plantilla && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>Plantilla en Meta: {c.wa.plantilla.nombre} · {c.wa.plantilla.estado}</div>}
                     </div>
                   )}
-                  {c.wa.texto && <div style={{ background: CHANNEL.whatsapp.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{c.wa.texto}</div>}
-                  {c.correo.texto && (
-                    <div style={{ background: CHANNEL.email.soft, borderRadius: 8, padding: "9px 12px", fontFamily: "var(--ui)", fontSize: 12.5, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-                      <strong>{c.correo.asunto}</strong>{"\n\n"}{c.correo.texto}
-                    </div>
-                  )}
-                  {c.wa.plantilla && <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint }}>Plantilla en Meta: {c.wa.plantilla.nombre} · {c.wa.plantilla.estado}</div>}
                 </div>
-              )}
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {agente.key === "seguimiento" && (
+        <div style={tarjeta}>
+          {titulo("Configuración")}
+          <label style={fila}>Escribir a quien no se registró a los {numero(mk.seguimiento.dias, (v) => set((m) => ({ ...m, seguimiento: { ...m.seguimiento, dias: v } })), 1, 30)} días de la campaña</label>
+          {ayuda(`Usa una plantilla fija que invita a resolver dudas por WhatsApp (${estadoSeg}). Respeta el mismo tope semanal y horario que las campañas.`)}
+        </div>
+      )}
+
+      <div style={tarjeta}>
+        {titulo("Lo último que hizo")}
+        {movimientos.length === 0 && ayuda("Todavía nada.")}
+        {movimientos.map((m) => {
+          const e = ESTADO_SUP[m.estado] || ESTADO_SUP.info;
+          return (
+            <div key={m.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", borderTop: `1px solid ${C.line}`, marginTop: 8, paddingTop: 8 }}>
+              <e.Icon size={13} color={e.color} style={{ flexShrink: 0, marginTop: 3 }} />
+              <div style={{ flex: 1, minWidth: 0, fontFamily: "var(--ui)", fontSize: 12.5, color: C.ink, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{String(m.texto).slice(0, 400)}</div>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: C.faint, flexShrink: 0 }}>{haceRato(m.at)}</span>
             </div>
           );
         })}
@@ -4265,7 +4410,7 @@ function EditorAgente({ db, agente, indice, conversaciones, onGuardar, onAlterna
       </div>
 
       <div style={{ fontFamily: "var(--ui)", fontSize: 11.5, color: C.faint, lineHeight: 1.6 }}>
-        Encendido, este agente atiende los WhatsApp que entran a las conversaciones que le tocan, también con el CRM cerrado. Lo que propone o envía queda en Mensajes → Supervisión.
+        Encendido, este agente atiende los WhatsApp que entran a las conversaciones que le tocan, también con el CRM cerrado. Lo que propone o envía queda en Agentes → Supervisión.
       </div>
     </div>
   );
@@ -4398,9 +4543,8 @@ function PropuestaAgente({ item, say, onAbrir, compacta = false }) {
   );
 }
 
-function SupervisionView({ db, say, seccion, setSeccion, onAbrir }) {
+function SupervisionView({ db, say, cab, onAbrir }) {
   const items = db.supervision || [];
-  const op = db.operacion || {};
   const [filtro, setFiltro] = useState("revisar");
   const [sel, setSel] = useState("");
   const filtrados = items.filter((x) =>
@@ -4415,13 +4559,9 @@ function SupervisionView({ db, say, seccion, setSeccion, onAbrir }) {
   return (
     <div style={{ display: "flex", height: "100vh", minWidth: 0 }}>
       <div style={{ width: 316, flexShrink: 0, borderRight: `1px solid ${C.line}`, background: C.panel, display: "flex", flexDirection: "column" }}>
-        <div style={{ padding: "18px 16px 12px", borderBottom: `1px solid ${C.line}` }}>
-          <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: C.faint, letterSpacing: ".1em", textTransform: "uppercase" }}>
-            {cuenta("revisar")} por revisar
-          </div>
-          <h1 style={{ fontFamily: "var(--display)", fontSize: 21, fontWeight: 600, letterSpacing: "-.02em", margin: "3px 0 0" }}>Mensajes</h1>
-          <SeccionMensajes seccion={seccion} setSeccion={setSeccion} agentes={db.agentes || []} supervision={items} />
-          <div style={{ display: "flex", gap: 5, marginTop: 12, flexWrap: "wrap" }}>
+        <CabeceraAgentes {...cab} subtitulo={`${cuenta("revisar")} por revisar`} />
+        <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.line}` }}>
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
             {[["revisar", "Por revisar"], ["enviados", "Enviados"], ["operacion", "Campañas"], ["todo", "Todo"]].map(([k, l]) => (
               <button key={k} onClick={() => { setFiltro(k); setSel(""); }} className="crm-btn"
                 style={{ border: `1px solid ${filtro === k ? C.jade : C.line}`, background: filtro === k ? C.jade : C.panel, color: filtro === k ? "#fff" : C.mute, borderRadius: 999, padding: "3px 10px", fontFamily: "var(--ui)", fontSize: 11.5, cursor: "pointer" }}>
@@ -4430,12 +4570,6 @@ function SupervisionView({ db, say, seccion, setSeccion, onAbrir }) {
             ))}
           </div>
         </div>
-
-        {op.pausada && (
-          <div style={{ padding: "9px 16px", borderBottom: `1px solid ${C.line}`, background: C.claySoft, fontFamily: "var(--ui)", fontSize: 11.5, color: C.clay, lineHeight: 1.5, display: "flex", gap: 6 }}>
-            <Pause size={13} style={{ flexShrink: 0, marginTop: 1 }} /> Los agentes están en pausa: entran los mensajes, pero nadie redacta ni envía. Se reanudan en Agentes.
-          </div>
-        )}
 
         <div style={{ flex: 1, overflowY: "auto" }}>
           {filtrados.map((x) => {
